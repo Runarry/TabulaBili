@@ -17,13 +17,66 @@ jobs:
       - name: 📥 拉取最新代码
         uses: actions/checkout@v4
 
+      - name: 🧰 准备发布目录
+        run: mkdir -p dist
+
       - name: 📦 打包 Chrome 扩展 ZIP
         run: |
-          zip -r TabulaBili-${{ github.ref_name }}.zip . -x "*.git*" -x ".github/*" -x ".gitignore" -x "README.md" -x "LICENSE" -x "*.DS_Store" -x "*.pem" -x "*.crx" -x "promo.html"
-          
+          zip -r "dist/TabulaBili-${{ github.ref_name }}-chrome.zip" \
+            manifest.json \
+            rules.json \
+            background.js \
+            content.js \
+            content-main.js \
+            popup.html \
+            popup.css \
+            popup.js \
+            icon.png \
+            icon16.png \
+            icon32.png \
+            icon48.png \
+            icon128.png
+
+      - name: 🦊 校验 Firefox 扩展
+        run: |
+          npx --yes web-ext lint \
+            --source-dir . \
+            --ignore-files \
+              ".git" \
+              ".github" \
+              ".gitignore" \
+              "README.md" \
+              "LICENSE" \
+              "promo.html" \
+              "dist" \
+              "*.DS_Store" \
+              "*.pem" \
+              "*.crx"
+
+      - name: 📦 打包 Firefox 扩展 XPI
+        run: |
+          npx --yes web-ext build \
+            --source-dir . \
+            --artifacts-dir dist \
+            --filename "tabulabili-${{ github.ref_name }}-firefox.xpi" \
+            --overwrite-dest \
+            --ignore-files \
+              ".git" \
+              ".github" \
+              ".gitignore" \
+              "README.md" \
+              "LICENSE" \
+              "promo.html" \
+              "dist" \
+              "*.DS_Store" \
+              "*.pem" \
+              "*.crx"
+
       - name: 🚀 发布到 GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
           name: TabulaBili ${{ github.ref_name }}
-          files: TabulaBili-${{ github.ref_name }}.zip
+          files: |
+            dist/TabulaBili-${{ github.ref_name }}-chrome.zip
+            dist/tabulabili-${{ github.ref_name }}-firefox.xpi
           generate_release_notes: true

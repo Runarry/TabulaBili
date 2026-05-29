@@ -13,6 +13,7 @@
     "*://www.bilibili.com/*"
   ],
   "background": {
+    "scripts": ["background.js"],
     "service_worker": "background.js"
   },
   "content_scripts": [
@@ -51,5 +52,17 @@
         "path": "rules.json"
       }
     ]
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "tabulabili-plus@local.invalid",
+      "strict_min_version": "140.0",
+      "data_collection_permissions": {
+        "required": ["none"]
+      }
+    },
+    "gecko_android": {
+      "strict_min_version": "142.0"
+    }
   }
 }
