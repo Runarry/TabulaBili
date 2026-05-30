@@ -67,6 +67,15 @@ function tabsSendMessage(tabId, message) {
   });
 }
 
+function openOptionsPage() {
+  if (extensionApi.runtime.openOptionsPage) {
+    return extensionApi.runtime.openOptionsPage();
+  }
+
+  window.open(extensionApi.runtime.getURL('options.html'));
+  return Promise.resolve();
+}
+
 function isBilibiliTab(tab) {
   if (!tab || !tab.url) return false;
 
@@ -83,6 +92,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const statusText = document.getElementById('statusText');
   const radioInputs = document.querySelectorAll('input[name="biliMode"]');
   const resetFingerprintBtn = document.getElementById('resetFingerprintBtn');
+  const openOptionsBtn = document.getElementById('openOptionsBtn');
 
   const updateStatusBar = (mode) => {
     switch (mode) {
@@ -164,6 +174,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     } catch (error) {
       console.warn('[TabulaBili] Failed to reset fingerprint:', error);
       alert('指纹重置失败，请确认当前标签页已打开 B 站页面。');
+    }
+  });
+
+  openOptionsBtn.addEventListener('click', async () => {
+    try {
+      await openOptionsPage();
+      window.close();
+    } catch (error) {
+      console.warn('[TabulaBili] Failed to open options page:', error);
     }
   });
 });

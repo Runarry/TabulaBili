@@ -1,0 +1,252 @@
+body.options-page {
+  width: auto;
+  min-width: 720px;
+  min-height: 100vh;
+  overflow: auto;
+  background: var(--color-bg-main);
+}
+
+.options-shell {
+  width: min(920px, calc(100vw - 48px));
+  margin: 0 auto;
+  padding: 28px 0 40px;
+}
+
+.options-header {
+  margin-bottom: 18px;
+}
+
+.options-main {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.settings-panel {
+  background: var(--color-bg-card);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.panel-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+
+.panel-heading.compact {
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+.options-section-title {
+  margin: 0;
+}
+
+.panel-desc {
+  margin: 6px 0 0;
+  color: var(--color-text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.switch-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--color-text-sub);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.switch-row input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--color-mint);
+}
+
+.rule-form {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 180px;
+}
+
+.field-grow {
+  flex: 1;
+}
+
+.field-label {
+  color: var(--color-text-sub);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.field-input {
+  height: 34px;
+  box-sizing: border-box;
+  border: 1px solid var(--color-gray-border);
+  border-radius: 6px;
+  background: var(--color-bg-main);
+  color: var(--color-text-main);
+  padding: 0 10px;
+  font-size: 13px;
+  outline: none;
+}
+
+.field-input:focus {
+  border-color: var(--color-mint);
+  box-shadow: 0 0 0 3px var(--color-mint-light);
+}
+
+.primary-btn,
+.secondary-btn {
+  height: 34px;
+  border-radius: 6px;
+  border: 1px solid var(--color-gray-border);
+  padding: 0 12px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.primary-btn {
+  background: var(--color-mint);
+  border-color: var(--color-mint);
+  color: white;
+}
+
+.primary-btn:hover {
+  filter: brightness(0.96);
+}
+
+.secondary-btn {
+  background: var(--color-bg-main);
+  color: var(--color-text-sub);
+}
+
+.secondary-btn:hover {
+  border-color: var(--color-mint);
+  color: var(--color-mint);
+}
+
+.form-message {
+  min-height: 18px;
+  margin: 8px 0 0;
+  color: var(--color-text-muted);
+  font-size: 12px;
+}
+
+.form-message.error {
+  color: #ef4444;
+}
+
+.rule-count {
+  color: var(--color-text-muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.rules-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.rule-row,
+.empty-state {
+  display: grid;
+  grid-template-columns: auto 1fr auto auto auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 42px;
+  padding: 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-bg-main);
+}
+
+.empty-state {
+  display: block;
+  color: var(--color-text-muted);
+  font-size: 13px;
+  text-align: center;
+}
+
+.rule-type {
+  min-width: 112px;
+  color: var(--color-text-sub);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.rule-pattern {
+  color: var(--color-text-main);
+  font-size: 13px;
+  word-break: break-word;
+}
+
+.rule-created {
+  color: var(--color-text-muted);
+  font-size: 11px;
+}
+
+.rule-enabled {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--color-text-sub);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.rule-enabled input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--color-mint);
+}
+
+.footer-button {
+  font-family: inherit;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+@media (max-width: 760px) {
+  body.options-page {
+    min-width: 0;
+  }
+
+  .options-shell {
+    width: calc(100vw - 28px);
+    padding: 16px 0 28px;
+  }
+
+  .rule-form {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .field {
+    min-width: 0;
+  }
+
+  .rule-row {
+    grid-template-columns: 1fr;
+    align-items: flex-start;
+  }
+}

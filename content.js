@@ -91,8 +91,46 @@ function dispatchNetworkReady(eventId) {
   window.dispatchEvent(new CustomEvent('tabula_network_ready', { detail: eventId }));
 }
 
+function normalizeBlockerRules(value) {
+  if (!Array.isArray(value)) return [];
+
+  return value
+    .filter((rule) => rule && (rule.type === 'up_name_exact' || rule.type === 'title_regex'))
+    .map((rule) => ({
+      id: typeof rule.id === 'string' ? rule.id : '',
+      type: rule.type,
+      pattern: typeof rule.pattern === 'string' ? rule.pattern : '',
+      enabled: rule.enabled !== false
+    }))
+    .filter((rule) => rule.pattern.trim());
+}
+
+function dispatchBlockerConfig(config) {
+  window.dispatchEvent(new CustomEvent('tabula_blocker_config', {
+    detail: JSON.stringify(config)
+  }));
+}
+
+async function syncBlockerConfig() {
+  const result = await storageGet(['bili_blocker_enabled', 'bili_block_rules']);
+  dispatchBlockerConfig({
+    enabled: result.bili_blocker_enabled !== false,
+    rules: normalizeBlockerRules(result.bili_block_rules)
+  });
+}
+
 const fingerprintReady = captureBiliFingerprint().catch((error) => {
   console.warn('[TabulaBili] Failed to capture fingerprint:', error);
+});
+
+window.addEventListener('tabula_blocker_config_request', () => {
+  syncBlockerConfig().catch((error) => {
+    console.warn('[TabulaBili] Failed to sync blocker config:', error);
+  });
+});
+
+syncBlockerConfig().catch((error) => {
+  console.warn('[TabulaBili] Failed to initialize blocker config:', error);
 });
 
 window.addEventListener('tabula_request_triggered', async (event) => {
@@ -146,4 +184,14 @@ extensionApi.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   return false;
+});
+
+extensionApi.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== 'local') return;
+
+  if (changes.bili_blocker_enabled || changes.bili_block_rules) {
+    syncBlockerConfig().catch((error) => {
+      console.warn('[TabulaBili] Failed to sync blocker config:', error);
+    });
+  }
 });

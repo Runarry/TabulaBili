@@ -276,6 +276,7 @@ body {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 10px;
 }
 
 .link-btn {
@@ -288,4 +289,12 @@ body {
 
 .link-btn:hover {
   color: var(--color-mint);
+}
+
+.footer-button {
+  font-family: inherit;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  cursor: pointer;
 }
