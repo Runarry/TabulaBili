@@ -1,5 +1,6 @@
 const extensionApi = globalThis.browser ?? globalThis.chrome;
 const usePromiseApi = typeof globalThis.browser !== 'undefined';
+const DEFAULT_FUSION_CLEAN_RATIO = 50;
 
 function getLastRuntimeError() {
   return extensionApi.runtime.lastError
@@ -72,6 +73,34 @@ function tryClickRollBtn() {
   setTimeout(tryClickRollBtn, 200);
 }
 
+let queuedRefreshTimer = null;
+
+function queueRollRefresh() {
+  if (queuedRefreshTimer) {
+    clearTimeout(queuedRefreshTimer);
+  }
+
+  queuedRefreshTimer = setTimeout(() => {
+    queuedRefreshTimer = null;
+    clickRollBtnWithRetry(0);
+  }, 350);
+}
+
+function clickRollBtnWithRetry(attempt) {
+  const rollBtn = document.querySelector('.roll-btn');
+  if (rollBtn) {
+    rollBtn.click();
+    return;
+  }
+
+  if (attempt < 8) {
+    queuedRefreshTimer = setTimeout(() => {
+      queuedRefreshTimer = null;
+      clickRollBtnWithRetry(attempt + 1);
+    }, 200);
+  }
+}
+
 function enablePureModeAutoRoll() {
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', tryClickRollBtn);
@@ -105,17 +134,33 @@ function normalizeBlockerRules(value) {
     .filter((rule) => rule.pattern.trim());
 }
 
-function dispatchBlockerConfig(config) {
-  window.dispatchEvent(new CustomEvent('tabula_blocker_config', {
+function normalizeFusionCleanRatio(value) {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) return DEFAULT_FUSION_CLEAN_RATIO;
+
+  const rounded = Math.round(parsed / 10) * 10;
+  return Math.min(90, Math.max(10, rounded));
+}
+
+function dispatchSettingsConfig(config) {
+  window.dispatchEvent(new CustomEvent('tabula_settings_config', {
     detail: JSON.stringify(config)
   }));
 }
 
-async function syncBlockerConfig() {
-  const result = await storageGet(['bili_blocker_enabled', 'bili_block_rules']);
-  dispatchBlockerConfig({
-    enabled: result.bili_blocker_enabled !== false,
-    rules: normalizeBlockerRules(result.bili_block_rules)
+async function syncSettingsConfig() {
+  const result = await storageGet([
+    'bili_blocker_enabled',
+    'bili_block_rules',
+    'bili_fusion_clean_ratio'
+  ]);
+
+  dispatchSettingsConfig({
+    blocker: {
+      enabled: result.bili_blocker_enabled !== false,
+      rules: normalizeBlockerRules(result.bili_block_rules)
+    },
+    fusionCleanRatio: normalizeFusionCleanRatio(result.bili_fusion_clean_ratio)
   });
 }
 
@@ -123,14 +168,14 @@ const fingerprintReady = captureBiliFingerprint().catch((error) => {
   console.warn('[TabulaBili] Failed to capture fingerprint:', error);
 });
 
-window.addEventListener('tabula_blocker_config_request', () => {
-  syncBlockerConfig().catch((error) => {
-    console.warn('[TabulaBili] Failed to sync blocker config:', error);
+window.addEventListener('tabula_settings_config_request', () => {
+  syncSettingsConfig().catch((error) => {
+    console.warn('[TabulaBili] Failed to sync settings config:', error);
   });
 });
 
-syncBlockerConfig().catch((error) => {
-  console.warn('[TabulaBili] Failed to initialize blocker config:', error);
+syncSettingsConfig().catch((error) => {
+  console.warn('[TabulaBili] Failed to initialize settings config:', error);
 });
 
 window.addEventListener('tabula_request_triggered', async (event) => {
@@ -165,12 +210,22 @@ storageGet(['bili_mode'])
 extensionApi.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === 'triggerModeSwitchRefresh') {
     setDocumentMode(message.newMode);
+    sendRuntimeMessage({ action: 'syncModeConfiguration' })
+      .catch((error) => {
+        console.warn('[TabulaBili] Failed to sync mode before refresh:', error);
+      })
+      .finally(queueRollRefresh);
 
-    const rollBtn = document.querySelector('.roll-btn');
-    if (rollBtn) {
-      rollBtn.click();
+    sendResponse({ success: true });
+    return true;
+  }
+
+  if (message.action === 'triggerSettingsRefresh') {
+    if (message.newMode) {
+      setDocumentMode(message.newMode);
     }
 
+    queueRollRefresh();
     sendResponse({ success: true });
     return true;
   }
@@ -189,9 +244,9 @@ extensionApi.runtime.onMessage.addListener((message, sender, sendResponse) => {
 extensionApi.storage.onChanged.addListener((changes, areaName) => {
   if (areaName !== 'local') return;
 
-  if (changes.bili_blocker_enabled || changes.bili_block_rules) {
-    syncBlockerConfig().catch((error) => {
-      console.warn('[TabulaBili] Failed to sync blocker config:', error);
+  if (changes.bili_blocker_enabled || changes.bili_block_rules || changes.bili_fusion_clean_ratio) {
+    syncSettingsConfig().catch((error) => {
+      console.warn('[TabulaBili] Failed to sync settings config:', error);
     });
   }
 });

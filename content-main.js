@@ -2,6 +2,10 @@ const nativeFetch = window.fetch;
 const FEED_API_PATH = '/x/web-interface/wbi/index/top/feed/rcmd';
 const MAX_REFILL_PAGES = 3;
 const WBI_KEY_CACHE_MS = 10 * 60 * 1000;
+const DEFAULT_FUSION_CLEAN_RATIO = 50;
+const FUSION_BRANCH_PARAM = 'tabula_mix_branch';
+const FUSION_BRANCH_VALUE = 'clean';
+const FUSION_BRANCH_TIMEOUT_MS = 3500;
 const MIXIN_KEY_ENC_TAB = [
   46, 47, 18, 2, 53, 8, 23, 32,
   15, 50, 10, 31, 58, 3, 45, 35,
@@ -14,22 +18,25 @@ const MIXIN_KEY_ENC_TAB = [
 ];
 
 let blockerConfig = { enabled: true, rules: [] };
+let fusionCleanRatio = DEFAULT_FUSION_CLEAN_RATIO;
 let cachedWbiMixinKey = '';
 let cachedWbiMixinKeyTime = 0;
 
-window.addEventListener('tabula_blocker_config', (event) => {
+window.addEventListener('tabula_settings_config', (event) => {
   const detail = typeof event.detail === 'string' ? event.detail : '';
   if (!detail) return;
 
   try {
     const parsed = JSON.parse(detail);
-    blockerConfig = normalizeBlockerConfig(parsed);
+    const settings = normalizeSettingsConfig(parsed);
+    blockerConfig = settings.blocker;
+    fusionCleanRatio = settings.fusionCleanRatio;
   } catch (error) {
-    console.warn('[TabulaBili] Failed to parse blocker config:', error);
+    console.warn('[TabulaBili] Failed to parse settings config:', error);
   }
 });
 
-window.dispatchEvent(new CustomEvent('tabula_blocker_config_request'));
+window.dispatchEvent(new CustomEvent('tabula_settings_config_request'));
 
 window.fetch = async function(...args) {
   const requestUrl = getFetchUrl(args[0]);
@@ -39,14 +46,23 @@ window.fetch = async function(...args) {
   }
 
   const currentMode = document.documentElement.getAttribute('data-tabula-mode') || 'pure';
-
-  if (currentMode !== 'pure' && currentMode !== 'origin') {
-    await prepareNetworkState();
-  }
-
-  const response = await nativeFetch(...args);
+  const response = await fetchFeedResponseForMode(args, requestUrl, currentMode);
   return filterFeedResponse(response, args, requestUrl, currentMode);
 };
+
+function normalizeSettingsConfig(value) {
+  const blocker = value && value.blocker
+    ? value.blocker
+    : {
+        enabled: value && value.enabled,
+        rules: value && value.rules
+      };
+
+  return {
+    blocker: normalizeBlockerConfig(blocker),
+    fusionCleanRatio: normalizeFusionCleanRatio(value && value.fusionCleanRatio)
+  };
+}
 
 function normalizeBlockerConfig(value) {
   const rules = Array.isArray(value && value.rules) ? value.rules : [];
@@ -63,6 +79,14 @@ function normalizeBlockerConfig(value) {
       }))
       .filter((rule) => rule.pattern)
   };
+}
+
+function normalizeFusionCleanRatio(value) {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) return DEFAULT_FUSION_CLEAN_RATIO;
+
+  const rounded = Math.round(parsed / 10) * 10;
+  return Math.min(90, Math.max(10, rounded));
 }
 
 function getFetchUrl(input) {
@@ -98,6 +122,153 @@ function compileBlockRules() {
   return compiled;
 }
 
+async function fetchFeedResponseForMode(args, requestUrl, currentMode) {
+  if (currentMode === 'fusion' && !isFusionCleanBranchUrl(requestUrl)) {
+    return fetchFusionFeedResponse(args, requestUrl);
+  }
+
+  if (currentMode !== 'pure' && currentMode !== 'origin') {
+    await prepareNetworkState();
+  }
+
+  return nativeFetch(...args);
+}
+
+function isFusionCleanBranchUrl(url) {
+  try {
+    return new URL(url, location.href).searchParams.get(FUSION_BRANCH_PARAM) === FUSION_BRANCH_VALUE;
+  } catch {
+    return false;
+  }
+}
+
+async function fetchFusionFeedResponse(args, requestUrl) {
+  await prepareNetworkState();
+
+  const cleanUrl = await buildSignedFusionCleanUrl(requestUrl);
+  if (!cleanUrl) {
+    return nativeFetch(...args);
+  }
+
+  const originPromise = readFeedBranch(nativeFetch(...args));
+  const cleanPromise = readFeedBranch(nativeFetch(cleanUrl, buildRefillInit(args)));
+  const [originBranch, cleanBranch] = await Promise.all([originPromise, cleanPromise]);
+
+  if (originBranch.ok && cleanBranch.ok) {
+    const targetLength = originBranch.items.length || cleanBranch.items.length;
+    const mergedItems = mergeFusionItems(
+      originBranch.items,
+      cleanBranch.items,
+      targetLength,
+      fusionCleanRatio
+    );
+
+    originBranch.payload.data.item = mergedItems;
+    return createJsonResponse(originBranch.response, originBranch.payload);
+  }
+
+  if (originBranch.ok) return originBranch.response;
+  if (cleanBranch.ok) return cleanBranch.response;
+
+  return originBranch.response || cleanBranch.response || nativeFetch(...args);
+}
+
+async function readFeedBranch(responsePromise) {
+  try {
+    const response = await withTimeout(responsePromise, FUSION_BRANCH_TIMEOUT_MS);
+    if (!response) return { ok: false };
+
+    const result = { ok: false, response };
+    if (!response.ok) return result;
+
+    let payload;
+    try {
+      payload = await response.clone().json();
+    } catch {
+      return result;
+    }
+
+    const items = getPayloadItems(payload);
+    const apiOk = payload && (payload.code === undefined || payload.code === 0);
+    if (!apiOk || !items) return { ...result, payload };
+
+    return {
+      ok: true,
+      response,
+      payload,
+      items
+    };
+  } catch (error) {
+    console.warn('[TabulaBili] Failed to read fusion branch:', error);
+    return { ok: false };
+  }
+}
+
+function withTimeout(promise, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => {
+      resolve(null);
+    }, timeoutMs);
+
+    promise
+      .then((value) => {
+        window.clearTimeout(timer);
+        resolve(value);
+      })
+      .catch((error) => {
+        window.clearTimeout(timer);
+        reject(error);
+      });
+  });
+}
+
+function getPayloadItems(payload) {
+  return payload && payload.data && Array.isArray(payload.data.item)
+    ? payload.data.item
+    : null;
+}
+
+function mergeFusionItems(originItems, cleanItems, targetLength, cleanRatio) {
+  const output = [];
+  const seenKeys = new Set();
+  const originCursor = { index: 0 };
+  const cleanCursor = { index: 0 };
+
+  for (let slot = 0; output.length < targetLength; slot += 1) {
+    const cleanBefore = Math.floor((slot * cleanRatio) / 100);
+    const cleanAfter = Math.floor(((slot + 1) * cleanRatio) / 100);
+    const preferClean = cleanAfter > cleanBefore;
+    const primaryItems = preferClean ? cleanItems : originItems;
+    const primaryCursor = preferClean ? cleanCursor : originCursor;
+    const fallbackItems = preferClean ? originItems : cleanItems;
+    const fallbackCursor = preferClean ? originCursor : cleanCursor;
+
+    if (appendNextUnique(primaryItems, primaryCursor, output, seenKeys)) continue;
+    if (appendNextUnique(fallbackItems, fallbackCursor, output, seenKeys)) continue;
+    break;
+  }
+
+  return output;
+}
+
+function appendNextUnique(items, cursor, output, seenKeys) {
+  while (cursor.index < items.length) {
+    const item = items[cursor.index];
+    cursor.index += 1;
+
+    const key = getItemKey(item);
+    if (key) {
+      if (seenKeys.has(key)) continue;
+      seenKeys.add(key);
+    }
+
+    output.push(item);
+    return true;
+  }
+
+  return false;
+}
+
 async function filterFeedResponse(response, originalArgs, originalUrl, currentMode) {
   const compiledRules = compileBlockRules();
   if (!compiledRules.length) return response;
@@ -109,9 +280,7 @@ async function filterFeedResponse(response, originalArgs, originalUrl, currentMo
     return response;
   }
 
-  const items = payload && payload.data && Array.isArray(payload.data.item)
-    ? payload.data.item
-    : null;
+  const items = getPayloadItems(payload);
   if (!items) return response;
 
   const targetLength = items.length;
@@ -217,11 +386,8 @@ async function refillItems(options) {
     const refillUrl = await buildSignedRefillUrl(options.originalUrl, pageOffset);
     if (!refillUrl) return;
 
-    if (options.currentMode !== 'pure' && options.currentMode !== 'origin') {
-      await prepareNetworkState();
-    }
-
-    const refillResponse = await nativeFetch(refillUrl, buildRefillInit(options.originalArgs));
+    const refillArgs = [refillUrl, buildRefillInit(options.originalArgs)];
+    const refillResponse = await fetchFeedResponseForMode(refillArgs, refillUrl, options.currentMode);
     if (!refillResponse.ok) continue;
 
     let payload;
@@ -231,9 +397,7 @@ async function refillItems(options) {
       continue;
     }
 
-    const items = payload && payload.data && Array.isArray(payload.data.item)
-      ? payload.data.item
-      : [];
+    const items = getPayloadItems(payload) || [];
     if (!items.length) return;
 
     const remaining = options.targetLength - options.output.length;
@@ -275,15 +439,27 @@ function copyRequestOption(target, request, name) {
 }
 
 async function buildSignedRefillUrl(originalUrl, pageOffset) {
+  return buildSignedFeedUrl(originalUrl, (params) => {
+    incrementNumericParam(params, 'fresh_idx', pageOffset);
+    incrementNumericParam(params, 'fresh_idx_1h', pageOffset);
+    incrementNumericParam(params, 'brush', pageOffset);
+    if (!params.has('fresh_idx')) params.set('fresh_idx', String(pageOffset));
+  });
+}
+
+async function buildSignedFusionCleanUrl(originalUrl) {
+  return buildSignedFeedUrl(originalUrl, (params) => {
+    params.set(FUSION_BRANCH_PARAM, FUSION_BRANCH_VALUE);
+  });
+}
+
+async function buildSignedFeedUrl(originalUrl, mutateParams) {
   const url = new URL(originalUrl, location.href);
   const params = url.searchParams;
   params.delete('w_rid');
   params.delete('wts');
 
-  incrementNumericParam(params, 'fresh_idx', pageOffset);
-  incrementNumericParam(params, 'fresh_idx_1h', pageOffset);
-  incrementNumericParam(params, 'brush', pageOffset);
-  if (!params.has('fresh_idx')) params.set('fresh_idx', String(pageOffset));
+  mutateParams(params);
 
   params.set('wts', String(Math.round(Date.now() / 1000)));
 

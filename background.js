@@ -1,5 +1,9 @@
 const extensionApi = globalThis.browser ?? globalThis.chrome;
 const usePromiseApi = typeof globalThis.browser !== 'undefined';
+const GLOBAL_FEED_RULE_ID = 100;
+const FUSION_FEED_RULE_ID = 101;
+const FUSION_BRANCH_PARAM = 'tabula_mix_branch';
+const FUSION_BRANCH_VALUE = 'clean';
 
 function getLastRuntimeError() {
   return extensionApi.runtime.lastError
@@ -59,9 +63,11 @@ function updateEnabledRulesets(options) {
   });
 }
 
-function buildFeedRuleCondition(tabId = null) {
+function buildFeedRuleCondition(tabId = null, options = {}) {
   const condition = {
-    urlFilter: '||api.bilibili.com/x/web-interface/wbi/index/top/feed/rcmd',
+    urlFilter: options.fusionBranch
+      ? `||api.bilibili.com/x/web-interface/wbi/index/top/feed/rcmd*${FUSION_BRANCH_PARAM}=${FUSION_BRANCH_VALUE}`
+      : '||api.bilibili.com/x/web-interface/wbi/index/top/feed/rcmd',
     resourceTypes: ['xmlhttprequest'],
     requestDomains: ['api.bilibili.com'],
     initiatorDomains: ['www.bilibili.com']
@@ -74,24 +80,28 @@ function buildFeedRuleCondition(tabId = null) {
   return condition;
 }
 
+async function buildCleanRequestHeaders(mode) {
+  const { bili_fingerprint: fingerprint = '' } = await storageGet(['bili_fingerprint']);
+  return mode === 'pure' || !fingerprint
+    ? [{ header: 'cookie', operation: 'remove' }]
+    : [{ header: 'cookie', operation: 'set', value: fingerprint }];
+}
+
 async function compileDynamicNetworkRules(mode, tabId = null) {
-  const ruleIdsToRemove = [100];
+  const ruleIdsToRemove = [GLOBAL_FEED_RULE_ID];
 
   if (mode === 'origin') {
     await updateSessionRules({ removeRuleIds: ruleIdsToRemove });
     return;
   }
 
-  const { bili_fingerprint: fingerprint = '' } = await storageGet(['bili_fingerprint']);
-  const requestHeaders = mode === 'pure' || !fingerprint
-    ? [{ header: 'cookie', operation: 'remove' }]
-    : [{ header: 'cookie', operation: 'set', value: fingerprint }];
+  const requestHeaders = await buildCleanRequestHeaders(mode);
 
   await updateSessionRules({
     removeRuleIds: ruleIdsToRemove,
     addRules: [
       {
-        id: 100,
+        id: GLOBAL_FEED_RULE_ID,
         priority: 2,
         action: {
           type: 'modifyHeaders',
@@ -103,15 +113,41 @@ async function compileDynamicNetworkRules(mode, tabId = null) {
   });
 }
 
+async function compileFusionNetworkRule() {
+  const requestHeaders = await buildCleanRequestHeaders('fusion');
+
+  await updateSessionRules({
+    removeRuleIds: [GLOBAL_FEED_RULE_ID, FUSION_FEED_RULE_ID],
+    addRules: [
+      {
+        id: FUSION_FEED_RULE_ID,
+        priority: 3,
+        action: {
+          type: 'modifyHeaders',
+          requestHeaders
+        },
+        condition: buildFeedRuleCondition(null, { fusionBranch: true })
+      }
+    ]
+  });
+}
+
 async function syncGlobalModeConfiguration(mode) {
   await updateEnabledRulesets({ disableRulesetIds: ['rules'] });
 
   if (mode === 'pure' || mode === 'refresh') {
+    await updateSessionRules({ removeRuleIds: [FUSION_FEED_RULE_ID] });
     await compileDynamicNetworkRules(mode);
     return;
   }
 
-  await updateSessionRules({ removeRuleIds: [100] });
+  if (mode === 'fusion') {
+    await updateSessionRules({ removeRuleIds: [GLOBAL_FEED_RULE_ID] });
+    await compileFusionNetworkRule();
+    return;
+  }
+
+  await updateSessionRules({ removeRuleIds: [GLOBAL_FEED_RULE_ID, FUSION_FEED_RULE_ID] });
 }
 
 async function syncStoredModeConfiguration() {
@@ -126,9 +162,9 @@ async function syncStoredModeConfiguration() {
 }
 
 extensionApi.storage.onChanged.addListener((changes, areaName) => {
-  if (areaName !== 'local' || !changes.bili_mode) return;
+  if (areaName !== 'local' || (!changes.bili_mode && !changes.bili_fingerprint)) return;
 
-  syncGlobalModeConfiguration(changes.bili_mode.newValue).catch((error) => {
+  syncStoredModeConfiguration().catch((error) => {
     console.warn('[TabulaBili] Failed to sync mode:', error);
   });
 });
@@ -150,6 +186,16 @@ const tabRequestCounters = {};
 async function evaluateMixedRequest(sender) {
   const { bili_mode: mode = 'pure' } = await storageGet(['bili_mode']);
 
+  if (mode === 'pure') {
+    await compileDynamicNetworkRules('pure');
+    return { active: true };
+  }
+
+  if (mode === 'origin') {
+    await updateSessionRules({ removeRuleIds: [GLOBAL_FEED_RULE_ID, FUSION_FEED_RULE_ID] });
+    return { active: false };
+  }
+
   if (mode === 'mixed' && sender.tab && Number.isInteger(sender.tab.id)) {
     const tabId = sender.tab.id;
     tabRequestCounters[tabId] = (tabRequestCounters[tabId] || 0) + 1;
@@ -158,10 +204,15 @@ async function evaluateMixedRequest(sender) {
     if (active) {
       await compileDynamicNetworkRules('mixed', tabId);
     } else {
-      await updateSessionRules({ removeRuleIds: [100] });
+      await updateSessionRules({ removeRuleIds: [GLOBAL_FEED_RULE_ID] });
     }
 
     return { active };
+  }
+
+  if (mode === 'fusion') {
+    await compileFusionNetworkRule();
+    return { active: true };
   }
 
   if (mode === 'refresh') {
@@ -173,7 +224,24 @@ async function evaluateMixedRequest(sender) {
 }
 
 extensionApi.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (!message || message.action !== 'evaluateMixedRequest') {
+  if (!message) {
+    return false;
+  }
+
+  if (message.action === 'syncModeConfiguration') {
+    syncStoredModeConfiguration()
+      .then(() => {
+        sendResponse({ success: true });
+      })
+      .catch((error) => {
+        console.warn('[TabulaBili] Failed to sync mode configuration:', error);
+        sendResponse({ success: false, error: error.message });
+      });
+
+    return true;
+  }
+
+  if (message.action !== 'evaluateMixedRequest') {
     return false;
   }
 

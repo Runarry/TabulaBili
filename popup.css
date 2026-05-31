@@ -186,6 +186,7 @@ body {
 .badge-pure { background: rgba(16, 185, 129, 0.08); color: var(--color-mint); }
 .badge-refresh { background: rgba(59, 130, 246, 0.08); color: #3b82f6; }
 .badge-mixed { background: rgba(139, 92, 246, 0.08); color: #8b5cf6; }
+.badge-fusion { background: rgba(14, 165, 233, 0.08); color: #0ea5e9; }
 .badge-origin { background: var(--color-border); color: var(--color-text-muted); }
 
 /* ==========================================

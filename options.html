@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>TabulaBili-Plus 屏蔽设置</title>
+  <title>TabulaBili-Plus 设置</title>
   <link rel="stylesheet" href="popup.css">
   <link rel="stylesheet" href="options.css">
 </head>
@@ -13,14 +13,45 @@
       <div class="header-main">
         <div class="logo-area">
           <img src="icon32.png" alt="Logo" class="logo">
-          <h1 class="title">TabulaBili-Plus 屏蔽设置</h1>
+          <h1 class="title">TabulaBili-Plus 设置</h1>
         </div>
         <span class="version">V1.2.0</span>
       </div>
-      <p class="subtitle">管理首页推荐流的视频屏蔽规则。</p>
+      <p class="subtitle">管理首页推荐流、融合比例和内容屏蔽规则。</p>
     </header>
 
     <main class="options-main">
+      <section class="settings-panel">
+        <div class="panel-heading">
+          <div>
+            <h2 class="section-title options-section-title">融合模式</h2>
+            <p class="panel-desc">设置融合模式中探索内容与个性内容的合并比例。</p>
+          </div>
+        </div>
+
+        <div class="ratio-control">
+          <div class="ratio-readout">
+            <span>探索 <strong id="fusionCleanRatioText">50%</strong></span>
+            <span>个性 <strong id="fusionOriginRatioText">50%</strong></span>
+          </div>
+          <input
+            id="fusionCleanRatio"
+            class="ratio-slider"
+            type="range"
+            min="10"
+            max="90"
+            step="10"
+            value="50"
+          >
+          <div class="ratio-scale" aria-hidden="true">
+            <span>探索少</span>
+            <span>均衡</span>
+            <span>探索多</span>
+          </div>
+        </div>
+        <p class="form-message" id="fusionMessage" role="status"></p>
+      </section>
+
       <section class="settings-panel">
         <div class="panel-heading">
           <div>

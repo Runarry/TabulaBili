@@ -3,7 +3,7 @@
   "name": "TabulaBili-Plus (初见哔哩增强版)",
   "version": "1.2.0",
   "author": "去年夏天",
-  "description": "通过精细化控制网络请求与首屏加载，提供纯净、刷新、混合等多维度的B站首页大盘推荐流体验，打破信息茧房。",
+  "description": "通过精细化控制网络请求与首屏加载，提供纯净、探索、混合、融合等多维度的B站首页推荐流体验，打破信息茧房。",
   "permissions": [
     "storage",
     "declarativeNetRequest"

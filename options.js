@@ -1,5 +1,6 @@
 const extensionApi = globalThis.browser ?? globalThis.chrome;
 const usePromiseApi = typeof globalThis.browser !== 'undefined';
+const DEFAULT_FUSION_CLEAN_RATIO = 50;
 
 function getLastRuntimeError() {
   return extensionApi.runtime.lastError
@@ -31,6 +32,30 @@ function storageSet(values) {
   });
 }
 
+function tabsQuery(queryInfo) {
+  if (usePromiseApi) return extensionApi.tabs.query(queryInfo);
+
+  return new Promise((resolve, reject) => {
+    extensionApi.tabs.query(queryInfo, (tabs) => {
+      const error = getLastRuntimeError();
+      if (error) reject(error);
+      else resolve(tabs);
+    });
+  });
+}
+
+function tabsSendMessage(tabId, message) {
+  if (usePromiseApi) return extensionApi.tabs.sendMessage(tabId, message);
+
+  return new Promise((resolve, reject) => {
+    extensionApi.tabs.sendMessage(tabId, message, (response) => {
+      const error = getLastRuntimeError();
+      if (error) reject(error);
+      else resolve(response);
+    });
+  });
+}
+
 function createRuleId() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -50,6 +75,14 @@ function normalizeRules(value) {
     .filter((rule) => rule.pattern.trim());
 }
 
+function normalizeFusionCleanRatio(value) {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) return DEFAULT_FUSION_CLEAN_RATIO;
+
+  const rounded = Math.round(parsed / 10) * 10;
+  return Math.min(90, Math.max(10, rounded));
+}
+
 function getTypeLabel(type) {
   return type === 'title_regex' ? '标题正则' : 'UP 主名';
 }
@@ -61,6 +94,10 @@ function formatCreatedAt(value) {
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
+  const fusionCleanRatioInput = document.getElementById('fusionCleanRatio');
+  const fusionCleanRatioText = document.getElementById('fusionCleanRatioText');
+  const fusionOriginRatioText = document.getElementById('fusionOriginRatioText');
+  const fusionMessage = document.getElementById('fusionMessage');
   const enabledInput = document.getElementById('blockerEnabled');
   const ruleForm = document.getElementById('ruleForm');
   const ruleType = document.getElementById('ruleType');
@@ -70,17 +107,55 @@ document.addEventListener('DOMContentLoaded', async () => {
   const ruleCount = document.getElementById('ruleCount');
 
   let rules = [];
+  let fusionCleanRatio = DEFAULT_FUSION_CLEAN_RATIO;
+  let refreshTimer = null;
 
   function setMessage(text, isError = false) {
     formMessage.textContent = text;
     formMessage.classList.toggle('error', isError);
   }
 
-  async function persist() {
+  function setFusionMessage(text, isError = false) {
+    fusionMessage.textContent = text;
+    fusionMessage.classList.toggle('error', isError);
+  }
+
+  function renderFusionRatio() {
+    fusionCleanRatioInput.value = String(fusionCleanRatio);
+    fusionCleanRatioText.textContent = `${fusionCleanRatio}%`;
+    fusionOriginRatioText.textContent = `${100 - fusionCleanRatio}%`;
+  }
+
+  function queueBiliTabsRefresh() {
+    if (refreshTimer) {
+      clearTimeout(refreshTimer);
+    }
+
+    refreshTimer = setTimeout(async () => {
+      refreshTimer = null;
+
+      try {
+        const tabs = await tabsQuery({ url: ['*://www.bilibili.com/*'] });
+        await Promise.all((tabs || [])
+          .filter((tab) => Number.isInteger(tab.id))
+          .map((tab) => tabsSendMessage(tab.id, { action: 'triggerSettingsRefresh' }).catch(() => null)));
+      } catch (error) {
+        console.warn('[TabulaBili] Failed to refresh Bilibili tabs:', error);
+      }
+    }, 400);
+  }
+
+  async function persistBlocker() {
     await storageSet({
       bili_blocker_enabled: enabledInput.checked,
       bili_block_rules: rules
     });
+    queueBiliTabsRefresh();
+  }
+
+  async function persistFusionRatio() {
+    await storageSet({ bili_fusion_clean_ratio: fusionCleanRatio });
+    queueBiliTabsRefresh();
   }
 
   function renderRules() {
@@ -118,7 +193,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       enabled.checked = rule.enabled !== false;
       enabled.addEventListener('change', async () => {
         rule.enabled = enabled.checked;
-        await persist();
+        await persistBlocker();
       });
       enabledLabel.append(enabled, document.createTextNode('启用'));
 
@@ -128,7 +203,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       removeBtn.textContent = '删除';
       removeBtn.addEventListener('click', async () => {
         rules = rules.filter((item) => item.id !== rule.id);
-        await persist();
+        await persistBlocker();
         renderRules();
       });
 
@@ -138,20 +213,44 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   try {
-    const result = await storageGet(['bili_blocker_enabled', 'bili_block_rules']);
+    const result = await storageGet([
+      'bili_blocker_enabled',
+      'bili_block_rules',
+      'bili_fusion_clean_ratio'
+    ]);
+    fusionCleanRatio = normalizeFusionCleanRatio(result.bili_fusion_clean_ratio);
+    renderFusionRatio();
     enabledInput.checked = result.bili_blocker_enabled !== false;
     rules = normalizeRules(result.bili_block_rules);
     renderRules();
   } catch (error) {
     console.warn('[TabulaBili] Failed to load blocker settings:', error);
+    renderFusionRatio();
     enabledInput.checked = true;
     renderRules();
     setMessage('设置加载失败，请刷新后重试。', true);
   }
 
+  fusionCleanRatioInput.addEventListener('input', () => {
+    fusionCleanRatio = normalizeFusionCleanRatio(fusionCleanRatioInput.value);
+    renderFusionRatio();
+  });
+
+  fusionCleanRatioInput.addEventListener('change', async () => {
+    try {
+      fusionCleanRatio = normalizeFusionCleanRatio(fusionCleanRatioInput.value);
+      renderFusionRatio();
+      await persistFusionRatio();
+      setFusionMessage('融合比例已保存。');
+    } catch (error) {
+      console.warn('[TabulaBili] Failed to save fusion ratio:', error);
+      setFusionMessage('保存失败，请重试。', true);
+    }
+  });
+
   enabledInput.addEventListener('change', async () => {
     try {
-      await persist();
+      await persistBlocker();
       setMessage('已保存启用状态。');
     } catch (error) {
       console.warn('[TabulaBili] Failed to save blocker state:', error);
@@ -187,7 +286,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
 
     try {
-      await persist();
+      await persistBlocker();
       renderRules();
       rulePattern.value = '';
       setMessage('规则已添加。');

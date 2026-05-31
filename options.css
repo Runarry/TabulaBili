@@ -110,6 +110,38 @@ body.options-page {
   box-shadow: 0 0 0 3px var(--color-mint-light);
 }
 
+.ratio-control {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ratio-readout,
+.ratio-scale {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  color: var(--color-text-sub);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.ratio-readout strong {
+  color: var(--color-text-main);
+  font-size: 13px;
+}
+
+.ratio-slider {
+  width: 100%;
+  accent-color: var(--color-mint);
+}
+
+.ratio-scale {
+  color: var(--color-text-muted);
+  font-size: 11px;
+  font-weight: 500;
+}
+
 .primary-btn,
 .secondary-btn {
   height: 34px;

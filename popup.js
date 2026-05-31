@@ -114,6 +114,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         statusText.style.color = 'var(--color-mint)';
         resetFingerprintBtn.style.display = 'block';
         break;
+      case 'fusion':
+        statusDot.className = 'status-dot active';
+        statusText.textContent = '融合模式运行中，正在按比例合并内容';
+        statusText.style.color = 'var(--color-mint)';
+        resetFingerprintBtn.style.display = 'block';
+        break;
       case 'origin':
       default:
         statusDot.className = 'status-dot';
