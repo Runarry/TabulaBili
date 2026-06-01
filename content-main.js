@@ -6,6 +6,7 @@ const DEFAULT_FUSION_CLEAN_RATIO = 50;
 const FUSION_BRANCH_PARAM = 'tabula_mix_branch';
 const FUSION_BRANCH_VALUE = 'clean';
 const FUSION_BRANCH_TIMEOUT_MS = 3500;
+const ANALYSIS_SOURCE_SYMBOL = Symbol('tabulaAnalysisSource');
 const MIXIN_KEY_ENC_TAB = [
   46, 47, 18, 2, 53, 8, 23, 32,
   15, 50, 10, 31, 58, 3, 45, 35,
@@ -21,6 +22,9 @@ let blockerConfig = { enabled: true, rules: [] };
 let fusionCleanRatio = DEFAULT_FUSION_CLEAN_RATIO;
 let cachedWbiMixinKey = '';
 let cachedWbiMixinKeyTime = 0;
+let analysisEnabled = false;
+const responseAnalysisSources = new WeakMap();
+const responseItemAnalysisSources = new WeakMap();
 
 window.addEventListener('tabula_settings_config', (event) => {
   const detail = typeof event.detail === 'string' ? event.detail : '';
@@ -31,6 +35,7 @@ window.addEventListener('tabula_settings_config', (event) => {
     const settings = normalizeSettingsConfig(parsed);
     blockerConfig = settings.blocker;
     fusionCleanRatio = settings.fusionCleanRatio;
+    analysisEnabled = settings.analysis.enabled;
   } catch (error) {
     console.warn('[TabulaBili] Failed to parse settings config:', error);
   }
@@ -60,7 +65,10 @@ function normalizeSettingsConfig(value) {
 
   return {
     blocker: normalizeBlockerConfig(blocker),
-    fusionCleanRatio: normalizeFusionCleanRatio(value && value.fusionCleanRatio)
+    fusionCleanRatio: normalizeFusionCleanRatio(value && value.fusionCleanRatio),
+    analysis: {
+      enabled: value && value.analysis && value.analysis.enabled === true
+    }
   };
 }
 
@@ -127,11 +135,17 @@ async function fetchFeedResponseForMode(args, requestUrl, currentMode) {
     return fetchFusionFeedResponse(args, requestUrl);
   }
 
+  let source = currentMode === 'origin' ? 'origin' : 'clean';
   if (currentMode !== 'pure' && currentMode !== 'origin') {
-    await prepareNetworkState();
+    const networkState = await prepareNetworkState();
+    if (currentMode === 'mixed') {
+      source = networkState && networkState.active ? 'mixed_clean' : 'mixed_origin';
+    }
   }
 
-  return nativeFetch(...args);
+  const response = await nativeFetch(...args);
+  responseAnalysisSources.set(response, source);
+  return response;
 }
 
 function isFusionCleanBranchUrl(url) {
@@ -159,6 +173,8 @@ async function fetchFusionFeedResponse(args, requestUrl) {
   const originPromise = readFeedBranch(nativeFetch(...args));
   const cleanPromise = readFeedBranch(nativeFetch(cleanUrl, buildRefillInit(args)));
   const [originBranch, cleanBranch] = await Promise.all([originPromise, cleanPromise]);
+  if (originBranch.response) responseAnalysisSources.set(originBranch.response, 'origin');
+  if (cleanBranch.response) responseAnalysisSources.set(cleanBranch.response, 'clean');
 
   if (originBranch.ok && cleanBranch.ok) {
     const targetLength = originBranch.items.length || cleanBranch.items.length;
@@ -170,7 +186,10 @@ async function fetchFusionFeedResponse(args, requestUrl) {
     );
 
     originBranch.payload.data.item = mergedItems;
-    return createJsonResponse(originBranch.response, originBranch.payload);
+    const mergedResponse = createJsonResponse(originBranch.response, originBranch.payload);
+    responseAnalysisSources.set(mergedResponse, 'fusion');
+    responseItemAnalysisSources.set(mergedResponse, buildItemAnalysisSourceMap(mergedItems));
+    return mergedResponse;
   }
 
   if (originBranch.ok) return originBranch.response;
@@ -249,15 +268,27 @@ function mergeFusionItems(originItems, cleanItems, targetLength, cleanRatio) {
     const fallbackItems = preferClean ? originItems : cleanItems;
     const fallbackCursor = preferClean ? originCursor : cleanCursor;
 
-    if (appendNextUnique(primaryItems, primaryCursor, output, seenKeys)) continue;
-    if (appendNextUnique(fallbackItems, fallbackCursor, output, seenKeys)) continue;
+    if (appendNextUnique(
+      primaryItems,
+      primaryCursor,
+      output,
+      seenKeys,
+      preferClean ? 'clean' : 'origin'
+    )) continue;
+    if (appendNextUnique(
+      fallbackItems,
+      fallbackCursor,
+      output,
+      seenKeys,
+      preferClean ? 'origin' : 'clean'
+    )) continue;
     break;
   }
 
   return output;
 }
 
-function appendNextUnique(items, cursor, output, seenKeys) {
+function appendNextUnique(items, cursor, output, seenKeys, source = 'unknown') {
   while (cursor.index < items.length) {
     const item = items[cursor.index];
     cursor.index += 1;
@@ -268,6 +299,9 @@ function appendNextUnique(items, cursor, output, seenKeys) {
       seenKeys.add(key);
     }
 
+    if (item && typeof item === 'object') {
+      item[ANALYSIS_SOURCE_SYMBOL] = source;
+    }
     output.push(item);
     return true;
   }
@@ -277,7 +311,7 @@ function appendNextUnique(items, cursor, output, seenKeys) {
 
 async function filterFeedResponse(response, originalArgs, originalUrl, currentMode) {
   const compiledRules = compileBlockRules();
-  if (!compiledRules.length) return response;
+  if (!analysisEnabled && !compiledRules.length) return response;
 
   let payload;
   try {
@@ -288,6 +322,16 @@ async function filterFeedResponse(response, originalArgs, originalUrl, currentMo
 
   const items = getPayloadItems(payload);
   if (!items) return response;
+
+  if (!compiledRules.length) {
+    dispatchAnalysisSamples(items, {
+      currentMode,
+      source: getResponseAnalysisSource(response, currentMode),
+      sourceMap: responseItemAnalysisSources.get(response),
+      responseUrl: originalUrl
+    });
+    return response;
+  }
 
   const targetLength = items.length;
   const seenKeys = new Set();
@@ -309,6 +353,13 @@ async function filterFeedResponse(response, originalArgs, originalUrl, currentMo
       console.warn('[TabulaBili] Failed to refill filtered feed:', error);
     }
   }
+
+  dispatchAnalysisSamples(filteredItems, {
+    currentMode,
+    source: getResponseAnalysisSource(response, currentMode),
+    sourceMap: responseItemAnalysisSources.get(response),
+    responseUrl: originalUrl
+  });
 
   if (initial.blocked === 0 && filteredItems.length === items.length) {
     return response;
@@ -371,6 +422,72 @@ function getItemUpName(item) {
     || getString(item && item.author);
 }
 
+function getItemAid(item) {
+  return getString(item && item.aid)
+    || getString(item && item.id)
+    || getString(item && item.args && item.args.aid);
+}
+
+function getItemBvid(item) {
+  const explicit = getString(item && item.bvid)
+    || getString(item && item.bv_id)
+    || getString(item && item.args && item.args.bvid)
+    || getString(item && item.args && item.args.bv_id);
+  if (explicit) return explicit;
+
+  const uri = getItemUri(item);
+  const match = uri.match(/BV[0-9A-Za-z]+/);
+  return match ? match[0] : '';
+}
+
+function getItemUri(item) {
+  return getString(item && item.uri)
+    || getString(item && item.url)
+    || getString(item && item.args && item.args.uri);
+}
+
+function getItemUpMid(item) {
+  return getString(item && item.owner && item.owner.mid)
+    || getString(item && item.mid)
+    || getString(item && item.up_mid)
+    || getString(item && item.args && item.args.up_mid)
+    || getString(item && item.args && item.args.up_id);
+}
+
+function getItemCategory(item) {
+  return getString(item && item.tname)
+    || getString(item && item.category)
+    || getString(item && item.args && item.args.tname)
+    || getString(item && item.args && item.args.tag);
+}
+
+function getItemReason(item) {
+  return getString(item && item.rcmd_reason && item.rcmd_reason.content)
+    || getString(item && item.rcmd_reason && item.rcmd_reason.reason)
+    || getString(item && item.reason)
+    || getString(item && item.desc_button && item.desc_button.text);
+}
+
+function getItemDuration(item) {
+  const value = item && (item.duration ?? (item.args && item.args.duration));
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function getItemStats(item) {
+  const stat = item && item.stat ? item.stat : {};
+  return {
+    view: getFiniteNumber(stat.view ?? stat.play ?? (item && item.play)),
+    like: getFiniteNumber(stat.like ?? (item && item.like)),
+    danmaku: getFiniteNumber(stat.danmaku ?? stat.danmaku_count ?? (item && item.danmaku))
+  };
+}
+
+function getFiniteNumber(value) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
 function getItemKey(item) {
   const key = getString(item && item.bvid)
     || getString(item && item.aid)
@@ -383,6 +500,105 @@ function getString(value) {
   if (typeof value === 'string') return value;
   if (typeof value === 'number') return String(value);
   return '';
+}
+
+function getResponseAnalysisSource(response, currentMode) {
+  const source = responseAnalysisSources.get(response);
+  if (source) return source;
+  if (currentMode === 'origin') return 'origin';
+  if (currentMode === 'pure' || currentMode === 'refresh') return 'clean';
+  return 'unknown';
+}
+
+function buildItemAnalysisSourceMap(items) {
+  const sourceMap = new Map();
+  for (const item of items) {
+    const source = item && item[ANALYSIS_SOURCE_SYMBOL];
+    const key = getAnalysisItemId(item);
+    if (key && source) sourceMap.set(key, source);
+  }
+  return sourceMap;
+}
+
+function getItemAnalysisSource(item, context) {
+  const itemSource = item && item[ANALYSIS_SOURCE_SYMBOL];
+  if (itemSource) return itemSource;
+
+  const key = getAnalysisItemId(item);
+  if (key && context.sourceMap && context.sourceMap.has(key)) {
+    return context.sourceMap.get(key);
+  }
+
+  return context.source || 'unknown';
+}
+
+function dispatchAnalysisSamples(items, context) {
+  if (!analysisEnabled || !Array.isArray(items) || !items.length) return;
+
+  const capturedAt = new Date().toISOString();
+  const samples = items
+    .map((item, index) => extractAnalysisSample(item, {
+      capturedAt,
+      mode: context.currentMode,
+      source: getItemAnalysisSource(item, context),
+      position: index + 1
+    }))
+    .filter(Boolean);
+
+  if (!samples.length) return;
+
+  window.dispatchEvent(new CustomEvent('tabula_analysis_samples', {
+    detail: JSON.stringify({
+      capturedAt,
+      url: context.responseUrl,
+      samples
+    })
+  }));
+}
+
+function extractAnalysisSample(item, context) {
+  if (!item || typeof item !== 'object') return null;
+
+  const bvid = getItemBvid(item);
+  const aid = getItemAid(item);
+  const uri = getItemUri(item);
+  const id = getAnalysisItemId(item);
+  if (!id) return null;
+
+  return {
+    id,
+    capturedAt: context.capturedAt,
+    dateKey: getLocalDateKey(context.capturedAt),
+    mode: context.mode || 'unknown',
+    source: context.source || 'unknown',
+    position: context.position,
+    bvid,
+    aid,
+    uri,
+    title: getItemTitle(item),
+    upName: getItemUpName(item),
+    upMid: getItemUpMid(item),
+    category: getItemCategory(item),
+    duration: getItemDuration(item),
+    reason: getItemReason(item),
+    stats: getItemStats(item),
+    feedback: 'unset',
+    tags: []
+  };
+}
+
+function getAnalysisItemId(item) {
+  return getItemBvid(item) || getItemAid(item) || getItemUri(item) || getItemKey(item);
+}
+
+function getLocalDateKey(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
 }
 
 async function refillItems(options) {
@@ -568,19 +784,29 @@ function prepareNetworkState() {
     }, 1200);
 
     function onNetworkReady(e) {
-      const detail = e.detail;
+      const detail = parseBridgeDetail(e.detail);
       const readyEventId = typeof detail === 'string' ? detail : detail && detail.eventId;
 
       if (readyEventId === eventId) {
         window.clearTimeout(fallbackTimer);
         window.removeEventListener('tabula_network_ready', onNetworkReady);
-        resolve();
+        resolve(detail && typeof detail === 'object' ? detail : null);
       }
     }
 
     window.addEventListener('tabula_network_ready', onNetworkReady);
     window.dispatchEvent(new CustomEvent('tabula_request_triggered', { detail: eventId }));
   });
+}
+
+function parseBridgeDetail(detail) {
+  if (typeof detail !== 'string') return detail;
+
+  try {
+    return JSON.parse(detail);
+  } catch {
+    return detail;
+  }
 }
 
 function md5(input) {

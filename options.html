@@ -55,6 +55,81 @@
       <section class="settings-panel">
         <div class="panel-heading">
           <div>
+            <h2 class="section-title options-section-title">信息统计</h2>
+            <p class="panel-desc">本地记录首页推荐样本，便于导出分析 UP 主和内容偏好。</p>
+          </div>
+          <label class="switch-row" for="analysisEnabled">
+            <span>启用</span>
+            <input type="checkbox" id="analysisEnabled">
+          </label>
+        </div>
+
+        <div class="analysis-settings">
+          <label class="field">
+            <span class="field-label">保留天数</span>
+            <input id="analysisRetentionDays" class="field-input" type="number" min="1" max="365" step="1" value="30">
+          </label>
+          <label class="field">
+            <span class="field-label">最大样本数</span>
+            <input id="analysisMaxSamples" class="field-input" type="number" min="100" max="50000" step="100" value="5000">
+          </label>
+          <label class="switch-row analysis-click-switch" for="analysisCaptureClicks">
+            <span>记录首页点击</span>
+            <input type="checkbox" id="analysisCaptureClicks">
+          </label>
+          <button type="button" class="secondary-btn" id="analysisSaveSettingsBtn">保存设置</button>
+        </div>
+
+        <div class="analysis-summary" aria-live="polite">
+          <div class="summary-item">
+            <span class="summary-label">总样本</span>
+            <strong id="analysisTotalSamples">0</strong>
+          </div>
+          <div class="summary-item">
+            <span class="summary-label">今日新增</span>
+            <strong id="analysisTodaySamples">0</strong>
+          </div>
+          <div class="summary-item">
+            <span class="summary-label">近 7 天</span>
+            <strong id="analysisWeekSamples">0</strong>
+          </div>
+          <div class="summary-item">
+            <span class="summary-label">已点击</span>
+            <strong id="analysisClickedSamples">0</strong>
+          </div>
+          <div class="summary-item">
+            <span class="summary-label">不喜欢</span>
+            <strong id="analysisDislikedSamples">0</strong>
+          </div>
+        </div>
+
+        <div class="analysis-actions">
+          <button type="button" class="secondary-btn" id="analysisExportCsvBtn">导出 CSV</button>
+          <button type="button" class="secondary-btn" id="analysisExportJsonlBtn">导出 JSONL</button>
+          <button type="button" class="secondary-btn danger-btn" id="analysisClearBtn">清空统计</button>
+        </div>
+        <p class="form-message" id="analysisMessage" role="status"></p>
+      </section>
+
+      <section class="settings-panel">
+        <div class="panel-heading compact">
+          <h2 class="section-title options-section-title">UP 主统计</h2>
+          <span class="rule-count" id="analysisUpCount">0 位</span>
+        </div>
+        <div class="analysis-list" id="analysisUpList"></div>
+      </section>
+
+      <section class="settings-panel">
+        <div class="panel-heading compact">
+          <h2 class="section-title options-section-title">最近推荐样本</h2>
+          <span class="rule-count" id="analysisSampleCount">0 条</span>
+        </div>
+        <div class="analysis-list" id="analysisSampleList"></div>
+      </section>
+
+      <section class="settings-panel">
+        <div class="panel-heading">
+          <div>
             <h2 class="section-title options-section-title">内容屏蔽</h2>
             <p class="panel-desc">规则会作用于所有模式，并在屏蔽后自动尝试补足首页数量。</p>
           </div>
@@ -91,6 +166,7 @@
     </main>
   </div>
 
+  <script src="analysis-common.js"></script>
   <script src="options.js"></script>
 </body>
 </html>

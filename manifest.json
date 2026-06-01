@@ -19,7 +19,7 @@
   "content_scripts": [
     {
       "matches": ["*://www.bilibili.com/*", "*://www.bilibili.com/?*"],
-      "js": ["content.js"],
+      "js": ["analysis-common.js", "content.js"],
       "run_at": "document_start"
     },
     {

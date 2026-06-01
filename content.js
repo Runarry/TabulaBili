@@ -1,6 +1,10 @@
 const extensionApi = globalThis.browser ?? globalThis.chrome;
 const usePromiseApi = typeof globalThis.browser !== 'undefined';
 const DEFAULT_FUSION_CLEAN_RATIO = 50;
+const analysisStore = globalThis.TabulaBiliAnalysis;
+
+let pendingAnalysisSamples = [];
+let analysisFlushTimer = null;
 
 function getLastRuntimeError() {
   return extensionApi.runtime.lastError
@@ -116,8 +120,10 @@ function getBridgeEventId(detail) {
   return null;
 }
 
-function dispatchNetworkReady(eventId) {
-  window.dispatchEvent(new CustomEvent('tabula_network_ready', { detail: eventId }));
+function dispatchNetworkReady(detail) {
+  window.dispatchEvent(new CustomEvent('tabula_network_ready', {
+    detail: typeof detail === 'string' ? detail : JSON.stringify(detail)
+  }));
 }
 
 function normalizeBlockerRules(value) {
@@ -152,7 +158,8 @@ async function syncSettingsConfig() {
   const result = await storageGet([
     'bili_blocker_enabled',
     'bili_block_rules',
-    'bili_fusion_clean_ratio'
+    'bili_fusion_clean_ratio',
+    'bili_analysis_enabled'
   ]);
 
   dispatchSettingsConfig({
@@ -160,8 +167,85 @@ async function syncSettingsConfig() {
       enabled: result.bili_blocker_enabled !== false,
       rules: normalizeBlockerRules(result.bili_block_rules)
     },
-    fusionCleanRatio: normalizeFusionCleanRatio(result.bili_fusion_clean_ratio)
+    fusionCleanRatio: normalizeFusionCleanRatio(result.bili_fusion_clean_ratio),
+    analysis: {
+      enabled: result.bili_analysis_enabled === true
+    }
   });
+}
+
+function queueAnalysisSamples(samples) {
+  if (!Array.isArray(samples) || !samples.length) return;
+
+  pendingAnalysisSamples.push(...samples);
+  if (analysisFlushTimer) {
+    clearTimeout(analysisFlushTimer);
+  }
+
+  analysisFlushTimer = setTimeout(() => {
+    analysisFlushTimer = null;
+    flushAnalysisSamples().catch((error) => {
+      console.warn('[TabulaBili] Failed to store analysis samples:', error);
+    });
+  }, 500);
+}
+
+async function flushAnalysisSamples() {
+  const samples = pendingAnalysisSamples;
+  pendingAnalysisSamples = [];
+  if (!samples.length) return;
+
+  const result = await storageGet([
+    'bili_analysis_enabled',
+    analysisStore.SAMPLES_KEY,
+    analysisStore.SETTINGS_KEY
+  ]);
+
+  if (result.bili_analysis_enabled !== true) return;
+
+  const settings = analysisStore.normalizeSettings(result[analysisStore.SETTINGS_KEY]);
+  const merged = analysisStore.mergeSamples(result[analysisStore.SAMPLES_KEY], samples, settings);
+  await storageSet({ [analysisStore.SAMPLES_KEY]: merged });
+}
+
+function getVideoIdFromUrl(value) {
+  if (!value) return '';
+
+  try {
+    const url = new URL(value, location.href);
+    const match = url.pathname.match(/\/video\/(BV[0-9A-Za-z]+)/);
+    if (match) return match[1];
+  } catch {
+    const match = String(value).match(/\/video\/(BV[0-9A-Za-z]+)/);
+    if (match) return match[1];
+  }
+
+  return '';
+}
+
+async function trackAnalysisClick(videoId) {
+  if (!videoId) return;
+  if (pendingAnalysisSamples.length) {
+    await flushAnalysisSamples();
+  }
+
+  const result = await storageGet([
+    'bili_analysis_enabled',
+    analysisStore.SAMPLES_KEY,
+    analysisStore.SETTINGS_KEY
+  ]);
+  if (result.bili_analysis_enabled !== true) return;
+
+  const settings = analysisStore.normalizeSettings(result[analysisStore.SETTINGS_KEY]);
+  if (!settings.captureClicks) return;
+
+  const samples = analysisStore.normalizeSamples(result[analysisStore.SAMPLES_KEY]);
+  const target = samples.find((sample) => sample.id === videoId || sample.bvid === videoId);
+  if (!target) return;
+
+  target.clickCount = analysisStore.getPositiveInteger(target.clickCount, 0) + 1;
+  target.lastClickedAt = new Date().toISOString();
+  await storageSet({ [analysisStore.SAMPLES_KEY]: analysisStore.trimSamples(samples, settings) });
 }
 
 const fingerprintReady = captureBiliFingerprint().catch((error) => {
@@ -174,6 +258,18 @@ window.addEventListener('tabula_settings_config_request', () => {
   });
 });
 
+window.addEventListener('tabula_analysis_samples', (event) => {
+  const detail = typeof event.detail === 'string' ? event.detail : '';
+  if (!detail) return;
+
+  try {
+    const parsed = JSON.parse(detail);
+    queueAnalysisSamples(parsed && parsed.samples);
+  } catch (error) {
+    console.warn('[TabulaBili] Failed to parse analysis samples:', error);
+  }
+});
+
 syncSettingsConfig().catch((error) => {
   console.warn('[TabulaBili] Failed to initialize settings config:', error);
 });
@@ -182,15 +278,32 @@ window.addEventListener('tabula_request_triggered', async (event) => {
   const eventId = getBridgeEventId(event.detail);
   if (!eventId) return;
 
+  let response = null;
   try {
     await fingerprintReady;
-    await sendRuntimeMessage({ action: 'evaluateMixedRequest' });
+    response = await sendRuntimeMessage({ action: 'evaluateMixedRequest' });
   } catch (error) {
     console.warn('[TabulaBili] Failed to prepare network state:', error);
   } finally {
-    dispatchNetworkReady(eventId);
+    dispatchNetworkReady({
+      eventId,
+      active: response && response.active === true
+    });
   }
 });
+
+document.addEventListener('click', (event) => {
+  const target = event.target;
+  if (!target || typeof target.closest !== 'function') return;
+
+  const link = target.closest('a[href]');
+  const videoId = link ? getVideoIdFromUrl(link.href) : '';
+  if (!videoId) return;
+
+  trackAnalysisClick(videoId).catch((error) => {
+    console.warn('[TabulaBili] Failed to track analysis click:', error);
+  });
+}, true);
 
 storageGet(['bili_mode'])
   .then((result) => {
@@ -244,7 +357,12 @@ extensionApi.runtime.onMessage.addListener((message, sender, sendResponse) => {
 extensionApi.storage.onChanged.addListener((changes, areaName) => {
   if (areaName !== 'local') return;
 
-  if (changes.bili_blocker_enabled || changes.bili_block_rules || changes.bili_fusion_clean_ratio) {
+  if (
+    changes.bili_blocker_enabled
+    || changes.bili_block_rules
+    || changes.bili_fusion_clean_ratio
+    || changes.bili_analysis_enabled
+  ) {
     syncSettingsConfig().catch((error) => {
       console.warn('[TabulaBili] Failed to sync settings config:', error);
     });
