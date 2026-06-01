@@ -159,6 +159,8 @@ function csvEscape(value) {
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
+  const tabButtons = [...document.querySelectorAll('[data-tab-target]')];
+  const tabPanels = [...document.querySelectorAll('[data-tab-panel]')];
   const fusionCleanRatioInput = document.getElementById('fusionCleanRatio');
   const fusionCleanRatioText = document.getElementById('fusionCleanRatioText');
   const fusionOriginRatioText = document.getElementById('fusionOriginRatioText');
@@ -175,6 +177,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const analysisMaxSamplesInput = document.getElementById('analysisMaxSamples');
   const analysisCaptureClicksInput = document.getElementById('analysisCaptureClicks');
   const analysisSaveSettingsBtn = document.getElementById('analysisSaveSettingsBtn');
+  const analysisSettingsMessage = document.getElementById('analysisSettingsMessage');
   const analysisTotalSamples = document.getElementById('analysisTotalSamples');
   const analysisTodaySamples = document.getElementById('analysisTodaySamples');
   const analysisWeekSamples = document.getElementById('analysisWeekSamples');
@@ -196,6 +199,29 @@ document.addEventListener('DOMContentLoaded', async () => {
   let analysisSamples = [];
   let refreshTimer = null;
 
+  function getTabFromHash() {
+    const name = window.location.hash.replace(/^#/, '');
+    return name === 'statistics' || name === 'settings' ? name : 'settings';
+  }
+
+  function activateOptionsTab(tabName, updateHash = false) {
+    const activeTab = tabName === 'statistics' ? 'statistics' : 'settings';
+
+    for (const button of tabButtons) {
+      const isActive = button.dataset.tabTarget === activeTab;
+      button.classList.toggle('active', isActive);
+      button.setAttribute('aria-selected', String(isActive));
+    }
+
+    for (const panel of tabPanels) {
+      panel.hidden = panel.dataset.tabPanel !== activeTab;
+    }
+
+    if (updateHash && window.location.hash !== `#${activeTab}`) {
+      window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}#${activeTab}`);
+    }
+  }
+
   function setMessage(text, isError = false) {
     formMessage.textContent = text;
     formMessage.classList.toggle('error', isError);
@@ -204,6 +230,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   function setFusionMessage(text, isError = false) {
     fusionMessage.textContent = text;
     fusionMessage.classList.toggle('error', isError);
+  }
+
+  function setAnalysisSettingsMessage(text, isError = false) {
+    analysisSettingsMessage.textContent = text;
+    analysisSettingsMessage.classList.toggle('error', isError);
   }
 
   function setAnalysisMessage(text, isError = false) {
@@ -633,6 +664,18 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
+  for (const button of tabButtons) {
+    button.addEventListener('click', () => {
+      activateOptionsTab(button.dataset.tabTarget, true);
+    });
+  }
+
+  window.addEventListener('hashchange', () => {
+    activateOptionsTab(getTabFromHash());
+  });
+
+  activateOptionsTab(getTabFromHash());
+
   try {
     const result = await storageGet([
       'bili_blocker_enabled',
@@ -690,20 +733,20 @@ document.addEventListener('DOMContentLoaded', async () => {
   analysisEnabledInput.addEventListener('change', async () => {
     try {
       await persistAnalysisSettings();
-      setAnalysisMessage(analysisEnabled ? '本地分析模式已开启。' : '本地分析模式已关闭。');
+      setAnalysisSettingsMessage(analysisEnabled ? '本地分析模式已开启。' : '本地分析模式已关闭。');
     } catch (error) {
       console.warn('[TabulaBili] Failed to save analysis enabled state:', error);
-      setAnalysisMessage('保存失败，请重试。', true);
+      setAnalysisSettingsMessage('保存失败，请重试。', true);
     }
   });
 
   analysisSaveSettingsBtn.addEventListener('click', async () => {
     try {
       await persistAnalysisSettings();
-      setAnalysisMessage('统计设置已保存。');
+      setAnalysisSettingsMessage('统计设置已保存。');
     } catch (error) {
       console.warn('[TabulaBili] Failed to save analysis settings:', error);
-      setAnalysisMessage('保存失败，请重试。', true);
+      setAnalysisSettingsMessage('保存失败，请重试。', true);
     }
   });
 
