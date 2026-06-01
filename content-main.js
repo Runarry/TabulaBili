@@ -145,7 +145,13 @@ function isFusionCleanBranchUrl(url) {
 async function fetchFusionFeedResponse(args, requestUrl) {
   await prepareNetworkState();
 
-  const cleanUrl = await buildSignedFusionCleanUrl(requestUrl);
+  let cleanUrl = '';
+  try {
+    cleanUrl = await buildSignedFusionCleanUrl(requestUrl);
+  } catch (error) {
+    console.warn('[TabulaBili] Failed to build fusion clean URL:', error);
+  }
+
   if (!cleanUrl) {
     return nativeFetch(...args);
   }
@@ -485,12 +491,19 @@ async function getWbiMixinKey() {
     return cachedWbiMixinKey;
   }
 
-  const response = await nativeFetch('https://api.bilibili.com/x/web-interface/nav', {
-    credentials: 'omit'
-  });
-  if (!response.ok) return '';
+  let payload;
+  try {
+    const response = await nativeFetch('https://api.bilibili.com/x/web-interface/nav', {
+      credentials: 'omit'
+    });
+    if (!response.ok) return '';
 
-  const payload = await response.json();
+    payload = await response.json();
+  } catch (error) {
+    console.warn('[TabulaBili] Failed to fetch WBI key:', error);
+    return '';
+  }
+
   const imgUrl = payload && payload.data && payload.data.wbi_img && payload.data.wbi_img.img_url;
   const subUrl = payload && payload.data && payload.data.wbi_img && payload.data.wbi_img.sub_url;
   const rawKey = `${extractWbiFileKey(imgUrl)}${extractWbiFileKey(subUrl)}`;
