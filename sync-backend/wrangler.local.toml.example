@@ -1,0 +1,16 @@
+# Copy this file to wrangler.local.toml before deploying.
+# Fill database_id with the ID printed by:
+# npx wrangler d1 create tabulabili-sync
+
+name = "tabulabili-sync"
+main = "src/worker.js"
+compatibility_date = "2026-06-01"
+
+# Preserve dashboard-defined plain variables. Encrypted secrets are preserved
+# by Wrangler unless they are explicitly deleted.
+keep_vars = true
+
+[[d1_databases]]
+binding = "TABULABILI_SYNC_DB"
+database_name = "tabulabili-sync"
+database_id = "<your-d1-database-id>"

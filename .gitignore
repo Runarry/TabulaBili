@@ -45,3 +45,7 @@ node_modules/
 .temp/
 .tmp/
 dist/
+
+# Cloudflare Wrangler local deployment config/state
+sync-backend/wrangler.local.toml
+sync-backend/.wrangler/

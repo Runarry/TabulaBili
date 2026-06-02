@@ -105,94 +105,73 @@ SQLite 数据保存在 `tabulabili-sync-data` volume 中。需要备份时备份
 
 ## Cloudflare Worker + D1
 
-1. 创建 D1 database：
+部署时使用本地私有配置文件 `wrangler.local.toml`。仓库只提交 `wrangler.local.toml.example`，真实的 D1 `database_id` 不提交。
+
+### 1. 创建 D1
+
+创建 D1 database：
 
 ```bash
 npx wrangler d1 create tabulabili-sync
 ```
 
-2. 在 Cloudflare Dashboard 的 Worker 设置中添加 D1 绑定：
+记录命令输出中的 `database_id`。也可以在 Cloudflare Dashboard 的 `Workers & Pages` -> `D1` 页面创建或查看。
 
-- Binding name: `TABULABILI_SYNC_DB`
-- D1 database: 选择刚创建的 `tabulabili-sync`
+### 2. 准备本地部署配置
 
-3. 在 Cloudflare Dashboard 的 Worker 环境变量中添加密钥：
+在 `sync-backend/` 目录复制示例配置：
 
-- Variable name: `SYNC_SECRET`
-- Value: 使用长随机字符串
-- 建议设置为 Secret/Encrypted 类型
-
-也可以用命令设置密钥：
-
-```bash
-npx wrangler secret put SYNC_SECRET
+```powershell
+Copy-Item wrangler.local.toml.example wrangler.local.toml
 ```
 
-4. 部署：
+然后编辑 `wrangler.local.toml`，把 `database_id` 改成真实 D1 ID：
 
-```bash
-npm install
-npx wrangler deploy
+```toml
+[[d1_databases]]
+binding = "TABULABILI_SYNC_DB"
+database_name = "tabulabili-sync"
+database_id = "<your-d1-database-id>"
 ```
 
-D1 表和索引会在 Worker 首次访问时自动创建。旧 KV 数据不会自动迁移到 D1。
+`wrangler.local.toml` 已被 `.gitignore` 忽略，不要提交真实 D1 ID。
 
-## Cloudflare Dashboard 纯后台部署
+### 3. 设置密钥
 
-这个流程不需要把 D1 database id 或密钥写进 `wrangler.toml`。所有运行时配置都在 Cloudflare 后台完成。
+使用同一个本地配置设置 Secret：
 
-### 1. 创建 D1
-
-1. 打开 Cloudflare Dashboard。
-2. 进入 `Workers & Pages` -> `D1`。
-3. 创建一个 database，例如 `tabulabili-sync`。
-
-### 2. 创建 Worker
-
-1. 进入 `Workers & Pages`。
-2. 点击 `Create` -> `Worker`。
-3. 创建 Worker，例如命名为 `tabulabili-sync`。
-4. 暂时保留默认代码，后续用部署命令上传项目代码。
-
-### 3. 绑定 D1
-
-1. 打开刚创建的 Worker。
-2. 进入 `Settings` -> `Bindings`。
-3. 添加 `D1 database binding`。
-4. 设置：
-
-- Variable name: `TABULABILI_SYNC_DB`
-- D1 database: 选择刚创建的 `tabulabili-sync`
-
-### 4. 设置密钥
-
-1. 仍在 Worker 的 `Settings` 页面。
-2. 进入 `Variables and Secrets`。
-3. 添加 Secret：
-
-- Name: `SYNC_SECRET`
-- Value: 使用长随机字符串
+```bash
+npx wrangler secret put SYNC_SECRET --config wrangler.local.toml
+```
 
 这个密钥就是后台页面登录密钥，也是扩展端同步密钥。
 
-### 5. 上传 Worker 代码
+### 4. 部署代码
 
 在 `sync-backend/` 目录运行：
 
 ```bash
 npm install
-npx wrangler deploy
+npm run deploy
 ```
 
-这里的 `wrangler.toml` 只提供 Worker 名称和入口文件。D1 绑定与 `SYNC_SECRET` 已经在 Cloudflare 后台设置，不需要写入配置文件。
+`npm run deploy` 会执行：
 
-### 6. 验证后台
+```bash
+npx wrangler deploy --config wrangler.local.toml
+```
+
+这样 D1 binding 会由本地 `wrangler.local.toml` 随部署一起提交，避免普通 `npx wrangler deploy` 用缺少 D1 的配置覆盖 Cloudflare 后台绑定。
+
+### 5. 验证后台
 
 1. 打开 Worker 地址，例如 `https://tabulabili-sync.<account>.workers.dev`。
 2. 输入 `SYNC_SECRET` 登录。
 3. `/data` 能看到配置、批次和样本，`/analytics` 能看到分析页面即部署成功。
 
-### 7. 配置扩展
+D1 表和索引会在 Worker 首次访问时自动创建。旧 KV 数据不会自动迁移到 D1。
+
+### 6. 配置扩展
 
 在扩展设置页的“同步与上报”区域填写：
 
@@ -200,6 +179,10 @@ npx wrangler deploy
 - 服务密钥：`SYNC_SECRET`
 - 开启同步与上报
 - 点击“立即同步”测试连接
+
+### Dashboard 设置说明
+
+Cloudflare Dashboard 可以用来查看 Worker、D1 和 Secret，但部署配置以 `wrangler.local.toml` 为准。不要再用只读取默认 `wrangler.toml` 的普通 `npx wrangler deploy`，否则仍可能覆盖远端 D1 绑定。
 
 ## 扩展端配置
 
