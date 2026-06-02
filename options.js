@@ -71,6 +71,78 @@ function tabsSendMessage(tabId, message) {
   });
 }
 
+function callPermissionsBoolean(method, permissions, fallbackValue) {
+  if (!extensionApi.permissions) {
+    return fallbackValue instanceof Error
+      ? Promise.reject(fallbackValue)
+      : Promise.resolve(fallbackValue);
+  }
+  if (usePromiseApi) return extensionApi.permissions[method](permissions);
+
+  return new Promise((resolve, reject) => {
+    extensionApi.permissions[method](permissions, (result) => {
+      const error = getLastRuntimeError();
+      if (error) reject(error);
+      else resolve(result === true);
+    });
+  });
+}
+
+function permissionsContains(permissions) {
+  return callPermissionsBoolean('contains', permissions, false);
+}
+
+function permissionsRequest(permissions) {
+  return callPermissionsBoolean('request', permissions, new Error('当前浏览器不支持运行时授权'));
+}
+
+function permissionsRemove(permissions) {
+  return callPermissionsBoolean('remove', permissions, false);
+}
+
+function getBackendOriginPattern(endpoint) {
+  const text = syncStore.normalizeEndpoint(endpoint);
+  if (!text) return '';
+
+  let url;
+  try {
+    url = new URL(text);
+  } catch {
+    throw new Error('后端 URL 格式无效');
+  }
+
+  const hostname = url.hostname.toLowerCase();
+  const isLocalHttp = url.protocol === 'http:' && (hostname === 'localhost' || hostname === '127.0.0.1');
+  if (url.protocol !== 'https:' && !isLocalHttp) {
+    throw new Error('后端 URL 仅支持 HTTPS；本地调试可使用 localhost 或 127.0.0.1');
+  }
+
+  return `${url.protocol}//${hostname}/*`;
+}
+
+function getBackendOriginPatternOrEmpty(endpoint) {
+  try {
+    return getBackendOriginPattern(endpoint);
+  } catch {
+    return '';
+  }
+}
+
+async function ensureBackendHostPermission(endpoint) {
+  const origin = getBackendOriginPattern(endpoint);
+  if (!origin) return '';
+
+  const granted = await permissionsRequest({ origins: [origin] });
+  if (!granted) throw new Error(`未授权访问后端 ${origin}`);
+  return origin;
+}
+
+async function removeBackendHostPermission(origin) {
+  if (!origin) return;
+  const hasPermission = await permissionsContains({ origins: [origin] });
+  if (hasPermission) await permissionsRemove({ origins: [origin] });
+}
+
 function createRuleId() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -330,17 +402,33 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   async function persistSyncSettings() {
-    syncEndpoint = syncStore.normalizeEndpoint(syncEndpointInput.value);
-    syncSecret = syncSecretInput.value.trim();
-    reportFrequency = syncStore.normalizeFrequency(reportFrequencyInput.value);
-    syncEnabled = syncEnabledInput.checked;
+    const previousOrigin = getBackendOriginPatternOrEmpty(syncEndpoint);
+    const nextEndpoint = syncStore.normalizeEndpoint(syncEndpointInput.value);
+    const nextSecret = syncSecretInput.value.trim();
+    const nextReportFrequency = syncStore.normalizeFrequency(reportFrequencyInput.value);
+    const nextEnabled = syncEnabledInput.checked;
+    const nextOrigin = nextEnabled && nextEndpoint
+      ? await ensureBackendHostPermission(nextEndpoint)
+      : '';
+
     await storageSet({
-      [syncStore.ENDPOINT_KEY]: syncEndpoint,
-      [syncStore.SECRET_KEY]: syncSecret,
-      [syncStore.ENABLED_KEY]: syncEnabled,
-      [syncStore.REPORT_FREQUENCY_KEY]: reportFrequency
+      [syncStore.ENDPOINT_KEY]: nextEndpoint,
+      [syncStore.SECRET_KEY]: nextSecret,
+      [syncStore.ENABLED_KEY]: nextEnabled,
+      [syncStore.REPORT_FREQUENCY_KEY]: nextReportFrequency
     });
+
+    syncEndpoint = nextEndpoint;
+    syncSecret = nextSecret;
+    reportFrequency = nextReportFrequency;
+    syncEnabled = nextEnabled;
     renderSyncControls();
+
+    if (previousOrigin && previousOrigin !== nextOrigin) {
+      removeBackendHostPermission(previousOrigin).catch((error) => {
+        console.warn('[TabulaBili] Failed to remove previous backend permission:', error);
+      });
+    }
   }
 
   function renderAnalysisControls() {
@@ -888,7 +976,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       setSyncMessage('同步连接已保存。');
     } catch (error) {
       console.warn('[TabulaBili] Failed to save sync settings:', error);
-      setSyncMessage('保存失败，请重试。', true);
+      setSyncMessage(`保存失败：${error.message}`, true);
     }
   });
 
@@ -898,7 +986,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       setSyncMessage(syncEnabled ? '同步已启用。' : '同步已关闭。');
     } catch (error) {
       console.warn('[TabulaBili] Failed to save sync enabled state:', error);
-      setSyncMessage('保存失败，请重试。', true);
+      renderSyncControls();
+      setSyncMessage(`保存失败：${error.message}`, true);
     }
   });
 

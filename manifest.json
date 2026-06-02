@@ -11,8 +11,12 @@
   ],
   "host_permissions": [
     "*://api.bilibili.com/*",
-    "*://www.bilibili.com/*",
-    "<all_urls>"
+    "*://www.bilibili.com/*"
+  ],
+  "optional_host_permissions": [
+    "https://*/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*"
   ],
   "background": {
     "scripts": ["analysis-common.js", "sync-common.js", "background.js"],
