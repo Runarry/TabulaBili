@@ -10,6 +10,28 @@ const ANALYTICS_FILTERS = [
 
 const NEGATIVE_FEEDBACK = new Set(['dislike', 'blocked']);
 
+const SAMPLE_SORTS = new Set([
+  'lastSeenAt',
+  'seenCount',
+  'clickCount',
+  'ctr',
+  'negativeFeedback',
+  'repeatCount',
+  'firstSeenAt',
+  'lastClickedAt'
+]);
+
+const SAMPLE_ORDER_BY = {
+  seenCount: 'seen_count desc, last_seen_at desc',
+  clickCount: 'click_count desc, last_seen_at desc',
+  ctr: 'case when seen_count > 0 then cast(click_count as real) / seen_count else 0 end desc, last_seen_at desc',
+  negativeFeedback: "case when feedback in ('dislike', 'blocked') then 1 else 0 end desc, seen_count desc, last_seen_at desc",
+  repeatCount: 'case when seen_count > 1 then seen_count - 1 else 0 end desc, last_seen_at desc',
+  firstSeenAt: 'first_seen_at desc, last_seen_at desc',
+  lastClickedAt: 'last_clicked_at desc, last_seen_at desc',
+  lastSeenAt: 'last_seen_at desc'
+};
+
 function normalizeNumber(value, fallback) {
   const number = Number(value);
   return Number.isFinite(number) ? number : fallback;
@@ -24,12 +46,24 @@ function normalizeOffset(value) {
 }
 
 function normalizeSampleListOptions(options = {}, maxLimit = 10000) {
+  const sort = SAMPLE_SORTS.has(options.sort) ? options.sort : 'lastSeenAt';
   return {
     limit: normalizeLimit(options.limit, maxLimit),
     offset: normalizeOffset(options.offset),
     q: String(options.q || '').trim(),
     feedback: String(options.feedback || 'all'),
-    sort: options.sort === 'seenCount' || options.sort === 'clickCount' ? options.sort : 'lastSeenAt'
+    sort,
+    clientId: normalizeFilter(options.clientId),
+    mode: normalizeFilter(options.mode),
+    source: normalizeFilter(options.source),
+    category: normalizeFilter(options.category),
+    upMid: normalizeFilter(options.upMid),
+    upName: normalizeFilter(options.upName),
+    minSeenCount: Math.max(0, normalizeNumber(options.minSeenCount || 0, 0)),
+    minClickCount: Math.max(0, normalizeNumber(options.minClickCount || 0, 0)),
+    since: normalizeFilter(options.since),
+    until: normalizeFilter(options.until),
+    hasFeedback: normalizeBooleanFilter(options.hasFeedback)
   };
 }
 
@@ -39,18 +73,41 @@ function getSearchText(item) {
     .join(' ');
 }
 
-function filterSamples(samples, options) {
+function filterSamples(samples, options, events = []) {
   const q = options.q.toLowerCase();
+  const eventSampleIds = getSampleIdsMatchingEventFilters(events, options);
   return samples
+    .filter((item) => !eventSampleIds || eventSampleIds.has(item.id || item.sampleId))
     .filter((item) => !q || getSearchText(item).includes(q))
-    .filter((item) => options.feedback === 'all' || !options.feedback || item.feedback === options.feedback);
+    .filter((item) => options.feedback === 'all' || !options.feedback || item.feedback === options.feedback)
+    .filter((item) => !options.category || item.category === options.category)
+    .filter((item) => !options.upMid || item.upMid === options.upMid)
+    .filter((item) => !options.upName || String(item.upName || '').includes(options.upName))
+    .filter((item) => Number(item.seenCount || 0) >= options.minSeenCount)
+    .filter((item) => Number(item.clickCount || 0) >= options.minClickCount)
+    .filter((item) => options.hasFeedback == null || hasSampleFeedback(item) === options.hasFeedback);
 }
 
 function sortSamples(samples, sort) {
   return samples.sort((a, b) => {
-    if (sort === 'seenCount') return Number(b.seenCount || 0) - Number(a.seenCount || 0);
-    if (sort === 'clickCount') return Number(b.clickCount || 0) - Number(a.clickCount || 0);
-    return String(b.lastSeenAt).localeCompare(String(a.lastSeenAt));
+    switch (sort) {
+      case 'seenCount':
+        return Number(b.seenCount || 0) - Number(a.seenCount || 0);
+      case 'clickCount':
+        return Number(b.clickCount || 0) - Number(a.clickCount || 0);
+      case 'ctr':
+        return ratio(Number(b.clickCount || 0), Number(b.seenCount || 0)) - ratio(Number(a.clickCount || 0), Number(a.seenCount || 0));
+      case 'negativeFeedback':
+        return Number(hasNegativeSampleFeedback(b)) - Number(hasNegativeSampleFeedback(a)) || Number(b.seenCount || 0) - Number(a.seenCount || 0);
+      case 'repeatCount':
+        return Math.max(0, Number(b.seenCount || 0) - 1) - Math.max(0, Number(a.seenCount || 0) - 1);
+      case 'firstSeenAt':
+        return String(b.firstSeenAt).localeCompare(String(a.firstSeenAt));
+      case 'lastClickedAt':
+        return String(b.lastClickedAt).localeCompare(String(a.lastClickedAt));
+      default:
+        return String(b.lastSeenAt).localeCompare(String(a.lastSeenAt));
+    }
   });
 }
 
@@ -65,6 +122,37 @@ function getSampleWhere(options) {
     where.push('feedback = ?');
     args.push(options.feedback);
   }
+  if (options.category) {
+    where.push('category = ?');
+    args.push(options.category);
+  }
+  if (options.upMid) {
+    where.push('up_mid = ?');
+    args.push(options.upMid);
+  }
+  if (options.upName) {
+    where.push('up_name like ?');
+    args.push(`%${options.upName}%`);
+  }
+  if (options.minSeenCount > 0) {
+    where.push('seen_count >= ?');
+    args.push(options.minSeenCount);
+  }
+  if (options.minClickCount > 0) {
+    where.push('click_count >= ?');
+    args.push(options.minClickCount);
+  }
+  if (options.hasFeedback === true) {
+    where.push("feedback <> 'unset'");
+  }
+  if (options.hasFeedback === false) {
+    where.push("feedback = 'unset'");
+  }
+  const eventFilter = getSampleEventFilterWhere(options);
+  if (eventFilter.whereSql) {
+    where.push(`exists (select 1 from events where events.sample_id = samples.sample_id and ${eventFilter.whereSql})`);
+    args.push(...eventFilter.args);
+  }
   return {
     whereSql: where.length ? `where ${where.join(' and ')}` : '',
     args
@@ -72,14 +160,73 @@ function getSampleWhere(options) {
 }
 
 function getSampleOrderBy(sort) {
-  if (sort === 'seenCount') return 'seen_count desc, last_seen_at desc';
-  if (sort === 'clickCount') return 'click_count desc, last_seen_at desc';
-  return 'last_seen_at desc';
+  return SAMPLE_ORDER_BY[sort] || SAMPLE_ORDER_BY.lastSeenAt;
+}
+
+function hasSampleEventFilters(options) {
+  return Boolean(options.clientId || options.mode || options.source || options.since || options.until);
+}
+
+function getSampleEventFilterWhere(options) {
+  const where = [];
+  const args = [];
+  if (options.clientId) {
+    where.push('client_id = ?');
+    args.push(options.clientId);
+  }
+  if (options.mode) {
+    where.push('mode = ?');
+    args.push(options.mode);
+  }
+  if (options.source) {
+    where.push('source = ?');
+    args.push(options.source);
+  }
+  if (options.since) {
+    where.push('captured_at >= ?');
+    args.push(options.since);
+  }
+  if (options.until) {
+    where.push('captured_at <= ?');
+    args.push(options.until);
+  }
+  return {
+    whereSql: where.join(' and '),
+    args
+  };
+}
+
+function getSampleIdsMatchingEventFilters(events, options) {
+  if (!hasSampleEventFilters(options)) return null;
+  const ids = new Set();
+  for (const event of events) {
+    const normalized = normalizeStoredEvent(event);
+    if (!eventMatchesSampleFilters(normalized, options)) continue;
+    const sampleId = normalized.sampleId || getSampleId(normalized);
+    if (sampleId) ids.add(sampleId);
+  }
+  return ids;
+}
+
+function eventMatchesSampleFilters(event, options) {
+  if (options.clientId && event.clientId !== options.clientId) return false;
+  if (options.mode && event.mode !== options.mode) return false;
+  if (options.source && event.source !== options.source) return false;
+  if (options.since && String(event.capturedAt || '') < options.since) return false;
+  if (options.until && String(event.capturedAt || '') > options.until) return false;
+  return true;
 }
 
 function normalizeFilter(value) {
   const text = String(value || '').trim();
   return text && text !== 'all' ? text : '';
+}
+
+function normalizeBooleanFilter(value) {
+  const text = String(value || '').trim().toLowerCase();
+  if (text === '1' || text === 'true' || text === 'yes') return true;
+  if (text === '0' || text === 'false' || text === 'no') return false;
+  return null;
 }
 
 function countBy(items, getKey) {
@@ -99,6 +246,14 @@ function ratio(numerator, denominator) {
 
 function isNegativeFeedback(event) {
   return NEGATIVE_FEEDBACK.has(event.feedback);
+}
+
+function hasSampleFeedback(sample) {
+  return Boolean(sample.feedback && sample.feedback !== 'unset');
+}
+
+function hasNegativeSampleFeedback(sample) {
+  return NEGATIVE_FEEDBACK.has(sample.feedback);
 }
 
 function getLocalDateKey(value, tzOffsetMinutes) {
@@ -124,6 +279,20 @@ function normalizeAnalyticsOptions(options = {}) {
   };
 }
 
+function normalizeEventListOptions(options = {}) {
+  const days = Math.min(365, Math.max(1, normalizeNumber(options.days || 30, 30)));
+  const sinceMs = Date.now() - (days - 1) * 24 * 60 * 60 * 1000;
+  return {
+    limit: normalizeLimit(options.limit, 500, 100),
+    offset: normalizeOffset(options.offset),
+    sampleId: normalizeFilter(options.sampleId),
+    eventKind: ['impression', 'click', 'feedback'].includes(options.eventKind) ? options.eventKind : '',
+    days,
+    sinceMs,
+    sinceIso: new Date(sinceMs).toISOString()
+  };
+}
+
 function getAnalyticsEventWhere(options) {
   const where = ['captured_at >= ?'];
   const args = [options.sinceIso];
@@ -140,11 +309,33 @@ function getAnalyticsEventWhere(options) {
   };
 }
 
+function getReportEventWhere(options) {
+  const where = ['sample_id = ?', 'captured_at >= ?'];
+  const args = [options.sampleId, options.sinceIso];
+  if (options.eventKind) {
+    where.push('event_kind = ?');
+    args.push(options.eventKind);
+  }
+  return {
+    whereSql: `where ${where.join(' and ')}`,
+    args
+  };
+}
+
 function eventMatchesAnalyticsOptions(event, options) {
   const capturedMs = Date.parse(event.capturedAt || event.receivedAt || '');
   if (!Number.isFinite(capturedMs) || capturedMs < options.sinceMs) return false;
 
   return ANALYTICS_FILTERS.every(([key]) => !options[key] || String(event[key] || '') === options[key]);
+}
+
+function eventMatchesReportEventOptions(event, options) {
+  const normalized = event && event.sampleId && event.eventKind ? event : normalizeStoredEvent(event);
+  const capturedMs = Date.parse(normalized.capturedAt || normalized.receivedAt || '');
+  if (!options.sampleId || normalized.sampleId !== options.sampleId) return false;
+  if (!Number.isFinite(capturedMs) || capturedMs < options.sinceMs) return false;
+  if (options.eventKind && normalized.eventKind !== options.eventKind) return false;
+  return true;
 }
 
 function parseJsonObject(value) {
@@ -466,12 +657,15 @@ function buildReportAnalytics({ events, range }) {
 
 export {
   buildReportAnalytics,
+  eventMatchesReportEventOptions,
   eventMatchesAnalyticsOptions,
   filterSamples,
   getAnalyticsEventWhere,
+  getReportEventWhere,
   getSampleOrderBy,
   getSampleWhere,
   normalizeAnalyticsOptions,
+  normalizeEventListOptions,
   normalizeLimit,
   normalizeOffset,
   normalizeSampleListOptions,

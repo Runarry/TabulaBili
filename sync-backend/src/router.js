@@ -44,6 +44,37 @@ function getBearer(request, url) {
   return url.searchParams.get('auth') || '';
 }
 
+function getReportSampleOptions(url) {
+  return {
+    limit: Number(url.searchParams.get('limit') || 50),
+    offset: Number(url.searchParams.get('offset') || 0),
+    q: url.searchParams.get('q') || '',
+    feedback: url.searchParams.get('feedback') || 'all',
+    sort: url.searchParams.get('sort') || 'lastSeenAt',
+    clientId: url.searchParams.get('clientId') || '',
+    mode: url.searchParams.get('mode') || '',
+    source: url.searchParams.get('source') || '',
+    category: url.searchParams.get('category') || '',
+    upMid: url.searchParams.get('upMid') || '',
+    upName: url.searchParams.get('upName') || '',
+    minSeenCount: Number(url.searchParams.get('minSeenCount') || 0),
+    minClickCount: Number(url.searchParams.get('minClickCount') || 0),
+    since: url.searchParams.get('since') || '',
+    until: url.searchParams.get('until') || '',
+    hasFeedback: url.searchParams.get('hasFeedback') || ''
+  };
+}
+
+function getReportEventOptions(url, sampleId) {
+  return {
+    sampleId,
+    limit: Number(url.searchParams.get('limit') || 100),
+    offset: Number(url.searchParams.get('offset') || 0),
+    eventKind: url.searchParams.get('eventKind') || '',
+    days: Number(url.searchParams.get('days') || 30)
+  };
+}
+
 function createApp(options) {
   const storage = options.storage;
   const secret = options.secret;
@@ -104,17 +135,20 @@ function createApp(options) {
       }
 
       if (url.pathname === '/api/reports/samples' && request.method === 'GET') {
-        const result = await storage.listReportSamples({
-          limit: Number(url.searchParams.get('limit') || 50),
-          offset: Number(url.searchParams.get('offset') || 0),
-          q: url.searchParams.get('q') || '',
-          feedback: url.searchParams.get('feedback') || 'all',
-          sort: url.searchParams.get('sort') || 'lastSeenAt'
-        });
+        const result = await storage.listReportSamples(getReportSampleOptions(url));
         if (url.searchParams.get('export') === '1') {
           return text(JSON.stringify(result.items, null, 2), 200, 'application/json; charset=utf-8');
         }
         return json(result);
+      }
+
+      const sampleEventsMatch = url.pathname.match(/^\/api\/reports\/samples\/([^/]+)\/events$/);
+      if ((url.pathname === '/api/reports/events' || sampleEventsMatch) && request.method === 'GET') {
+        const sampleId = sampleEventsMatch
+          ? decodeURIComponent(sampleEventsMatch[1])
+          : (url.searchParams.get('sampleId') || '');
+        if (!sampleId) return json({ error: 'invalid_sample' }, 400);
+        return json(await storage.listReportEvents(getReportEventOptions(url, sampleId)));
       }
 
       if (url.pathname === '/api/reports/analytics' && request.method === 'GET') {

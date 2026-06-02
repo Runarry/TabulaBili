@@ -76,8 +76,18 @@ test('report APIs expose paginated samples and analytics', async () => {
   assert.equal(samples.total, 1);
   assert.equal(samples.items[0].clickCount, 1);
 
+  const filteredSamplesResponse = await app.fetch(new Request('http://local/api/reports/samples?mode=pure&source=feed&minSeenCount=1', { headers }));
+  const filteredSamples = await filteredSamplesResponse.json();
+  assert.equal(filteredSamples.total, 1);
+
   const analyticsResponse = await app.fetch(new Request('http://local/api/reports/analytics?days=90&tzOffsetMinutes=0', { headers }));
   assert.equal(analyticsResponse.status, 200);
   const analytics = await analyticsResponse.json();
   assert.equal(analytics.metrics.clickCount, 1);
+
+  const eventResponse = await app.fetch(new Request('http://local/api/reports/samples/BV1/events?days=90', { headers }));
+  assert.equal(eventResponse.status, 200);
+  const events = await eventResponse.json();
+  assert.equal(events.total, 2);
+  assert.equal(events.items[0].eventKind, 'click');
 });

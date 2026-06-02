@@ -2,12 +2,15 @@ import { getSampleId, mergeAggregate, toEventRow, toSampleRow } from '../report-
 import {
   buildReportAnalytics,
   getAnalyticsEventWhere,
+  getReportEventWhere,
   getSampleOrderBy,
   getSampleWhere,
   normalizeAnalyticsOptions,
+  normalizeEventListOptions,
   normalizeLimit,
   normalizeOffset,
-  normalizeSampleListOptions
+  normalizeSampleListOptions,
+  normalizeStoredEvent
 } from './helpers.js';
 
 async function allRows(statement) {
@@ -286,6 +289,22 @@ class D1Storage {
     const total = await firstRow(this.db.prepare(`select count(*) as count from samples ${whereSql}`).bind(...args));
     const rows = await allRows(this.db.prepare(`select json from samples ${whereSql} order by ${orderBy} limit ? offset ?`).bind(...args, query.limit, query.offset));
     return { items: rows.map((row) => JSON.parse(row.json)), total: total.count };
+  }
+
+  async listReportEvents(options = {}) {
+    await this.ready;
+    const query = normalizeEventListOptions(options);
+    const { whereSql, args } = getReportEventWhere(query);
+    const total = await firstRow(this.db.prepare(`select count(*) as count from events ${whereSql}`).bind(...args));
+    const rows = await allRows(this.db.prepare(`
+      select event_id as eventId, batch_id as batchId, client_id as clientId, sample_id as sampleId,
+        captured_at as capturedAt, received_at as receivedAt, event_kind as eventKind, mode, source,
+        category, feedback, position, bvid, up_name as upName, up_mid as upMid, raw_json as json
+      from events ${whereSql}
+      order by captured_at desc
+      limit ? offset ?
+    `).bind(...args, query.limit, query.offset));
+    return { items: rows.map(normalizeStoredEvent), total: total.count };
   }
 
   async getReportAnalytics(options = {}) {

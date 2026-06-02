@@ -184,4 +184,16 @@ test('analytics exposes quality ratios dimensions and repeated samples', async (
   assert.equal(analytics.top.ups[0].ctr, 1 / 2);
   assert.equal(analytics.top.repeatedSamples[0].sampleId, 'BV1');
   assert.equal(analytics.top.repeatedSamples[0].repeatImpressionCount, 1);
+
+  const repeatedSamples = await storage.listReportSamples({ mode: 'pure', source: 'feed', minSeenCount: 2, sort: 'repeatCount' });
+  assert.equal(repeatedSamples.total, 1);
+  assert.equal(repeatedSamples.items[0].id, 'BV1');
+
+  const negativeFeedback = await storage.listReportSamples({ hasFeedback: 'true', sort: 'negativeFeedback' });
+  assert.equal(negativeFeedback.total, 2);
+  assert.equal(negativeFeedback.items[0].feedback, 'dislike');
+
+  const byUp = await storage.listReportSamples({ upMid: 'u2', category: 'cat-b' });
+  assert.equal(byUp.total, 1);
+  assert.equal(byUp.items[0].id, 'BV2');
 });

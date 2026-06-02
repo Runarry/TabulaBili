@@ -2,11 +2,14 @@ import { getSampleId, mergeAggregate, toEventRow } from '../report-aggregate.js'
 import {
   buildReportAnalytics,
   eventMatchesAnalyticsOptions,
+  eventMatchesReportEventOptions,
   filterSamples,
   normalizeAnalyticsOptions,
+  normalizeEventListOptions,
   normalizeLimit,
   normalizeOffset,
   normalizeSampleListOptions,
+  normalizeStoredEvent,
   sortSamples
 } from './helpers.js';
 
@@ -82,7 +85,16 @@ class MemoryStorage {
 
   async listReportSamples(options = {}) {
     const query = normalizeSampleListOptions(options);
-    const filtered = sortSamples(filterSamples([...this.samples.values()], query), query.sort);
+    const filtered = sortSamples(filterSamples([...this.samples.values()], query, [...this.events.values()]), query.sort);
+    return { items: filtered.slice(query.offset, query.offset + query.limit), total: filtered.length };
+  }
+
+  async listReportEvents(options = {}) {
+    const query = normalizeEventListOptions(options);
+    const filtered = [...this.events.values()]
+      .map(normalizeStoredEvent)
+      .filter((event) => eventMatchesReportEventOptions(event, query))
+      .sort((a, b) => String(b.capturedAt).localeCompare(String(a.capturedAt)));
     return { items: filtered.slice(query.offset, query.offset + query.limit), total: filtered.length };
   }
 

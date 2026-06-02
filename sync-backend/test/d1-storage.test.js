@@ -65,11 +65,25 @@ test('D1 storage initializes schema and supports report APIs', { skip: DatabaseS
   assert.equal(samples.items[0].seenCount, 1);
   assert.equal(samples.items[0].clickCount, 1);
 
+  const filteredSamplesResponse = await app.fetch(new Request('http://local/api/reports/samples?mode=pure&source=feed&upMid=42&minSeenCount=1&sort=ctr', { headers }));
+  const filteredSamples = await filteredSamplesResponse.json();
+  assert.equal(filteredSamples.total, 1);
+  assert.equal(filteredSamples.items[0].id, 'BV1');
+
   const analyticsResponse = await app.fetch(new Request('http://local/api/reports/analytics?days=90&tzOffsetMinutes=0', { headers }));
   const analytics = await analyticsResponse.json();
   assert.equal(analytics.metrics.sampleCount, 1);
   assert.equal(analytics.metrics.clickCount, 1);
   assert.equal(analytics.range.days, 90);
+
+  const clickEventsResponse = await app.fetch(new Request('http://local/api/reports/events?sampleId=BV1&eventKind=click&days=90', { headers }));
+  const clickEvents = await clickEventsResponse.json();
+  assert.equal(clickEvents.total, 1);
+  assert.equal(clickEvents.items[0].eventKind, 'click');
+
+  const timelineResponse = await app.fetch(new Request('http://local/api/reports/samples/BV1/events?days=90', { headers }));
+  const timeline = await timelineResponse.json();
+  assert.equal(timeline.total, 3);
 
   const impression = fake.db.prepare('select event_kind, mode, source, category, position, bvid, up_name, up_mid from events where event_id = ?').get('e1');
   assert.deepEqual({ ...impression }, {
