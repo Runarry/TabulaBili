@@ -17,72 +17,17 @@ jobs:
       - name: 📥 拉取最新代码
         uses: actions/checkout@v4
 
-      - name: 🧰 准备浏览器专属源码目录
-        run: |
-          extension_files=(
-            rules.json
-            analysis-common.js
-            sync-common.js
-            background.js
-            content.js
-            content-main.js
-            popup.html
-            popup.css
-            popup.js
-            options.html
-            options.css
-            options.js
-            icon.png
-            icon16.png
-            icon32.png
-            icon48.png
-            icon128.png
-          )
+      - name: 🧰 准备 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
 
-          mkdir -p dist/chrome-source dist/firefox-source
-          for file in "${extension_files[@]}"; do
-            cp "$file" dist/chrome-source/
-            cp "$file" dist/firefox-source/
-          done
+      - name: 📦 安装构建依赖
+        run: npm ci
 
-          node <<'NODE'
-          const fs = require('node:fs');
-          const manifest = JSON.parse(fs.readFileSync('manifest.json', 'utf8'));
-          const clone = (value) => JSON.parse(JSON.stringify(value));
-
-          const chromeManifest = clone(manifest);
-          delete chromeManifest.background.scripts;
-          delete chromeManifest.browser_specific_settings;
-          fs.writeFileSync(
-            'dist/chrome-source/manifest.json',
-            `${JSON.stringify(chromeManifest, null, 2)}\n`
-          );
-
-          const firefoxManifest = clone(manifest);
-          delete firefoxManifest.background.service_worker;
-          fs.writeFileSync(
-            'dist/firefox-source/manifest.json',
-            `${JSON.stringify(firefoxManifest, null, 2)}\n`
-          );
-          NODE
-
-      - name: 📦 打包 Chrome 扩展 ZIP
-        run: |
-          cd dist/chrome-source
-          zip -r "../TabulaBili-${{ github.ref_name }}-chrome.zip" .
-
-      - name: 🦊 校验 Firefox 扩展
-        run: |
-          npx --yes web-ext lint \
-            --source-dir dist/firefox-source
-
-      - name: 📦 打包 Firefox 扩展 XPI
-        run: |
-          npx --yes web-ext build \
-            --source-dir dist/firefox-source \
-            --artifacts-dir dist \
-            --filename "tabulabili-${{ github.ref_name }}-firefox.xpi" \
-            --overwrite-dest
+      - name: 🧰 构建 Chrome 与 Firefox 扩展
+        run: npm run build
 
       - name: 🚀 发布到 GitHub Releases
         uses: softprops/action-gh-release@v2
