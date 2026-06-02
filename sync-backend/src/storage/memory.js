@@ -4,6 +4,7 @@ import {
   eventMatchesAnalyticsOptions,
   eventMatchesReportEventOptions,
   filterSamples,
+  getDailyMetricDelta,
   normalizeAnalyticsOptions,
   normalizeEventListOptions,
   normalizeLimit,
@@ -19,6 +20,7 @@ class MemoryStorage {
     this.batches = new Map();
     this.events = new Map();
     this.samples = new Map();
+    this.dailyMetrics = new Map();
   }
 
   async getConfig() {
@@ -55,6 +57,7 @@ class MemoryStorage {
       const existingAggregate = sampleId ? this.samples.get(sampleId) : null;
       const eventRow = toEventRow(event, batch, receivedAt, existingAggregate);
       this.events.set(event.eventId, eventRow);
+      this.incrementDailyMetrics(eventRow);
       if (!sampleId) continue;
       this.samples.set(sampleId, mergeAggregate(existingAggregate, event));
     }
@@ -139,6 +142,28 @@ class MemoryStorage {
 
     const orphanSampleIds = [...this.samples.keys()].filter((id) => !remainingSampleIds.has(id));
     return { eventIds, batchIds, orphanSampleIds };
+  }
+
+  incrementDailyMetrics(eventRow) {
+    const delta = getDailyMetricDelta(eventRow);
+    if (!delta) return;
+    const key = JSON.stringify([delta.date, delta.clientId, delta.mode, delta.source, delta.category]);
+    const current = this.dailyMetrics.get(key) || {
+      date: delta.date,
+      clientId: delta.clientId,
+      mode: delta.mode,
+      source: delta.source,
+      category: delta.category,
+      impressions: 0,
+      clicks: 0,
+      feedbacks: 0,
+      negativeFeedbacks: 0
+    };
+    current.impressions += delta.impressions;
+    current.clicks += delta.clicks;
+    current.feedbacks += delta.feedbacks;
+    current.negativeFeedbacks += delta.negativeFeedbacks;
+    this.dailyMetrics.set(key, current);
   }
 }
 

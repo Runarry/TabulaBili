@@ -69,6 +69,8 @@ Content-Type: application/json
 
 如果请求体不提供 `before`，可以提供 `retentionDays`，默认按 365 天计算清理边界。
 
+`daily_metrics` 每日汇总表不会被 cleanup 删除，用于在清理明细事件后保留长期趋势基础数据。
+
 ### Schema 迁移
 
 D1 和 SQLite 会在启动或首次访问时自动创建表、补齐缺失列和索引，并在 `schema_migrations` 中记录已应用版本。当前记录：
@@ -76,8 +78,13 @@ D1 和 SQLite 会在启动或首次访问时自动创建表、补齐缺失列和
 - `1 base_tables`
 - `2 structured_event_columns`
 - `3 sample_timestamps`
+- `4 daily_metrics`
 
 重复运行初始化是幂等的，不需要手动执行 SQL migration。
+
+### 性能说明
+
+后端写入事件时会同步维护 `daily_metrics` 汇总表，维度包括 `date`、`clientId`、`mode`、`source` 和 `category`。当前 `/api/reports/analytics` 仍会读取时间范围内事件明细，因为 Top UP、重复推荐、位置效果和钻取仍依赖明细事件；当事件量继续增长时，可以优先把概览和趋势切到 `daily_metrics` 查询。
 
 ### 隐私说明
 

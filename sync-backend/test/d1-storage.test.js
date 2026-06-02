@@ -52,8 +52,8 @@ test('D1 storage initializes schema and supports report APIs', { skip: DatabaseS
       capturedAt: '2026-06-01T00:00:00.000Z',
       events: [
         { eventId: 'e1', id: 'BV1', bvid: 'BV1', title: 'alpha', upName: 'up', upMid: '42', category: 'cat-a', capturedAt: '2026-06-01T00:00:00.000Z', mode: 'pure', source: 'feed', position: 1 },
-        { eventId: 'e2', id: 'BV1', bvid: 'BV1', eventKind: 'click', capturedAt: '2026-06-01T00:01:00.000Z' },
-        { eventId: 'e3', id: 'BV1', bvid: 'BV1', eventKind: 'feedback', feedback: 'like', capturedAt: '2026-06-01T00:02:00.000Z' }
+        { eventId: 'e2', id: 'BV1', bvid: 'BV1', eventKind: 'click', capturedAt: '2026-06-01T00:01:00.000Z', mode: 'pure', source: 'feed', category: 'cat-a' },
+        { eventId: 'e3', id: 'BV1', bvid: 'BV1', eventKind: 'feedback', feedback: 'like', capturedAt: '2026-06-01T00:02:00.000Z', mode: 'pure', source: 'feed', category: 'cat-a' }
       ]
     })
   }));
@@ -89,8 +89,26 @@ test('D1 storage initializes schema and supports report APIs', { skip: DatabaseS
   assert.deepEqual(migrations.map((row) => ({ ...row })), [
     { version: 1, name: 'base_tables' },
     { version: 2, name: 'structured_event_columns' },
-    { version: 3, name: 'sample_timestamps' }
+    { version: 3, name: 'sample_timestamps' },
+    { version: 4, name: 'daily_metrics' }
   ]);
+
+  const dailyMetrics = fake.db.prepare(`
+    select date, client_id, mode, source, category, impressions, clicks, feedbacks, negative_feedbacks
+    from daily_metrics
+    where date = ?
+  `).get('2026-06-01');
+  assert.deepEqual({ ...dailyMetrics }, {
+    date: '2026-06-01',
+    client_id: 'c1',
+    mode: 'pure',
+    source: 'feed',
+    category: 'cat-a',
+    impressions: 1,
+    clicks: 1,
+    feedbacks: 1,
+    negative_feedbacks: 0
+  });
 
   const impression = fake.db.prepare('select event_kind, mode, source, category, position, bvid, up_name, up_mid from events where event_id = ?').get('e1');
   assert.deepEqual({ ...impression }, {

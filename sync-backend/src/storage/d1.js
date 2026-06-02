@@ -2,6 +2,7 @@ import { getSampleId, mergeAggregate, toEventRow, toSampleRow } from '../report-
 import {
   buildReportAnalytics,
   getAnalyticsEventWhere,
+  getDailyMetricDelta,
   getReportEventWhere,
   getSampleOrderBy,
   getSampleWhere,
@@ -87,6 +88,18 @@ class D1Storage {
         feedback_updated_at text not null default '',
         json text not null
       )`,
+      `create table if not exists daily_metrics (
+        date text not null,
+        client_id text not null default '',
+        mode text not null default '',
+        source text not null default '',
+        category text not null default '',
+        impressions integer not null default 0,
+        clicks integer not null default 0,
+        feedbacks integer not null default 0,
+        negative_feedbacks integer not null default 0,
+        primary key (date, client_id, mode, source, category)
+      )`,
     ];
     const indexStatements = [
       'create index if not exists idx_d1_batches_received_at on batches(received_at desc)',
@@ -103,7 +116,8 @@ class D1Storage {
       'create index if not exists idx_d1_samples_category on samples(category)',
       'create index if not exists idx_d1_samples_seen_count on samples(seen_count desc)',
       'create index if not exists idx_d1_samples_click_count on samples(click_count desc)',
-      'create index if not exists idx_d1_samples_feedback on samples(feedback)'
+      'create index if not exists idx_d1_samples_feedback on samples(feedback)',
+      'create index if not exists idx_d1_daily_metrics_date on daily_metrics(date desc)'
     ];
     for (const sql of baseStatements) {
       await this.db.prepare(sql).run();
@@ -136,7 +150,8 @@ class D1Storage {
     await this.recordMigrations([
       [1, 'base_tables'],
       [2, 'structured_event_columns'],
-      [3, 'sample_timestamps']
+      [3, 'sample_timestamps'],
+      [4, 'daily_metrics']
     ]);
   }
 
@@ -230,6 +245,7 @@ class D1Storage {
         duplicateEventCount += 1;
         continue;
       }
+      await this.incrementDailyMetrics(eventRow);
 
       if (!sampleId) continue;
       const aggregate = mergeAggregate(existingAggregate, event);
@@ -339,6 +355,33 @@ class D1Storage {
       order by captured_at asc
     `).bind(...args));
     return buildReportAnalytics({ events, range: query });
+  }
+
+  async incrementDailyMetrics(eventRow) {
+    const delta = getDailyMetricDelta(eventRow);
+    if (!delta) return;
+    await this.db.prepare(`
+      insert into daily_metrics (
+        date, client_id, mode, source, category,
+        impressions, clicks, feedbacks, negative_feedbacks
+      )
+      values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      on conflict(date, client_id, mode, source, category) do update set
+        impressions = impressions + excluded.impressions,
+        clicks = clicks + excluded.clicks,
+        feedbacks = feedbacks + excluded.feedbacks,
+        negative_feedbacks = negative_feedbacks + excluded.negative_feedbacks
+    `).bind(
+      delta.date,
+      delta.clientId,
+      delta.mode,
+      delta.source,
+      delta.category,
+      delta.impressions,
+      delta.clicks,
+      delta.feedbacks,
+      delta.negativeFeedbacks
+    ).run();
   }
 
   async cleanupReports(options = {}) {

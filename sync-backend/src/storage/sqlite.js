@@ -3,6 +3,7 @@ import { getSampleId, mergeAggregate, toEventRow, toSampleRow } from '../report-
 import {
   buildReportAnalytics,
   getAnalyticsEventWhere,
+  getDailyMetricDelta,
   getReportEventWhere,
   getSampleOrderBy,
   getSampleWhere,
@@ -71,6 +72,18 @@ class SqliteStorage {
         feedback_updated_at text not null default '',
         json text not null
       );
+      create table if not exists daily_metrics (
+        date text not null,
+        client_id text not null default '',
+        mode text not null default '',
+        source text not null default '',
+        category text not null default '',
+        impressions integer not null default 0,
+        clicks integer not null default 0,
+        feedbacks integer not null default 0,
+        negative_feedbacks integer not null default 0,
+        primary key (date, client_id, mode, source, category)
+      );
     `);
     this.ensureColumns([
       ['batches', 'duplicate_event_count', 'integer not null default 0'],
@@ -110,11 +123,13 @@ class SqliteStorage {
       create index if not exists idx_samples_seen_count on samples(seen_count desc);
       create index if not exists idx_samples_click_count on samples(click_count desc);
       create index if not exists idx_samples_feedback on samples(feedback);
+      create index if not exists idx_daily_metrics_date on daily_metrics(date desc);
     `);
     this.recordMigrations([
       [1, 'base_tables'],
       [2, 'structured_event_columns'],
-      [3, 'sample_timestamps']
+      [3, 'sample_timestamps'],
+      [4, 'daily_metrics']
     ]);
   }
 
@@ -196,6 +211,18 @@ class SqliteStorage {
           feedback_updated_at = excluded.feedback_updated_at,
           json = excluded.json
       `);
+      const upsertDailyMetric = this.db.prepare(`
+        insert into daily_metrics (
+          date, client_id, mode, source, category,
+          impressions, clicks, feedbacks, negative_feedbacks
+        )
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        on conflict(date, client_id, mode, source, category) do update set
+          impressions = impressions + excluded.impressions,
+          clicks = clicks + excluded.clicks,
+          feedbacks = feedbacks + excluded.feedbacks,
+          negative_feedbacks = negative_feedbacks + excluded.negative_feedbacks
+      `);
 
       for (const event of batch.events) {
         const sampleId = getSampleId(event);
@@ -223,6 +250,20 @@ class SqliteStorage {
         if (result.changes === 0) {
           duplicateEventCount += 1;
           continue;
+        }
+        const delta = getDailyMetricDelta(eventRow);
+        if (delta) {
+          upsertDailyMetric.run(
+            delta.date,
+            delta.clientId,
+            delta.mode,
+            delta.source,
+            delta.category,
+            delta.impressions,
+            delta.clicks,
+            delta.feedbacks,
+            delta.negativeFeedbacks
+          );
         }
 
         if (!sampleId) continue;

@@ -391,6 +391,24 @@ function normalizeStoredEvent(row) {
   };
 }
 
+function getDailyMetricDelta(event) {
+  const capturedMs = Date.parse(event.capturedAt || '');
+  if (!Number.isFinite(capturedMs)) return null;
+  const date = new Date(capturedMs).toISOString().slice(0, 10);
+
+  return {
+    date,
+    clientId: event.clientId || '',
+    mode: event.mode || '',
+    source: event.source || '',
+    category: event.category || '',
+    impressions: event.eventKind === 'impression' ? 1 : 0,
+    clicks: event.eventKind === 'click' ? 1 : 0,
+    feedbacks: event.eventKind === 'feedback' ? 1 : 0,
+    negativeFeedbacks: event.eventKind === 'feedback' && isNegativeFeedback(event) ? 1 : 0
+  };
+}
+
 function createMetricBucket(key) {
   return {
     key,
@@ -661,6 +679,7 @@ export {
   eventMatchesAnalyticsOptions,
   filterSamples,
   getAnalyticsEventWhere,
+  getDailyMetricDelta,
   getReportEventWhere,
   getSampleOrderBy,
   getSampleWhere,
