@@ -8,6 +8,10 @@ function daysAgo(days) {
   return new Date(Date.now() - days * DAY_MS).toISOString();
 }
 
+function byKey(rows, key) {
+  return rows.find((row) => row.key === key);
+}
+
 test('report batches and events are idempotent', async () => {
   const storage = new MemoryStorage();
   const batch = {
@@ -128,4 +132,56 @@ test('analytics metrics only use events inside the requested range', async () =>
 
   const empty = await storage.getReportAnalytics({ days: 7, clientId: 'c1' });
   assert.equal(empty.metrics.eventCount, 0);
+});
+
+test('analytics exposes quality ratios dimensions and repeated samples', async () => {
+  const storage = new MemoryStorage();
+  const capturedAt = daysAgo(1);
+
+  await storage.saveReportBatch({
+    batchId: 'quality-batch',
+    clientId: 'c1',
+    capturedAt,
+    events: [
+      { eventId: 'q1', id: 'BV1', bvid: 'BV1', title: 'one', upName: 'up one', upMid: 'u1', category: 'cat-a', capturedAt, mode: 'pure', source: 'feed', position: 1 },
+      { eventId: 'q2', id: 'BV1', bvid: 'BV1', title: 'one', upName: 'up one', upMid: 'u1', category: 'cat-a', capturedAt, mode: 'pure', source: 'feed', position: 3 },
+      { eventId: 'q3', id: 'BV1', bvid: 'BV1', title: 'one', upName: 'up one', upMid: 'u1', category: 'cat-a', eventKind: 'click', capturedAt, mode: 'pure', source: 'feed', position: 3 },
+      { eventId: 'q4', id: 'BV1', bvid: 'BV1', title: 'one', upName: 'up one', upMid: 'u1', category: 'cat-a', eventKind: 'feedback', feedback: 'dislike', capturedAt, mode: 'pure', source: 'feed', position: 3 },
+      { eventId: 'q5', id: 'BV2', bvid: 'BV2', title: 'two', upName: 'up two', upMid: 'u2', category: 'cat-b', capturedAt, mode: 'fusion', source: 'search', position: 8 },
+      { eventId: 'q6', id: 'BV2', bvid: 'BV2', title: 'two', upName: 'up two', upMid: 'u2', category: 'cat-b', eventKind: 'feedback', feedback: 'blocked', capturedAt, mode: 'fusion', source: 'search', position: 8 }
+    ]
+  });
+
+  const analytics = await storage.getReportAnalytics({ days: 7, tzOffsetMinutes: 0 });
+  assert.equal(analytics.metrics.impressionCount, 3);
+  assert.equal(analytics.metrics.clickCount, 1);
+  assert.equal(analytics.metrics.feedbackCount, 2);
+  assert.equal(analytics.metrics.negativeFeedbackCount, 2);
+  assert.equal(analytics.metrics.distinctUpCount, 2);
+  assert.equal(analytics.metrics.ctr, 1 / 3);
+  assert.equal(analytics.metrics.feedbackRate, 2 / 3);
+  assert.equal(analytics.metrics.negativeFeedbackRate, 2 / 3);
+  assert.equal(analytics.metrics.repeatImpressionCount, 1);
+  assert.equal(analytics.metrics.repeatImpressionRate, 1 / 3);
+
+  const pure = byKey(analytics.dimensions.modes, 'pure');
+  assert.equal(pure.impressions, 2);
+  assert.equal(pure.clicks, 1);
+  assert.equal(pure.feedbacks, 1);
+  assert.equal(pure.negativeFeedbacks, 1);
+  assert.equal(pure.ctr, 1 / 2);
+  assert.equal(pure.avgPosition, 2);
+
+  const catB = byKey(analytics.dimensions.categories, 'cat-b');
+  assert.equal(catB.impressions, 1);
+  assert.equal(catB.negativeFeedbackRate, 1);
+
+  const positionBucket = byKey(analytics.dimensions.positions, '7-10');
+  assert.equal(positionBucket.impressions, 1);
+  assert.equal(positionBucket.feedbacks, 1);
+
+  assert.equal(analytics.trends[0].ctr, 1 / 3);
+  assert.equal(analytics.top.ups[0].ctr, 1 / 2);
+  assert.equal(analytics.top.repeatedSamples[0].sampleId, 'BV1');
+  assert.equal(analytics.top.repeatedSamples[0].repeatImpressionCount, 1);
 });

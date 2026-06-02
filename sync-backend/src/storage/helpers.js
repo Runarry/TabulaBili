@@ -8,6 +8,8 @@ const ANALYTICS_FILTERS = [
   ['feedback', 'feedback']
 ];
 
+const NEGATIVE_FEEDBACK = new Set(['dislike', 'blocked']);
+
 function normalizeNumber(value, fallback) {
   const number = Number(value);
   return Number.isFinite(number) ? number : fallback;
@@ -89,6 +91,14 @@ function countBy(items, getKey) {
   return [...map.entries()]
     .map(([key, count]) => ({ key, count }))
     .sort((a, b) => b.count - a.count || String(a.key).localeCompare(String(b.key)));
+}
+
+function ratio(numerator, denominator) {
+  return denominator > 0 ? numerator / denominator : 0;
+}
+
+function isNegativeFeedback(event) {
+  return NEGATIVE_FEEDBACK.has(event.feedback);
 }
 
 function getLocalDateKey(value, tzOffsetMinutes) {
@@ -190,38 +200,168 @@ function normalizeStoredEvent(row) {
   };
 }
 
+function createMetricBucket(key) {
+  return {
+    key,
+    impressions: 0,
+    clicks: 0,
+    feedbacks: 0,
+    negativeFeedbacks: 0,
+    positionSum: 0,
+    positionCount: 0,
+    sampleIds: new Set()
+  };
+}
+
+function addEventToBucket(bucket, event) {
+  const sampleId = event.sampleId || getSampleId(event);
+  if (sampleId) bucket.sampleIds.add(sampleId);
+  if (event.eventKind === 'click') {
+    bucket.clicks += 1;
+    return;
+  }
+  if (event.eventKind === 'feedback') {
+    bucket.feedbacks += 1;
+    if (isNegativeFeedback(event)) bucket.negativeFeedbacks += 1;
+    return;
+  }
+
+  bucket.impressions += 1;
+  if (event.position > 0) {
+    bucket.positionSum += event.position;
+    bucket.positionCount += 1;
+  }
+}
+
+function finalizeMetricBucket(bucket) {
+  return {
+    key: bucket.key,
+    impressions: bucket.impressions,
+    clicks: bucket.clicks,
+    feedbacks: bucket.feedbacks,
+    negativeFeedbacks: bucket.negativeFeedbacks,
+    sampleCount: bucket.sampleIds.size,
+    ctr: ratio(bucket.clicks, bucket.impressions),
+    feedbackRate: ratio(bucket.feedbacks, bucket.impressions),
+    negativeFeedbackRate: ratio(bucket.negativeFeedbacks, bucket.impressions),
+    avgPosition: ratio(bucket.positionSum, bucket.positionCount),
+    count: bucket.impressions
+  };
+}
+
+function sortMetricRows(rows) {
+  return rows.sort((a, b) =>
+    b.impressions - a.impressions ||
+    b.clicks - a.clicks ||
+    String(a.key).localeCompare(String(b.key))
+  );
+}
+
+function buildDimension(events, getKey, limit = 20) {
+  const buckets = new Map();
+  for (const event of events) {
+    const key = getKey(event) || 'unknown';
+    if (!buckets.has(key)) buckets.set(key, createMetricBucket(key));
+    addEventToBucket(buckets.get(key), event);
+  }
+  return sortMetricRows([...buckets.values()].map(finalizeMetricBucket)).slice(0, limit);
+}
+
+function getPositionBucket(position) {
+  const value = Number(position || 0);
+  if (!Number.isFinite(value) || value <= 0) return 'unknown';
+  if (value === 1) return '1';
+  if (value <= 3) return '2-3';
+  if (value <= 6) return '4-6';
+  if (value <= 10) return '7-10';
+  return '11+';
+}
+
 function buildTopUps(events) {
   const byUp = new Map();
   for (const event of events) {
     const key = event.upMid || event.upName || 'unknown';
     if (!byUp.has(key)) {
-      byUp.set(key, {
-        key,
-        upName: event.upName || key,
-        seenCount: 0,
-        clickCount: 0,
-        feedbackCount: 0,
-        sampleIds: new Set()
-      });
+      const bucket = createMetricBucket(key);
+      bucket.upName = event.upName || key;
+      byUp.set(key, bucket);
     }
-    const stat = byUp.get(key);
-    const sampleId = event.sampleId || getSampleId(event);
-    if (sampleId) stat.sampleIds.add(sampleId);
-    if (event.eventKind === 'click') stat.clickCount += 1;
-    else if (event.eventKind === 'feedback') stat.feedbackCount += 1;
-    else stat.seenCount += 1;
+    addEventToBucket(byUp.get(key), event);
   }
 
-  return [...byUp.values()]
-    .map((item) => ({
-      key: item.key,
-      upName: item.upName,
-      seenCount: item.seenCount,
-      clickCount: item.clickCount,
-      feedbackCount: item.feedbackCount,
-      sampleCount: item.sampleIds.size
-    }))
-    .sort((a, b) => b.seenCount - a.seenCount || b.clickCount - a.clickCount || String(a.upName).localeCompare(String(b.upName)))
+  return sortMetricRows([...byUp.values()].map((bucket) => {
+    const row = finalizeMetricBucket(bucket);
+    return {
+      ...row,
+      upName: bucket.upName,
+      seenCount: row.impressions,
+      clickCount: row.clicks,
+      feedbackCount: row.feedbacks,
+      negativeFeedbackCount: row.negativeFeedbacks
+    };
+  }))
+    .slice(0, 20);
+}
+
+function fillSampleDetails(bucket, event) {
+  bucket.bvid = bucket.bvid || event.bvid || '';
+  bucket.title = bucket.title || event.title || '';
+  bucket.upName = bucket.upName || event.upName || '';
+  bucket.upMid = bucket.upMid || event.upMid || '';
+  bucket.category = bucket.category || event.category || '';
+}
+
+function buildSampleRows(events) {
+  const bySample = new Map();
+  for (const event of events) {
+    const key = event.sampleId || getSampleId(event);
+    if (!key) continue;
+    if (!bySample.has(key)) {
+      const bucket = createMetricBucket(key);
+      bucket.sampleId = key;
+      bucket.bvid = '';
+      bucket.title = '';
+      bucket.upName = '';
+      bucket.upMid = '';
+      bucket.category = '';
+      bySample.set(key, bucket);
+    }
+    const bucket = bySample.get(key);
+    fillSampleDetails(bucket, event);
+    addEventToBucket(bucket, event);
+  }
+
+  return sortMetricRows([...bySample.values()].map((bucket) => {
+    const row = finalizeMetricBucket(bucket);
+    return {
+      ...row,
+      sampleId: bucket.sampleId,
+      bvid: bucket.bvid,
+      title: bucket.title,
+      upName: bucket.upName,
+      upMid: bucket.upMid,
+      category: bucket.category,
+      seenCount: row.impressions,
+      clickCount: row.clicks,
+      feedbackCount: row.feedbacks,
+      negativeFeedbackCount: row.negativeFeedbacks,
+      repeatImpressionCount: Math.max(0, row.impressions - 1)
+    };
+  }));
+}
+
+function buildTopSamples(events, limit = 20) {
+  return buildSampleRows(events).slice(0, limit);
+}
+
+function buildRepeatedSamples(events) {
+  return buildSampleRows(events)
+    .filter((row) => row.repeatImpressionCount > 0)
+    .sort((a, b) =>
+      b.repeatImpressionCount - a.repeatImpressionCount ||
+      b.impressions - a.impressions ||
+      String(a.sampleId).localeCompare(String(b.sampleId))
+    )
     .slice(0, 20);
 }
 
@@ -230,13 +370,41 @@ function buildTrends(events, tzOffsetMinutes) {
   for (const event of events) {
     const date = getLocalDateKey(event.capturedAt || event.receivedAt, tzOffsetMinutes);
     if (!date) continue;
-    if (!trendsByDate.has(date)) trendsByDate.set(date, { date, impressions: 0, clicks: 0, feedbacks: 0 });
+    if (!trendsByDate.has(date)) {
+      trendsByDate.set(date, { date, impressions: 0, clicks: 0, feedbacks: 0, negativeFeedbacks: 0 });
+    }
     const row = trendsByDate.get(date);
     if (event.eventKind === 'click') row.clicks += 1;
-    else if (event.eventKind === 'feedback') row.feedbacks += 1;
+    else if (event.eventKind === 'feedback') {
+      row.feedbacks += 1;
+      if (isNegativeFeedback(event)) row.negativeFeedbacks += 1;
+    }
     else row.impressions += 1;
   }
-  return [...trendsByDate.values()].sort((a, b) => a.date.localeCompare(b.date));
+  return [...trendsByDate.values()]
+    .map((row) => ({
+      ...row,
+      ctr: ratio(row.clicks, row.impressions),
+      feedbackRate: ratio(row.feedbacks, row.impressions),
+      negativeFeedbackRate: ratio(row.negativeFeedbacks, row.impressions)
+    }))
+    .sort((a, b) => a.date.localeCompare(b.date));
+}
+
+function buildRepeatMetrics(impressionEvents) {
+  const bySample = new Map();
+  for (const event of impressionEvents) {
+    const sampleId = event.sampleId || getSampleId(event);
+    if (!sampleId) continue;
+    bySample.set(sampleId, (bySample.get(sampleId) || 0) + 1);
+  }
+  const repeatedCounts = [...bySample.values()].filter((count) => count > 1);
+  const repeatImpressionCount = repeatedCounts.reduce((sum, count) => sum + count - 1, 0);
+  return {
+    repeatSampleCount: repeatedCounts.length,
+    repeatImpressionCount,
+    repeatImpressionRate: ratio(repeatImpressionCount, impressionEvents.length)
+  };
 }
 
 function buildReportAnalytics({ events, range }) {
@@ -245,7 +413,37 @@ function buildReportAnalytics({ events, range }) {
   const clickEvents = normalizedEvents.filter((event) => event.eventKind === 'click');
   const feedbackEvents = normalizedEvents.filter((event) => event.eventKind === 'feedback');
   const sampleIds = new Set(normalizedEvents.map((event) => event.sampleId || getSampleId(event)).filter(Boolean));
+  const upIds = new Set(normalizedEvents.map((event) => event.upMid || event.upName).filter(Boolean));
   const batchIds = new Set(normalizedEvents.map((event) => event.batchId).filter(Boolean));
+  const negativeFeedbackCount = feedbackEvents.filter(isNegativeFeedback).length;
+  const repeatMetrics = buildRepeatMetrics(impressionEvents);
+  const metrics = {
+    batchCount: batchIds.size,
+    eventCount: normalizedEvents.length,
+    sampleCount: sampleIds.size,
+    distinctSampleCount: sampleIds.size,
+    distinctUpCount: upIds.size,
+    impressionCount: impressionEvents.length,
+    clickCount: clickEvents.length,
+    feedbackCount: feedbackEvents.length,
+    negativeFeedbackCount,
+    ctr: ratio(clickEvents.length, impressionEvents.length),
+    feedbackRate: ratio(feedbackEvents.length, impressionEvents.length),
+    negativeFeedbackRate: ratio(negativeFeedbackCount, impressionEvents.length),
+    ...repeatMetrics
+  };
+  const dimensions = {
+    modes: buildDimension(normalizedEvents, (event) => event.mode),
+    sources: buildDimension(normalizedEvents, (event) => event.source),
+    categories: buildDimension(normalizedEvents, (event) => event.category),
+    positions: buildDimension(normalizedEvents, (event) => getPositionBucket(event.position)),
+    feedback: countBy(feedbackEvents, (event) => event.feedback || 'unset')
+  };
+  const top = {
+    ups: buildTopUps(normalizedEvents),
+    samples: buildTopSamples(normalizedEvents),
+    repeatedSamples: buildRepeatedSamples(normalizedEvents)
+  };
 
   return {
     range: {
@@ -254,21 +452,15 @@ function buildReportAnalytics({ events, range }) {
       tzOffsetMinutes: range.tzOffsetMinutes,
       filters: range.filters
     },
-    metrics: {
-      batchCount: batchIds.size,
-      eventCount: normalizedEvents.length,
-      sampleCount: sampleIds.size,
-      distinctSampleCount: sampleIds.size,
-      impressionCount: impressionEvents.length,
-      clickCount: clickEvents.length,
-      feedbackCount: feedbackEvents.length
-    },
+    metrics,
     trends: buildTrends(normalizedEvents, range.tzOffsetMinutes),
-    topUps: buildTopUps(normalizedEvents),
-    categories: countBy(impressionEvents, (event) => event.category).slice(0, 20),
-    modes: countBy(impressionEvents, (event) => event.mode).slice(0, 20),
-    sources: countBy(impressionEvents, (event) => event.source).slice(0, 20),
-    feedback: countBy(feedbackEvents, (event) => event.feedback || 'unset')
+    dimensions,
+    top,
+    topUps: top.ups,
+    categories: dimensions.categories,
+    modes: dimensions.modes,
+    sources: dimensions.sources,
+    feedback: dimensions.feedback
   };
 }
 

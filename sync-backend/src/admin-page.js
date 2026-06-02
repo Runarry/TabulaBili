@@ -192,23 +192,27 @@ function analyticsBody() {
         <button class="secondary" type="button" id="refreshBtn">刷新</button>
       </div>
       <div class="grid">
-        <div class="metric"><span>样本</span><strong id="metricSamples">0</strong></div>
-        <div class="metric"><span>推荐次数</span><strong id="metricImpressions">0</strong></div>
-        <div class="metric"><span>点击次数</span><strong id="metricClicks">0</strong></div>
-        <div class="metric"><span>已标注</span><strong id="metricFeedback">0</strong></div>
+        <div class="metric"><span>视频</span><strong id="metricSamples">0</strong></div>
+        <div class="metric"><span>UP</span><strong id="metricUps">0</strong></div>
+        <div class="metric"><span>曝光</span><strong id="metricImpressions">0</strong></div>
+        <div class="metric"><span>点击</span><strong id="metricClicks">0</strong></div>
+        <div class="metric"><span>CTR</span><strong id="metricCtr">0%</strong></div>
+        <div class="metric"><span>反馈率</span><strong id="metricFeedbackRate">0%</strong></div>
+        <div class="metric"><span>负反馈率</span><strong id="metricNegativeRate">0%</strong></div>
+        <div class="metric"><span>重复推荐率</span><strong id="metricRepeatRate">0%</strong></div>
       </div>
     </section>
     <section>
       <h2>近期趋势</h2>
       <table>
-        <thead><tr><th>日期</th><th>曝光</th><th>点击</th><th>标注</th></tr></thead>
+        <thead><tr><th>日期</th><th>曝光</th><th>点击</th><th>CTR</th><th>标注</th></tr></thead>
         <tbody id="trendRows"></tbody>
       </table>
     </section>
     <section>
       <h2>Top UP</h2>
       <table>
-        <thead><tr><th>UP 主</th><th>样本</th><th>推荐</th><th>点击</th></tr></thead>
+        <thead><tr><th>UP 主</th><th>样本</th><th>曝光</th><th>点击</th><th>CTR</th><th>负反馈率</th></tr></thead>
         <tbody id="topUpRows"></tbody>
       </table>
     </section>
@@ -288,10 +292,13 @@ function dataScript() {
 
 function analyticsScript() {
   return `
+    function pct(value) {
+      return (Number(value || 0) * 100).toFixed(2) + '%';
+    }
     function bars(title, rows) {
-      const max = Math.max(1, ...rows.map((row) => Number(row.count || row.seenCount || 0)));
+      const max = Math.max(1, ...rows.map((row) => Number(row.count || row.seenCount || row.impressions || 0)));
       return '<h3>' + esc(title) + '</h3>' + rows.map((row) => {
-        const value = Number(row.count || row.seenCount || 0);
+        const value = Number(row.count || row.seenCount || row.impressions || 0);
         return '<div class="bar"><span>' + esc(row.key || row.upName || '') + '</span><div class="bar-track"><div class="bar-fill" style="width:' + Math.round(value / max * 100) + '%"></div></div><strong>' + esc(value) + '</strong></div>';
       }).join('');
     }
@@ -304,19 +311,25 @@ function analyticsScript() {
       const days = Number($('daysInput').value || 30);
       const result = await api('/api/reports/analytics?days=' + days + '&tzOffsetMinutes=' + tzOffsetMinutes);
       metric('metricSamples', result.metrics.sampleCount);
+      metric('metricUps', result.metrics.distinctUpCount);
       metric('metricImpressions', result.metrics.impressionCount);
       metric('metricClicks', result.metrics.clickCount);
-      metric('metricFeedback', result.metrics.feedbackCount);
+      metric('metricCtr', pct(result.metrics.ctr));
+      metric('metricFeedbackRate', pct(result.metrics.feedbackRate));
+      metric('metricNegativeRate', pct(result.metrics.negativeFeedbackRate));
+      metric('metricRepeatRate', pct(result.metrics.repeatImpressionRate));
       $('trendRows').innerHTML = result.trends.map((row) =>
-        '<tr><td>' + esc(row.date) + '</td><td>' + esc(row.impressions) + '</td><td>' + esc(row.clicks) + '</td><td>' + esc(row.feedbacks) + '</td></tr>'
+        '<tr><td>' + esc(row.date) + '</td><td>' + esc(row.impressions) + '</td><td>' + esc(row.clicks) + '</td><td>' + esc(pct(row.ctr)) + '</td><td>' + esc(row.feedbacks) + '</td></tr>'
       ).join('');
       $('topUpRows').innerHTML = result.topUps.map((row) =>
-        '<tr><td>' + esc(row.upName || row.key) + '</td><td>' + esc(row.sampleCount) + '</td><td>' + esc(row.seenCount) + '</td><td>' + esc(row.clickCount) + '</td></tr>'
+        '<tr><td>' + esc(row.upName || row.key) + '</td><td>' + esc(row.sampleCount) + '</td><td>' + esc(row.seenCount) + '</td><td>' + esc(row.clickCount) + '</td><td>' + esc(pct(row.ctr)) + '</td><td>' + esc(pct(row.negativeFeedbackRate)) + '</td></tr>'
       ).join('');
+      const dimensions = result.dimensions || {};
       $('distributionView').innerHTML = [
-        bars('分类', result.categories || []),
-        bars('来源', result.sources || []),
-        bars('模式', result.modes || []),
+        bars('分类', dimensions.categories || result.categories || []),
+        bars('来源', dimensions.sources || result.sources || []),
+        bars('模式', dimensions.modes || result.modes || []),
+        bars('位置', dimensions.positions || []),
         bars('反馈', result.feedback || [])
       ].join('');
       setMessage('已刷新。');
