@@ -35,6 +35,18 @@ function storageSet(values) {
   });
 }
 
+function sendRuntimeMessage(message) {
+  if (usePromiseApi) return extensionApi.runtime.sendMessage(message);
+
+  return new Promise((resolve, reject) => {
+    extensionApi.runtime.sendMessage(message, (response) => {
+      const error = getLastRuntimeError();
+      if (error) reject(error);
+      else resolve(response);
+    });
+  });
+}
+
 function tabsQuery(queryInfo) {
   if (usePromiseApi) return extensionApi.tabs.query(queryInfo);
 
@@ -211,6 +223,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   let syncSecret = '';
   let reportFrequency = syncStore.normalizeFrequency();
   let syncStatus = null;
+  let syncQueuedBatches = 0;
   let refreshTimer = null;
 
   function getTabFromHash() {
@@ -353,14 +366,32 @@ document.addEventListener('DOMContentLoaded', async () => {
     syncEndpointInput.value = syncEndpoint;
     syncSecretInput.value = syncSecret;
     reportFrequencyInput.value = String(reportFrequency);
+    const queueSuffix = syncQueuedBatches > 0 ? `，待上报 ${syncQueuedBatches} 个批次` : '';
 
     if (syncStatus && syncStatus.message) {
       const date = new Date(syncStatus.at || 0);
       const suffix = Number.isNaN(date.getTime()) ? '' : `（${date.toLocaleString('zh-CN')}）`;
-      setSyncMessage(`${syncStatus.message}${suffix}`, syncStatus.ok === false);
+      setSyncMessage(`${syncStatus.message}${queueSuffix}${suffix}`, syncStatus.ok === false);
     } else {
-      setSyncMessage(syncEnabled ? '同步已启用，保存后可立即同步。' : '同步未启用。');
+      setSyncMessage(syncEnabled
+        ? `同步已启用${queueSuffix || '，保存后可立即同步。'}`
+        : '同步未启用。');
     }
+  }
+
+  function getQueueLength(value) {
+    return Array.isArray(value) ? value.filter(Boolean).length : 0;
+  }
+
+  function getReportResultMessage(result, prefix = '') {
+    if (result && result.skipped) {
+      if (result.reason === 'disabled') return `${prefix}同步与上报未启用。`;
+      if (result.reason === 'retry_wait') return `${prefix}上报等待重试。`;
+      return `${prefix}上报已跳过。`;
+    }
+
+    const sent = result && Number(result.sent || 0);
+    return sent ? `${prefix}已上报 ${sent} 个批次。` : `${prefix}没有待上报数据。`;
   }
 
   function renderAnalysisSummary() {
@@ -736,7 +767,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       syncStore.SECRET_KEY,
       syncStore.ENABLED_KEY,
       syncStore.REPORT_FREQUENCY_KEY,
-      syncStore.LAST_STATUS_KEY
+      syncStore.LAST_STATUS_KEY,
+      syncStore.REPORT_QUEUE_KEY
     ]);
     fusionCleanRatio = normalizeFusionCleanRatio(result.bili_fusion_clean_ratio);
     renderFusionRatio();
@@ -751,6 +783,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     syncEnabled = result[syncStore.ENABLED_KEY] === true;
     reportFrequency = syncStore.normalizeFrequency(result[syncStore.REPORT_FREQUENCY_KEY]);
     syncStatus = result[syncStore.LAST_STATUS_KEY] || null;
+    syncQueuedBatches = getQueueLength(result[syncStore.REPORT_QUEUE_KEY]);
     renderAnalysis();
     renderSyncControls();
   } catch (error) {
@@ -838,7 +871,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (!response || response.success !== true) {
         throw new Error(response && response.error ? response.error : '同步失败');
       }
-      setSyncMessage('配置和队列已同步。');
+      const prefix = response.result && response.result.ok === true ? '配置已同步，' : '';
+      setSyncMessage(getReportResultMessage(response.result && response.result.report, prefix));
     } catch (error) {
       console.warn('[TabulaBili] Manual sync failed:', error);
       setSyncMessage(`同步失败：${error.message}`, true);
@@ -855,8 +889,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (!response || response.success !== true) {
         throw new Error(response && response.error ? response.error : '上报失败');
       }
-      const sent = response.result && Number(response.result.sent || 0);
-      setSyncMessage(sent ? `已上报 ${sent} 个批次。` : '没有待上报数据。');
+      setSyncMessage(getReportResultMessage(response.result));
     } catch (error) {
       console.warn('[TabulaBili] Manual report failed:', error);
       setSyncMessage(`上报失败：${error.message}`, true);
@@ -958,6 +991,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
     if (changes[syncStore.LAST_STATUS_KEY]) {
       syncStatus = changes[syncStore.LAST_STATUS_KEY].newValue || null;
+      shouldRenderSync = true;
+    }
+    if (changes[syncStore.REPORT_QUEUE_KEY]) {
+      syncQueuedBatches = getQueueLength(changes[syncStore.REPORT_QUEUE_KEY].newValue);
       shouldRenderSync = true;
     }
 

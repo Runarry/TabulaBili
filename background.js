@@ -175,7 +175,10 @@ async function queueReportPayload(payload) {
 
 async function flushReportQueue(force = false) {
   const connection = await getSyncConnection();
-  if (!connection.enabled) return { skipped: true };
+  if (!connection.enabled) {
+    if (force) await setSyncStatus(false, '同步与上报未启用');
+    return { skipped: true, reason: 'disabled' };
+  }
 
   const result = await storageGet([
     syncStore.REPORT_QUEUE_KEY,
@@ -184,9 +187,31 @@ async function flushReportQueue(force = false) {
   let queue = Array.isArray(result[syncStore.REPORT_QUEUE_KEY])
     ? result[syncStore.REPORT_QUEUE_KEY]
     : [];
+  const queuedBatches = queue.length;
+
+  if (!connection.endpoint || !connection.secret) {
+    const message = '缺少后端 URL 或服务密钥';
+    if (force || queuedBatches) await setSyncStatus(false, message, { queuedBatches });
+    throw new Error(message);
+  }
+
   const retryState = result[syncStore.RETRY_STATE_KEY] || {};
+  if (!queue.length) {
+    if (force) await setSyncStatus(true, '没有待上报数据', { queuedBatches: 0 });
+    return { sent: 0, queuedBatches: 0 };
+  }
+
   if (!force && retryState.nextRetryAt && new Date(retryState.nextRetryAt).getTime() > Date.now()) {
-    return { skipped: true };
+    await setSyncStatus(false, '上报等待重试', {
+      queuedBatches,
+      nextRetryAt: retryState.nextRetryAt
+    });
+    return {
+      skipped: true,
+      reason: 'retry_wait',
+      queuedBatches,
+      nextRetryAt: retryState.nextRetryAt
+    };
   }
 
   let sent = 0;
@@ -218,8 +243,8 @@ async function flushReportQueue(force = false) {
     }
   }
 
-  if (sent) await setSyncStatus(true, `已上报 ${sent} 个批次`);
-  return { sent };
+  if (sent) await setSyncStatus(true, `已上报 ${sent} 个批次`, { queuedBatches: queue.length });
+  return { sent, queuedBatches: queue.length };
 }
 
 async function scheduleSyncAlarms() {
@@ -475,7 +500,17 @@ extensionApi.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.action === 'syncBackendNow') {
     syncConfigNow()
-      .then((result) => flushReportQueue(true).then((reportResult) => ({ ...result, report: reportResult })))
+      .then((result) => flushReportQueue(true).then(async (reportResult) => {
+        if (result && result.ok === true && reportResult && !reportResult.skipped) {
+          const sent = Number(reportResult.sent || 0);
+          await setSyncStatus(
+            true,
+            sent ? `配置已同步，已上报 ${sent} 个批次` : '配置已同步，没有待上报数据',
+            { queuedBatches: Number(reportResult.queuedBatches || 0) }
+          );
+        }
+        return { ...result, report: reportResult };
+      }))
       .then((result) => sendResponse({ success: true, result }))
       .catch((error) => {
         console.warn('[TabulaBili] Manual sync failed:', error);
