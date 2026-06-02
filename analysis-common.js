@@ -8,6 +8,8 @@ globalThis.TabulaBiliAnalysis = (() => {
   const SAMPLE_STORE = 'samples';
   const UP_STORE = 'upStats';
   const META_STORE = 'meta';
+  const LAST_TRIM_META_KEY = 'lastTrimAt';
+  const AUTO_TRIM_INTERVAL_MS = 10 * 60 * 1000;
   const DEFAULT_SETTINGS = {
     retentionDays: 30,
     maxSamples: 5000,
@@ -310,6 +312,46 @@ globalThis.TabulaBiliAnalysis = (() => {
     return stat;
   }
 
+  function makeEmptyUpStat(key) {
+    return {
+      key,
+      upName: '',
+      upMid: '',
+      seenCount: 0,
+      sampleCount: 0,
+      clickCount: 0,
+      dislikeCount: 0,
+      blockedCount: 0,
+      lastSeenAt: '',
+      searchText: ''
+    };
+  }
+
+  function refreshUpStatSearchText(stat) {
+    stat.searchText = `${stat.upName || ''} ${stat.upMid || ''}`.toLowerCase();
+  }
+
+  function applySampleToUpStat(stat, sample, delta) {
+    if (!sample || !stat || !delta) return stat;
+
+    stat.seenCount = Math.max(0, getPositiveInteger(stat.seenCount, 0) + delta * getPositiveInteger(sample.seenCount, 0));
+    stat.sampleCount = Math.max(0, getPositiveInteger(stat.sampleCount, 0) + delta);
+    stat.clickCount = Math.max(0, getPositiveInteger(stat.clickCount, 0) + delta * getPositiveInteger(sample.clickCount, 0));
+    stat.dislikeCount = Math.max(0, getPositiveInteger(stat.dislikeCount, 0) + (sample.feedback === 'dislike' ? delta : 0));
+    stat.blockedCount = Math.max(0, getPositiveInteger(stat.blockedCount, 0) + (sample.feedback === 'blocked' ? delta : 0));
+
+    if (delta > 0) {
+      stat.upName = sample.upName || stat.upName || '(未知 UP)';
+      stat.upMid = sample.upMid || stat.upMid || '';
+      if (getDateTime(sample.lastSeenAt) > getDateTime(stat.lastSeenAt)) {
+        stat.lastSeenAt = sample.lastSeenAt;
+      }
+    }
+
+    refreshUpStatSearchText(stat);
+    return stat;
+  }
+
   async function rebuildUpStatForKey(sampleStore, upStore, key) {
     if (!key) return;
     const index = sampleStore.index('upKey');
@@ -321,40 +363,106 @@ globalThis.TabulaBiliAnalysis = (() => {
     upStore.put(buildUpStat(samples, key));
   }
 
+  async function updateUpStatForSampleChange(sampleStore, upStore, previous, next) {
+    const previousKey = previous && previous.upKey;
+    const nextKey = next && next.upKey;
+
+    if (previousKey && previousKey !== nextKey) {
+      await rebuildUpStatForKey(sampleStore, upStore, previousKey);
+    }
+
+    if (!nextKey) return;
+
+    if (previousKey === nextKey && previous) {
+      const current = await requestToPromise(upStore.get(nextKey));
+      if (!current) {
+        await rebuildUpStatForKey(sampleStore, upStore, nextKey);
+        return;
+      }
+
+      const stat = applySampleToUpStat(current, previous, -1);
+      applySampleToUpStat(stat, next, 1);
+      if (stat.sampleCount > 0) upStore.put(stat);
+      else upStore.delete(nextKey);
+      return;
+    }
+
+    const current = await requestToPromise(upStore.get(nextKey));
+    const stat = applySampleToUpStat(current || makeEmptyUpStat(nextKey), next, 1);
+    upStore.put(stat);
+  }
+
+  function deleteSamplesByLastSeen(sampleStore, range, maxDeletes, changedUpKeys) {
+    if (maxDeletes !== null && maxDeletes <= 0) return Promise.resolve(0);
+
+    return new Promise((resolve, reject) => {
+      const index = sampleStore.index('lastSeenAt');
+      const request = range === null ? index.openCursor() : index.openCursor(range);
+      let deleted = 0;
+      request.onerror = () => reject(request.error || new Error('Failed to trim samples'));
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor || (maxDeletes !== null && deleted >= maxDeletes)) {
+          resolve(deleted);
+          return;
+        }
+
+        const sample = cursor.value;
+        if (sample && sample.upKey) changedUpKeys.add(sample.upKey);
+        const deleteRequest = cursor.delete();
+        deleteRequest.onerror = () => reject(deleteRequest.error || new Error('Failed to delete sample'));
+        deleted += 1;
+        cursor.continue();
+      };
+    });
+  }
+
+  async function shouldRunAutoTrim(sampleStore, metaStore, settings) {
+    const normalizedSettings = normalizeSettings(settings);
+    const total = await requestToPromise(sampleStore.count());
+    if (total > normalizedSettings.maxSamples) return true;
+
+    const meta = await requestToPromise(metaStore.get(LAST_TRIM_META_KEY));
+    const lastTrimAt = meta && meta.value;
+    return !lastTrimAt || Date.now() - getDateTime(lastTrimAt) >= AUTO_TRIM_INTERVAL_MS;
+  }
+
   async function trimStoredSamples(settings) {
     const normalizedSettings = normalizeSettings(settings);
     const cutoffIso = new Date(Date.now() - normalizedSettings.retentionDays * 24 * 60 * 60 * 1000).toISOString();
     const db = await openDb();
-    const tx = db.transaction([SAMPLE_STORE, UP_STORE], 'readwrite');
+    const tx = db.transaction([SAMPLE_STORE, UP_STORE, META_STORE], 'readwrite');
     const sampleStore = tx.objectStore(SAMPLE_STORE);
     const upStore = tx.objectStore(UP_STORE);
+    const metaStore = tx.objectStore(META_STORE);
     const changedUpKeys = new Set();
-    const all = await requestToPromise(sampleStore.getAll());
-    const kept = all
-      .filter((sample) => getDateTime(sample.lastSeenAt || sample.capturedAt) >= getDateTime(cutoffIso))
-      .sort((a, b) => getDateTime(b.lastSeenAt || b.capturedAt) - getDateTime(a.lastSeenAt || a.capturedAt))
-      .slice(0, normalizedSettings.maxSamples);
-    const keepIds = new Set(kept.map((sample) => sample.id));
-    for (const sample of all) {
-      if (!keepIds.has(sample.id)) {
-        changedUpKeys.add(sample.upKey);
-        sampleStore.delete(sample.id);
-      }
-    }
+
+    const expired = await deleteSamplesByLastSeen(
+      sampleStore,
+      IDBKeyRange.upperBound(cutoffIso, true),
+      null,
+      changedUpKeys
+    );
+    const remaining = await requestToPromise(sampleStore.count());
+    const overflow = Math.max(0, remaining - normalizedSettings.maxSamples);
+    const excess = await deleteSamplesByLastSeen(sampleStore, null, overflow, changedUpKeys);
+
     for (const key of changedUpKeys) {
       await rebuildUpStatForKey(sampleStore, upStore, key);
     }
+    metaStore.put({ key: LAST_TRIM_META_KEY, value: new Date().toISOString() });
     await transactionDone(tx);
+    return { trimmed: expired + excess, expired, overflow: excess };
   }
 
   async function captureSamples(samples, settings) {
     const incomingSamples = Array.isArray(samples) ? samples : [];
     if (!incomingSamples.length) return { stored: 0 };
     const db = await openDb();
-    const tx = db.transaction([SAMPLE_STORE, UP_STORE], 'readwrite');
+    const tx = db.transaction([SAMPLE_STORE, UP_STORE, META_STORE], 'readwrite');
     const sampleStore = tx.objectStore(SAMPLE_STORE);
     const upStore = tx.objectStore(UP_STORE);
-    const changedUpKeys = new Set();
+    const metaStore = tx.objectStore(META_STORE);
     let stored = 0;
 
     for (const rawSample of incomingSamples) {
@@ -363,19 +471,15 @@ globalThis.TabulaBiliAnalysis = (() => {
       const existing = await requestToPromise(sampleStore.get(id));
       const next = mergeStoredSample(existing, rawSample);
       if (!next) continue;
-      if (existing) changedUpKeys.add(existing.upKey);
-      changedUpKeys.add(next.upKey);
-      sampleStore.put(next);
+      await requestToPromise(sampleStore.put(next));
+      await updateUpStatForSampleChange(sampleStore, upStore, existing, next);
       stored += 1;
     }
 
-    for (const key of changedUpKeys) {
-      await rebuildUpStatForKey(sampleStore, upStore, key);
-    }
-
+    const shouldTrim = stored > 0 && await shouldRunAutoTrim(sampleStore, metaStore, settings);
     await transactionDone(tx);
-    await trimStoredSamples(settings);
-    return { stored };
+    if (shouldTrim) await trimStoredSamples(settings);
+    return { stored, trimmed: shouldTrim };
   }
 
   async function replaceSamples(samples, settings) {
@@ -535,8 +639,8 @@ globalThis.TabulaBiliAnalysis = (() => {
       clickCount: getPositiveInteger(current.clickCount, 0) + 1,
       lastClickedAt: new Date().toISOString()
     });
-    sampleStore.put(next);
-    await rebuildUpStatForKey(sampleStore, upStore, next.upKey);
+    await requestToPromise(sampleStore.put(next));
+    await updateUpStatForSampleChange(sampleStore, upStore, current, next);
     await transactionDone(tx);
     return next;
   }
@@ -559,10 +663,46 @@ globalThis.TabulaBiliAnalysis = (() => {
       feedback: normalizedFeedback,
       feedbackUpdatedAt: new Date().toISOString()
     });
-    sampleStore.put(next);
-    await rebuildUpStatForKey(sampleStore, upStore, next.upKey);
+    await requestToPromise(sampleStore.put(next));
+    await updateUpStatForSampleChange(sampleStore, upStore, current, next);
     await transactionDone(tx);
     return next;
+  }
+
+  function updateUpFeedbackSamples(sampleStore, criteria, normalizedFeedback, changedUpKeys, samples) {
+    const now = new Date().toISOString();
+    const indexName = criteria.upMid ? 'upKey' : 'upNameLower';
+    const key = criteria.upMid ? `mid:${criteria.upMid}` : criteria.upName.toLowerCase();
+
+    return new Promise((resolve, reject) => {
+      const request = sampleStore.index(indexName).openCursor(IDBKeyRange.only(key));
+      request.onerror = () => reject(request.error || new Error('Failed to update UP feedback'));
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) {
+          resolve();
+          return;
+        }
+
+        const sample = cursor.value;
+        const matched = criteria.upMid ? sample.upMid === criteria.upMid : sample.upName === criteria.upName;
+        if (!matched) {
+          cursor.continue();
+          return;
+        }
+
+        const next = decorateSample({
+          ...sample,
+          feedback: normalizedFeedback,
+          feedbackUpdatedAt: now
+        });
+        const updateRequest = cursor.update(next);
+        updateRequest.onerror = () => reject(updateRequest.error || new Error('Failed to update UP feedback sample'));
+        if (next.upKey) changedUpKeys.add(next.upKey);
+        samples.push(next);
+        cursor.continue();
+      };
+    });
   }
 
   async function updateUpFeedback(criteria, feedback) {
@@ -574,22 +714,9 @@ globalThis.TabulaBiliAnalysis = (() => {
     const tx = db.transaction([SAMPLE_STORE, UP_STORE], 'readwrite');
     const sampleStore = tx.objectStore(SAMPLE_STORE);
     const upStore = tx.objectStore(UP_STORE);
-    const all = await requestToPromise(sampleStore.getAll());
-    const now = new Date().toISOString();
     const changedUpKeys = new Set();
     const samples = [];
-    for (const sample of all) {
-      const matched = upMid ? sample.upMid === upMid : sample.upName === upName;
-      if (!matched) continue;
-      const next = decorateSample({
-        ...sample,
-        feedback: normalizedFeedback,
-        feedbackUpdatedAt: now
-      });
-      sampleStore.put(next);
-      changedUpKeys.add(next.upKey);
-      samples.push(next);
-    }
+    await updateUpFeedbackSamples(sampleStore, { upMid, upName }, normalizedFeedback, changedUpKeys, samples);
     for (const key of changedUpKeys) {
       await rebuildUpStatForKey(sampleStore, upStore, key);
     }

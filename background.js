@@ -20,6 +20,7 @@ const CONFIG_SYNC_DEBOUNCE_MS = 1200;
 
 let configSyncTimer = null;
 let applyingRemoteConfigUntil = 0;
+let reportQueueMigration = null;
 
 function getLastRuntimeError() {
   return extensionApi.runtime.lastError
@@ -180,6 +181,39 @@ async function setSyncStatus(ok, message, extra = {}) {
   await storageSet({ [syncStore.LAST_STATUS_KEY]: syncStore.makeStatus(ok, message, extra) });
 }
 
+async function updateReportQueueStatus(queuedBatches = null) {
+  const count = queuedBatches === null
+    ? await syncStore.getReportQueueCount()
+    : Math.max(0, Number(queuedBatches) || 0);
+  await storageSet({
+    [syncStore.REPORT_QUEUE_STATUS_KEY]: {
+      queuedBatches: count,
+      updatedAt: new Date().toISOString()
+    }
+  });
+  return count;
+}
+
+async function ensureReportQueueMigrated() {
+  if (!reportQueueMigration) {
+    reportQueueMigration = (async () => {
+      const result = await storageGet([syncStore.REPORT_QUEUE_KEY]);
+      const legacyQueue = result[syncStore.REPORT_QUEUE_KEY];
+      const migration = await syncStore.migrateLegacyReportQueue(legacyQueue);
+      if (Array.isArray(legacyQueue) && legacyQueue.length) {
+        await storageSet({ [syncStore.REPORT_QUEUE_KEY]: [] });
+      }
+      const queuedBatches = await updateReportQueueStatus(migration.queuedBatches);
+      return { ...migration, queuedBatches };
+    })().catch((error) => {
+      reportQueueMigration = null;
+      throw error;
+    });
+  }
+
+  return reportQueueMigration;
+}
+
 async function ensureSyncClientId() {
   const result = await storageGet([syncStore.CLIENT_ID_KEY]);
   const clientId = syncStore.getStableClientId(result[syncStore.CLIENT_ID_KEY]);
@@ -288,36 +322,26 @@ async function queueReportPayload(payload) {
   const batch = syncStore.buildReportBatch(payload, clientId);
   if (!batch.events.length) return { queued: false };
 
-  const result = await storageGet([syncStore.REPORT_QUEUE_KEY]);
-  const queue = Array.isArray(result[syncStore.REPORT_QUEUE_KEY])
-    ? result[syncStore.REPORT_QUEUE_KEY]
-    : [];
-  const nextQueue = queue.filter((item) => item && item.batchId !== batch.batchId);
-  nextQueue.push(batch);
-  const overflow = Math.max(0, nextQueue.length - syncStore.MAX_REPORT_BATCHES);
-  const trimmed = overflow ? nextQueue.slice(overflow) : nextQueue;
-  await storageSet({ [syncStore.REPORT_QUEUE_KEY]: trimmed });
-  if (overflow) {
-    await setSyncStatus(false, `上报队列过长，已丢弃 ${overflow} 个最旧批次`);
+  await ensureReportQueueMigrated();
+  await syncStore.enqueueReportBatch(batch);
+  const trimResult = await syncStore.trimReportQueue(syncStore.MAX_REPORT_BATCHES);
+  const queuedBatches = await updateReportQueueStatus(trimResult.queuedBatches);
+  if (trimResult.trimmed) {
+    await setSyncStatus(false, `上报队列过长，已丢弃 ${trimResult.trimmed} 个最旧批次`, { queuedBatches });
   }
-  return { queued: true, eventCount: batch.events.length };
+  return { queued: true, eventCount: batch.events.length, queuedBatches };
 }
 
 async function flushReportQueue(force = false) {
+  await ensureReportQueueMigrated();
   const connection = await getSyncConnection();
+  const queuedBatches = await updateReportQueueStatus();
   if (!connection.enabled) {
     if (force) await setSyncStatus(false, '同步与上报未启用');
-    return { skipped: true, reason: 'disabled' };
+    return { skipped: true, reason: 'disabled', queuedBatches };
   }
 
-  const result = await storageGet([
-    syncStore.REPORT_QUEUE_KEY,
-    syncStore.RETRY_STATE_KEY
-  ]);
-  let queue = Array.isArray(result[syncStore.REPORT_QUEUE_KEY])
-    ? result[syncStore.REPORT_QUEUE_KEY]
-    : [];
-  const queuedBatches = queue.length;
+  const result = await storageGet([syncStore.RETRY_STATE_KEY]);
 
   if (!connection.endpoint || !connection.secret) {
     const message = '缺少后端 URL 或服务密钥';
@@ -326,6 +350,7 @@ async function flushReportQueue(force = false) {
   }
 
   const retryState = result[syncStore.RETRY_STATE_KEY] || {};
+  const queue = await syncStore.listReportBatches(syncStore.MAX_REPORT_BATCHES);
   if (!queue.length) {
     if (force) await setSyncStatus(true, '没有待上报数据', { queuedBatches: 0 });
     return { sent: 0, queuedBatches: 0 };
@@ -346,35 +371,35 @@ async function flushReportQueue(force = false) {
 
   let sent = 0;
   while (queue.length) {
-    const batch = queue[0];
+    const batch = queue.shift();
     try {
       await syncFetch('/api/reports', {
         method: 'POST',
         body: JSON.stringify(batch)
       }, connection);
       sent += 1;
-      queue = queue.slice(1);
-      await storageSet({
-        [syncStore.REPORT_QUEUE_KEY]: queue,
-        [syncStore.RETRY_STATE_KEY]: {}
-      });
+      await syncStore.deleteReportBatch(batch.batchId);
+      const remaining = await updateReportQueueStatus();
+      await storageSet({ [syncStore.RETRY_STATE_KEY]: {} });
+      if (!remaining) break;
     } catch (error) {
       const attempts = Number(retryState.attempts || 0) + 1;
       const delayMinutes = Math.min(120, 2 ** Math.min(attempts, 6));
       await storageSet({
-        [syncStore.REPORT_QUEUE_KEY]: queue,
         [syncStore.RETRY_STATE_KEY]: {
           attempts,
           nextRetryAt: new Date(Date.now() + delayMinutes * 60 * 1000).toISOString()
         }
       });
-      await setSyncStatus(false, `数据上报失败：${error.message}`, { queuedBatches: queue.length });
+      const remaining = await updateReportQueueStatus();
+      await setSyncStatus(false, `数据上报失败：${error.message}`, { queuedBatches: remaining });
       throw error;
     }
   }
 
-  if (sent) await setSyncStatus(true, `已上报 ${sent} 个批次`, { queuedBatches: queue.length });
-  return { sent, queuedBatches: queue.length };
+  const remaining = await updateReportQueueStatus();
+  if (sent) await setSyncStatus(true, `已上报 ${sent} 个批次`, { queuedBatches: remaining });
+  return { sent, queuedBatches: remaining };
 }
 
 async function scheduleSyncAlarms() {

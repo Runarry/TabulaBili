@@ -5,10 +5,14 @@ globalThis.TabulaBiliSync = (() => {
   const CLIENT_ID_KEY = 'tabulabili_sync_client_id';
   const CONFIG_ENVELOPE_KEY = 'tabulabili_sync_config_envelope_v1';
   const REPORT_QUEUE_KEY = 'tabulabili_report_queue_v1';
+  const REPORT_QUEUE_STATUS_KEY = 'tabulabili_report_queue_status_v1';
   const REPORT_FREQUENCY_KEY = 'tabulabili_report_frequency_minutes';
   const LAST_STATUS_KEY = 'tabulabili_sync_last_status_v1';
   const RETRY_STATE_KEY = 'tabulabili_sync_retry_state_v1';
   const MAX_REPORT_BATCHES = 200;
+  const DB_NAME = 'tabulabili-sync';
+  const DB_VERSION = 1;
+  const REPORT_QUEUE_STORE = 'reportQueue';
 
   const CONFIG_FIELD_KEYS = [
     'bili_mode',
@@ -49,6 +53,41 @@ globalThis.TabulaBiliSync = (() => {
       at: nowIso(),
       ...extra
     };
+  }
+
+  function openDb() {
+    return new Promise((resolve, reject) => {
+      if (!globalThis.indexedDB) {
+        reject(new Error('IndexedDB is unavailable'));
+        return;
+      }
+
+      const request = indexedDB.open(DB_NAME, DB_VERSION);
+      request.onerror = () => reject(request.error || new Error('Failed to open sync IndexedDB'));
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains(REPORT_QUEUE_STORE)) {
+          const queue = db.createObjectStore(REPORT_QUEUE_STORE, { keyPath: 'batchId' });
+          queue.createIndex('queuedAt', 'queuedAt');
+        }
+      };
+      request.onsuccess = () => resolve(request.result);
+    });
+  }
+
+  function requestToPromise(request) {
+    return new Promise((resolve, reject) => {
+      request.onerror = () => reject(request.error || new Error('IndexedDB request failed'));
+      request.onsuccess = () => resolve(request.result);
+    });
+  }
+
+  function transactionDone(tx) {
+    return new Promise((resolve, reject) => {
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error || new Error('IndexedDB transaction failed'));
+      tx.onabort = () => reject(tx.error || new Error('IndexedDB transaction aborted'));
+    });
   }
 
   function stableStringify(value) {
@@ -233,6 +272,133 @@ globalThis.TabulaBiliSync = (() => {
     };
   }
 
+  function normalizeReportBatch(batch, index = 0) {
+    if (!batch || typeof batch !== 'object' || typeof batch.batchId !== 'string' || !batch.batchId) {
+      return null;
+    }
+    if (!Array.isArray(batch.events) || !batch.events.length) return null;
+
+    return {
+      ...batch,
+      queuedAt: typeof batch.queuedAt === 'string' && batch.queuedAt
+        ? batch.queuedAt
+        : new Date(Date.now() + index).toISOString()
+    };
+  }
+
+  async function enqueueReportBatch(batch) {
+    const normalized = normalizeReportBatch(batch);
+    if (!normalized) return { queued: false };
+
+    const db = await openDb();
+    const tx = db.transaction([REPORT_QUEUE_STORE], 'readwrite');
+    tx.objectStore(REPORT_QUEUE_STORE).put(normalized);
+    await transactionDone(tx);
+    return { queued: true, batchId: normalized.batchId };
+  }
+
+  function readQueuedBatches(store, limit = MAX_REPORT_BATCHES) {
+    return new Promise((resolve, reject) => {
+      const items = [];
+      const request = store.index('queuedAt').openCursor();
+      request.onerror = () => reject(request.error || new Error('Failed to read report queue'));
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor || items.length >= limit) {
+          resolve(items);
+          return;
+        }
+        items.push(cursor.value);
+        cursor.continue();
+      };
+    });
+  }
+
+  async function listReportBatches(limit = MAX_REPORT_BATCHES) {
+    const db = await openDb();
+    const tx = db.transaction([REPORT_QUEUE_STORE], 'readonly');
+    const items = await readQueuedBatches(tx.objectStore(REPORT_QUEUE_STORE), limit);
+    await transactionDone(tx);
+    return items;
+  }
+
+  async function deleteReportBatch(batchId) {
+    if (!batchId) return { deleted: false };
+    const db = await openDb();
+    const tx = db.transaction([REPORT_QUEUE_STORE], 'readwrite');
+    tx.objectStore(REPORT_QUEUE_STORE).delete(batchId);
+    await transactionDone(tx);
+    return { deleted: true };
+  }
+
+  function deleteOldestQueuedBatches(store, count) {
+    if (count <= 0) return Promise.resolve(0);
+
+    return new Promise((resolve, reject) => {
+      let deleted = 0;
+      const request = store.index('queuedAt').openCursor();
+      request.onerror = () => reject(request.error || new Error('Failed to trim report queue'));
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor || deleted >= count) {
+          resolve(deleted);
+          return;
+        }
+
+        const deleteRequest = cursor.delete();
+        deleteRequest.onerror = () => reject(deleteRequest.error || new Error('Failed to delete queued report'));
+        deleted += 1;
+        cursor.continue();
+      };
+    });
+  }
+
+  async function trimReportQueue(maxBatches = MAX_REPORT_BATCHES) {
+    const db = await openDb();
+    const tx = db.transaction([REPORT_QUEUE_STORE], 'readwrite');
+    const store = tx.objectStore(REPORT_QUEUE_STORE);
+    const total = await requestToPromise(store.count());
+    const overflow = Math.max(0, total - maxBatches);
+    const trimmed = await deleteOldestQueuedBatches(store, overflow);
+    const remaining = total - trimmed;
+    await transactionDone(tx);
+    return { trimmed, queuedBatches: remaining };
+  }
+
+  async function getReportQueueCount() {
+    const db = await openDb();
+    const tx = db.transaction([REPORT_QUEUE_STORE], 'readonly');
+    const count = await requestToPromise(tx.objectStore(REPORT_QUEUE_STORE).count());
+    await transactionDone(tx);
+    return count;
+  }
+
+  async function migrateLegacyReportQueue(legacyQueue) {
+    if (!Array.isArray(legacyQueue) || !legacyQueue.length) {
+      return { imported: 0, trimmed: 0, queuedBatches: await getReportQueueCount() };
+    }
+
+    const db = await openDb();
+    const tx = db.transaction([REPORT_QUEUE_STORE], 'readwrite');
+    const store = tx.objectStore(REPORT_QUEUE_STORE);
+    let imported = 0;
+
+    for (let index = 0; index < legacyQueue.length; index += 1) {
+      const batch = normalizeReportBatch(legacyQueue[index], index);
+      if (!batch) continue;
+      store.put(batch);
+      imported += 1;
+    }
+
+    await transactionDone(tx);
+    const queuedBatches = await getReportQueueCount();
+    return {
+      imported,
+      trimmed: 0,
+      queuedBatches
+    };
+  }
+
   return {
     ENDPOINT_KEY,
     SECRET_KEY,
@@ -240,17 +406,26 @@ globalThis.TabulaBiliSync = (() => {
     CLIENT_ID_KEY,
     CONFIG_ENVELOPE_KEY,
     REPORT_QUEUE_KEY,
+    REPORT_QUEUE_STATUS_KEY,
     REPORT_FREQUENCY_KEY,
     LAST_STATUS_KEY,
     RETRY_STATE_KEY,
+    DB_NAME,
+    REPORT_QUEUE_STORE,
     MAX_REPORT_BATCHES,
     CONFIG_FIELD_KEYS,
     buildConfigEnvelope,
     buildReportBatch,
+    deleteReportBatch,
+    enqueueReportBatch,
+    getReportQueueCount,
     getStableClientId,
+    listReportBatches,
     makeStatus,
     materializeConfig,
+    migrateLegacyReportQueue,
     normalizeEndpoint,
-    normalizeFrequency
+    normalizeFrequency,
+    trimReportQueue
   };
 })();

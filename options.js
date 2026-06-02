@@ -465,8 +465,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
-  function getQueueLength(value) {
-    return Array.isArray(value) ? value.filter(Boolean).length : 0;
+  function getQueueStatusCount(value) {
+    const count = Number(value && value.queuedBatches);
+    return Number.isFinite(count) && count > 0 ? count : 0;
   }
 
   function getReportResultMessage(result, prefix = '') {
@@ -892,7 +893,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       syncStore.ENABLED_KEY,
       syncStore.REPORT_FREQUENCY_KEY,
       syncStore.LAST_STATUS_KEY,
-      syncStore.REPORT_QUEUE_KEY
+      syncStore.REPORT_QUEUE_STATUS_KEY
     ]);
     fusionCleanRatio = normalizeFusionCleanRatio(result.bili_fusion_clean_ratio);
     renderFusionRatio();
@@ -910,7 +911,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     syncEnabled = result[syncStore.ENABLED_KEY] === true;
     reportFrequency = syncStore.normalizeFrequency(result[syncStore.REPORT_FREQUENCY_KEY]);
     syncStatus = result[syncStore.LAST_STATUS_KEY] || null;
-    syncQueuedBatches = getQueueLength(result[syncStore.REPORT_QUEUE_KEY]);
+    syncQueuedBatches = getQueueStatusCount(result[syncStore.REPORT_QUEUE_STATUS_KEY]);
     await renderAnalysis();
     renderSyncControls();
   } catch (error) {
@@ -1136,8 +1137,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       syncStatus = changes[syncStore.LAST_STATUS_KEY].newValue || null;
       shouldRenderSync = true;
     }
-    if (changes[syncStore.REPORT_QUEUE_KEY]) {
-      syncQueuedBatches = getQueueLength(changes[syncStore.REPORT_QUEUE_KEY].newValue);
+    if (changes[syncStore.REPORT_QUEUE_STATUS_KEY]) {
+      syncQueuedBatches = getQueueStatusCount(changes[syncStore.REPORT_QUEUE_STATUS_KEY].newValue);
       shouldRenderSync = true;
     }
 

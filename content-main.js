@@ -19,6 +19,7 @@ const MIXIN_KEY_ENC_TAB = [
 ];
 
 let blockerConfig = { enabled: true, rules: [] };
+let compiledBlockRules = [];
 let fusionCleanRatio = DEFAULT_FUSION_CLEAN_RATIO;
 let cachedWbiMixinKey = '';
 let cachedWbiMixinKeyTime = 0;
@@ -34,6 +35,7 @@ window.addEventListener('tabula_settings_config', (event) => {
     const parsed = JSON.parse(detail);
     const settings = normalizeSettingsConfig(parsed);
     blockerConfig = settings.blocker;
+    compiledBlockRules = compileBlockRules(blockerConfig);
     fusionCleanRatio = settings.fusionCleanRatio;
     analysisEnabled = settings.analysis.enabled;
   } catch (error) {
@@ -108,11 +110,11 @@ function isFeedApiUrl(url) {
   return typeof url === 'string' && url.includes(FEED_API_PATH);
 }
 
-function compileBlockRules() {
-  if (!blockerConfig.enabled || !blockerConfig.rules.length) return [];
+function compileBlockRules(config) {
+  if (!config || !config.enabled || !config.rules.length) return [];
 
   const compiled = [];
-  for (const rule of blockerConfig.rules) {
+  for (const rule of config.rules) {
     if (!rule.enabled || !rule.pattern) continue;
 
     if (rule.type === 'up_name_exact') {
@@ -310,7 +312,7 @@ function appendNextUnique(items, cursor, output, seenKeys, source = 'unknown') {
 }
 
 async function filterFeedResponse(response, originalArgs, originalUrl, currentMode) {
-  const compiledRules = compileBlockRules();
+  const compiledRules = compiledBlockRules;
   if (!analysisEnabled && !compiledRules.length) return response;
 
   let payload;
