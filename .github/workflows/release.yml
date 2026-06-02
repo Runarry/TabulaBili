@@ -17,60 +17,72 @@ jobs:
       - name: 📥 拉取最新代码
         uses: actions/checkout@v4
 
-      - name: 🧰 准备发布目录
-        run: mkdir -p dist
+      - name: 🧰 准备浏览器专属源码目录
+        run: |
+          extension_files=(
+            rules.json
+            analysis-common.js
+            sync-common.js
+            background.js
+            content.js
+            content-main.js
+            popup.html
+            popup.css
+            popup.js
+            options.html
+            options.css
+            options.js
+            icon.png
+            icon16.png
+            icon32.png
+            icon48.png
+            icon128.png
+          )
+
+          mkdir -p dist/chrome-source dist/firefox-source
+          for file in "${extension_files[@]}"; do
+            cp "$file" dist/chrome-source/
+            cp "$file" dist/firefox-source/
+          done
+
+          node <<'NODE'
+          const fs = require('node:fs');
+          const manifest = JSON.parse(fs.readFileSync('manifest.json', 'utf8'));
+          const clone = (value) => JSON.parse(JSON.stringify(value));
+
+          const chromeManifest = clone(manifest);
+          delete chromeManifest.background.scripts;
+          delete chromeManifest.browser_specific_settings;
+          fs.writeFileSync(
+            'dist/chrome-source/manifest.json',
+            `${JSON.stringify(chromeManifest, null, 2)}\n`
+          );
+
+          const firefoxManifest = clone(manifest);
+          delete firefoxManifest.background.service_worker;
+          fs.writeFileSync(
+            'dist/firefox-source/manifest.json',
+            `${JSON.stringify(firefoxManifest, null, 2)}\n`
+          );
+          NODE
 
       - name: 📦 打包 Chrome 扩展 ZIP
         run: |
-          zip -r "dist/TabulaBili-${{ github.ref_name }}-chrome.zip" \
-            manifest.json \
-            rules.json \
-            background.js \
-            content.js \
-            content-main.js \
-            popup.html \
-            popup.css \
-            popup.js \
-            icon.png \
-            icon16.png \
-            icon32.png \
-            icon48.png \
-            icon128.png
+          cd dist/chrome-source
+          zip -r "../TabulaBili-${{ github.ref_name }}-chrome.zip" .
 
       - name: 🦊 校验 Firefox 扩展
         run: |
           npx --yes web-ext lint \
-            --source-dir . \
-            --ignore-files \
-              ".git" \
-              ".github" \
-              ".gitignore" \
-              "README.md" \
-              "LICENSE" \
-              "promo.html" \
-              "dist" \
-              "*.DS_Store" \
-              "*.pem" \
-              "*.crx"
+            --source-dir dist/firefox-source
 
       - name: 📦 打包 Firefox 扩展 XPI
         run: |
           npx --yes web-ext build \
-            --source-dir . \
+            --source-dir dist/firefox-source \
             --artifacts-dir dist \
             --filename "tabulabili-${{ github.ref_name }}-firefox.xpi" \
-            --overwrite-dest \
-            --ignore-files \
-              ".git" \
-              ".github" \
-              ".gitignore" \
-              "README.md" \
-              "LICENSE" \
-              "promo.html" \
-              "dist" \
-              "*.DS_Store" \
-              "*.pem" \
-              "*.crx"
+            --overwrite-dest
 
       - name: 🚀 发布到 GitHub Releases
         uses: softprops/action-gh-release@v2
