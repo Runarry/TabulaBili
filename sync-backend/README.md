@@ -14,6 +14,7 @@ Authorization: Bearer <SYNC_SECRET>
 - `POST /api/config/sync`
 - `GET /api/config`
 - `POST /api/reports`
+- `POST /api/reports/bulk`
 - `GET /api/reports/summary`
 - `GET /api/reports/samples`
 - `GET /api/reports/events?sampleId=<id>`
@@ -21,6 +22,29 @@ Authorization: Bearer <SYNC_SECRET>
 - `GET /api/reports/batches`
 - `GET /api/reports/analytics`
 - `POST /api/reports/cleanup`
+
+### 批量上报接口
+
+`POST /api/reports/bulk` 可以在一次请求中提交多个原始上报批次，后台仍按每个 `batchId` 独立保存和去重。单次请求最多 50 个批次、2000 个事件；超出限制会返回 `400`。
+
+```http
+POST /api/reports/bulk
+Authorization: Bearer <SYNC_SECRET>
+Content-Type: application/json
+
+{
+  "batches": [
+    {
+      "batchId": "client:batch-hash",
+      "clientId": "client",
+      "capturedAt": "2026-06-01T00:00:00.000Z",
+      "events": []
+    }
+  ]
+}
+```
+
+返回值会汇总本次处理的批次数、事件数和重复数据，并在 `results` 中列出每个批次的保存结果。旧版后台不支持该接口时，扩展端会自动回退到 `POST /api/reports` 逐批上报。
 
 ### 数据统计接口
 

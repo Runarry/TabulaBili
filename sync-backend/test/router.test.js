@@ -9,6 +9,26 @@ function daysAgo(days) {
   return new Date(Date.now() - days * DAY_MS).toISOString();
 }
 
+function makeBatch(batchId, eventId, extra = {}) {
+  return {
+    batchId,
+    clientId: extra.clientId || 'c1',
+    capturedAt: extra.capturedAt || '2026-06-01T00:00:00.000Z',
+    events: extra.events || [
+      {
+        eventId,
+        id: extra.sampleId || eventId,
+        bvid: extra.sampleId || eventId,
+        title: extra.title || eventId,
+        capturedAt: extra.capturedAt || '2026-06-01T00:00:00.000Z',
+        mode: 'pure',
+        source: 'feed',
+        position: 1
+      }
+    ]
+  };
+}
+
 test('api routes require bearer secret', async () => {
   const app = createApp({ secret: 'secret', storage: new MemoryStorage() });
   const rejected = await app.fetch(new Request('http://local/api/config'));
@@ -56,6 +76,91 @@ test('admin routes render data and analytics pages', async () => {
   assert.match(analyticsHtml, /维度对比/);
   assert.match(analyticsHtml, /重复推荐视频/);
   assert.doesNotMatch(analyticsHtml, /auth=/);
+});
+
+test('bulk report endpoint saves multiple batches idempotently and preserves batch ids', async () => {
+  const storage = new MemoryStorage();
+  const app = createApp({ secret: 'secret', storage });
+  const headers = { authorization: 'Bearer secret', 'content-type': 'application/json' };
+  const batches = [
+    makeBatch('bulk-b1', 'bulk-e1', { sampleId: 'BV_BULK_1', title: 'bulk one' }),
+    makeBatch('bulk-b2', 'bulk-e2', {
+      sampleId: 'BV_BULK_2',
+      title: 'bulk two',
+      events: [
+        { eventId: 'bulk-e2', id: 'BV_BULK_2', bvid: 'BV_BULK_2', title: 'bulk two', capturedAt: '2026-06-01T00:00:00.000Z', mode: 'pure', source: 'feed', position: 2 },
+        { eventId: 'bulk-e3', id: 'BV_BULK_2', bvid: 'BV_BULK_2', eventKind: 'click', capturedAt: '2026-06-01T00:01:00.000Z' }
+      ]
+    })
+  ];
+
+  const response = await app.fetch(new Request('http://local/api/reports/bulk', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ batches })
+  }));
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.batchCount, 2);
+  assert.equal(body.eventCount, 3);
+  assert.equal(body.duplicateBatchCount, 0);
+  assert.deepEqual(body.results.map((item) => item.batchId), ['bulk-b1', 'bulk-b2']);
+
+  const duplicateResponse = await app.fetch(new Request('http://local/api/reports/bulk', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ batches })
+  }));
+  assert.equal(duplicateResponse.status, 200);
+  const duplicate = await duplicateResponse.json();
+  assert.equal(duplicate.duplicateBatchCount, 2);
+  assert.equal(duplicate.duplicateEventCount, 3);
+
+  const summaryResponse = await app.fetch(new Request('http://local/api/reports/summary', { headers }));
+  const summary = await summaryResponse.json();
+  assert.equal(summary.batchCount, 2);
+  assert.equal(summary.eventCount, 3);
+
+  const batchesResponse = await app.fetch(new Request('http://local/api/reports/batches', { headers }));
+  const listed = await batchesResponse.json();
+  assert.equal(listed.total, 2);
+  assert.deepEqual(new Set(listed.items.map((item) => item.batchId)), new Set(['bulk-b1', 'bulk-b2']));
+});
+
+test('bulk report endpoint validates payload before saving', async () => {
+  const storage = new MemoryStorage();
+  const app = createApp({ secret: 'secret', storage });
+  const headers = { authorization: 'Bearer secret', 'content-type': 'application/json' };
+  const tooManyBatches = Array.from({ length: 51 }, (_, index) => makeBatch(`limit-b${index}`, `limit-e${index}`));
+  const tooManyEvents = Array.from({ length: 2001 }, (_, index) => ({
+    eventId: `limit-event-${index}`,
+    id: `BV_LIMIT_${index}`,
+    capturedAt: '2026-06-01T00:00:00.000Z'
+  }));
+  const cases = [
+    [{ batches: [] }, 'invalid_batches'],
+    [{ batches: [makeBatch('', 'missing-batch-id')] }, 'invalid_batch'],
+    [{ batches: [{ ...makeBatch('missing-client', 'missing-client-event'), clientId: '' }] }, 'invalid_batch'],
+    [{ batches: [{ batchId: 'missing-events', clientId: 'c1' }] }, 'invalid_batch'],
+    [{ batches: tooManyBatches }, 'too_many_batches'],
+    [{ batches: [makeBatch('too-many-events', 'unused', { events: tooManyEvents })] }, 'too_many_events'],
+    [{ batches: [makeBatch('partial-valid', 'partial-valid-event'), { batchId: 'partial-invalid', events: [] }] }, 'invalid_batch']
+  ];
+
+  for (const [payload, error] of cases) {
+    const response = await app.fetch(new Request('http://local/api/reports/bulk', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload)
+    }));
+    assert.equal(response.status, 400);
+    assert.equal((await response.json()).error, error);
+  }
+
+  const summaryResponse = await app.fetch(new Request('http://local/api/reports/summary', { headers }));
+  const summary = await summaryResponse.json();
+  assert.equal(summary.batchCount, 0);
+  assert.equal(summary.eventCount, 0);
 });
 
 test('report cleanup supports dry run and actual deletion', async () => {

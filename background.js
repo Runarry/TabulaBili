@@ -17,6 +17,8 @@ const syncStore = globalThis.TabulaBiliSync;
 const CONFIG_SYNC_ALARM = 'tabulabili-config-sync';
 const REPORT_SYNC_ALARM = 'tabulabili-report-sync';
 const CONFIG_SYNC_DEBOUNCE_MS = 1200;
+const REPORT_BULK_BATCH_LIMIT = 50;
+const REPORT_BULK_EVENT_LIMIT = 2000;
 
 let configSyncTimer = null;
 let applyingRemoteConfigUntil = 0;
@@ -252,7 +254,10 @@ async function syncFetch(path, options = {}, connection = null) {
   });
   if (!response.ok) {
     const text = await response.text().catch(() => '');
-    throw new Error(text || `HTTP ${response.status}`);
+    const error = new Error(text || `HTTP ${response.status}`);
+    error.status = response.status;
+    error.body = text;
+    throw error;
   }
   return response.json();
 }
@@ -332,6 +337,54 @@ async function queueReportPayload(payload) {
   return { queued: true, eventCount: batch.events.length, queuedBatches };
 }
 
+function getReportBatchEventCount(batch) {
+  return Array.isArray(batch && batch.events) ? batch.events.length : 0;
+}
+
+function isBulkReportUnavailable(error) {
+  return error && (error.status === 404 || error.status === 405);
+}
+
+function shiftReportBatchGroup(queue) {
+  const group = [];
+  let eventCount = 0;
+
+  while (queue.length && group.length < REPORT_BULK_BATCH_LIMIT) {
+    const batch = queue[0];
+    const batchEventCount = getReportBatchEventCount(batch);
+    if (!group.length && batchEventCount > REPORT_BULK_EVENT_LIMIT) {
+      group.push(queue.shift());
+      break;
+    }
+    if (group.length && eventCount + batchEventCount > REPORT_BULK_EVENT_LIMIT) break;
+
+    group.push(queue.shift());
+    eventCount += batchEventCount;
+  }
+
+  return group;
+}
+
+async function postSingleReportBatch(batch, connection) {
+  await syncFetch('/api/reports', {
+    method: 'POST',
+    body: JSON.stringify(batch)
+  }, connection);
+}
+
+async function postBulkReportBatches(batches, connection) {
+  await syncFetch('/api/reports/bulk', {
+    method: 'POST',
+    body: JSON.stringify({ batches })
+  }, connection);
+}
+
+async function deleteReportBatches(batches) {
+  for (const batch of batches) {
+    await syncStore.deleteReportBatch(batch.batchId);
+  }
+}
+
 async function flushReportQueue(force = false) {
   await ensureReportQueueMigrated();
   const connection = await getSyncConnection();
@@ -371,14 +424,28 @@ async function flushReportQueue(force = false) {
 
   let sent = 0;
   while (queue.length) {
-    const batch = queue.shift();
+    const group = shiftReportBatchGroup(queue);
     try {
-      await syncFetch('/api/reports', {
-        method: 'POST',
-        body: JSON.stringify(batch)
-      }, connection);
-      sent += 1;
-      await syncStore.deleteReportBatch(batch.batchId);
+      if (group.length === 1 && getReportBatchEventCount(group[0]) > REPORT_BULK_EVENT_LIMIT) {
+        await postSingleReportBatch(group[0], connection);
+      } else {
+        try {
+          await postBulkReportBatches(group, connection);
+        } catch (error) {
+          if (!isBulkReportUnavailable(error)) throw error;
+          for (const batch of group) {
+            await postSingleReportBatch(batch, connection);
+            sent += 1;
+            await deleteReportBatches([batch]);
+            await updateReportQueueStatus();
+            await storageSet({ [syncStore.RETRY_STATE_KEY]: {} });
+          }
+          continue;
+        }
+      }
+
+      sent += group.length;
+      await deleteReportBatches(group);
       const remaining = await updateReportQueueStatus();
       await storageSet({ [syncStore.RETRY_STATE_KEY]: {} });
       if (!remaining) break;

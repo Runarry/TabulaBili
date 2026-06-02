@@ -2,6 +2,9 @@ import { adminPage } from './admin-page.js';
 import { materializeConfig, mergeConfig, normalizeEnvelope } from './config-merge.js';
 import { normalizeReportPayload } from './report-aggregate.js';
 
+const MAX_BULK_REPORT_BATCHES = 50;
+const MAX_BULK_REPORT_EVENTS = 2000;
+
 function json(value, status = 200) {
   return new Response(JSON.stringify(value), {
     status,
@@ -94,6 +97,70 @@ function isValidDate(value) {
   return Number.isFinite(Date.parse(value || ''));
 }
 
+function validateReportPayload(raw, options = {}) {
+  const payload = normalizeReportPayload(raw);
+  const requireEvents = options.requireEvents === true;
+  const hasEvents = raw && typeof raw === 'object' && Array.isArray(raw.events);
+  if (
+    !payload.batchId
+    || !payload.clientId
+    || (requireEvents && (!hasEvents || !payload.events.length))
+  ) {
+    return { error: 'invalid_batch' };
+  }
+  return { payload };
+}
+
+function validateBulkReportPayload(body) {
+  const source = body && typeof body === 'object' ? body : {};
+  const batches = Array.isArray(source.batches) ? source.batches : null;
+  if (!batches || !batches.length) return { error: 'invalid_batches' };
+  if (batches.length > MAX_BULK_REPORT_BATCHES) return { error: 'too_many_batches' };
+
+  const payloads = [];
+  let eventCount = 0;
+  for (const raw of batches) {
+    const validated = validateReportPayload(raw, { requireEvents: true });
+    if (validated.error) return { error: validated.error };
+    eventCount += validated.payload.events.length;
+    if (eventCount > MAX_BULK_REPORT_EVENTS) return { error: 'too_many_events' };
+    payloads.push(validated.payload);
+  }
+
+  return { payloads, eventCount };
+}
+
+async function saveReportBatch(storage, payload) {
+  const result = await storage.saveReportBatch(payload);
+  return {
+    batchId: payload.batchId,
+    ok: true,
+    ...result
+  };
+}
+
+async function saveBulkReportBatches(storage, payloads, eventCount) {
+  const results = [];
+  let duplicateBatchCount = 0;
+  let duplicateEventCount = 0;
+
+  for (const payload of payloads) {
+    const result = await saveReportBatch(storage, payload);
+    results.push(result);
+    if (result.duplicateBatch) duplicateBatchCount += 1;
+    duplicateEventCount += Number(result.duplicateEventCount || 0);
+  }
+
+  return {
+    ok: true,
+    batchCount: payloads.length,
+    eventCount,
+    duplicateBatchCount,
+    duplicateEventCount,
+    results
+  };
+}
+
 function createApp(options) {
   const storage = options.storage;
   const secret = options.secret;
@@ -135,11 +202,16 @@ function createApp(options) {
       }
 
       if (url.pathname === '/api/reports' && request.method === 'POST') {
-        const body = await readJson(request);
-        const payload = normalizeReportPayload(body);
-        if (!payload.batchId || !payload.clientId) return json({ error: 'invalid_batch' }, 400);
-        const result = await storage.saveReportBatch(payload);
+        const validated = validateReportPayload(await readJson(request));
+        if (validated.error) return json({ error: validated.error }, 400);
+        const result = await storage.saveReportBatch(validated.payload);
         return json({ ok: true, ...result });
+      }
+
+      if (url.pathname === '/api/reports/bulk' && request.method === 'POST') {
+        const validated = validateBulkReportPayload(await readJson(request));
+        if (validated.error) return json({ error: validated.error }, 400);
+        return json(await saveBulkReportBatches(storage, validated.payloads, validated.eventCount));
       }
 
       if (url.pathname === '/api/reports/summary' && request.method === 'GET') {
