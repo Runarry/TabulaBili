@@ -1,0 +1,213 @@
+import { getSampleId, mergeAggregate, toSampleRow } from '../report-aggregate.js';
+import {
+  buildReportAnalytics,
+  getSampleOrderBy,
+  getSampleWhere,
+  normalizeAnalyticsOptions,
+  normalizeLimit,
+  normalizeOffset,
+  normalizeSampleListOptions
+} from './helpers.js';
+
+async function allRows(statement) {
+  const result = await statement.all();
+  return result.results || [];
+}
+
+async function firstRow(statement) {
+  return statement.first();
+}
+
+function changesOf(result) {
+  return Number(result && result.meta && result.meta.changes || 0);
+}
+
+class D1Storage {
+  constructor(db) {
+    if (!db) throw new Error('TABULABILI_SYNC_DB D1 binding is required');
+    this.db = db;
+    this.ready = this.ensureSchema();
+  }
+
+  async ensureSchema() {
+    const statements = [
+      `create table if not exists config_store (
+        id integer primary key check (id = 1),
+        json text not null
+      )`,
+      `create table if not exists batches (
+        batch_id text primary key,
+        client_id text not null,
+        captured_at text not null,
+        received_at text not null,
+        event_count integer not null,
+        duplicate_event_count integer not null default 0,
+        raw_json text not null
+      )`,
+      `create table if not exists events (
+        event_id text primary key,
+        batch_id text not null,
+        client_id text not null,
+        sample_id text,
+        captured_at text not null,
+        received_at text not null,
+        raw_json text not null
+      )`,
+      `create table if not exists samples (
+        sample_id text primary key,
+        bvid text not null default '',
+        title text not null default '',
+        up_name text not null default '',
+        up_mid text not null default '',
+        category text not null default '',
+        last_seen_at text not null,
+        seen_count integer not null,
+        click_count integer not null default 0,
+        feedback text not null default 'unset',
+        json text not null
+      )`,
+      'create index if not exists idx_d1_batches_received_at on batches(received_at desc)',
+      'create index if not exists idx_d1_events_captured_at on events(captured_at)',
+      'create index if not exists idx_d1_samples_last_seen_at on samples(last_seen_at desc)',
+      'create index if not exists idx_d1_samples_seen_count on samples(seen_count desc)',
+      'create index if not exists idx_d1_samples_click_count on samples(click_count desc)',
+      'create index if not exists idx_d1_samples_feedback on samples(feedback)'
+    ];
+    for (const sql of statements) {
+      await this.db.prepare(sql).run();
+    }
+  }
+
+  async getConfig() {
+    await this.ready;
+    const row = await firstRow(this.db.prepare('select json from config_store where id = 1'));
+    return row ? JSON.parse(row.json) : null;
+  }
+
+  async saveConfig(config) {
+    await this.ready;
+    await this.db.prepare(`
+      insert into config_store (id, json) values (1, ?)
+      on conflict(id) do update set json = excluded.json
+    `).bind(JSON.stringify(config)).run();
+  }
+
+  async saveReportBatch(batch) {
+    await this.ready;
+    const existing = await firstRow(this.db.prepare('select event_count as eventCount, duplicate_event_count as duplicateEventCount from batches where batch_id = ?').bind(batch.batchId));
+    if (existing) {
+      return {
+        duplicateBatch: true,
+        eventCount: existing.eventCount,
+        duplicateEventCount: existing.duplicateEventCount
+      };
+    }
+
+    const receivedAt = new Date().toISOString();
+    let duplicateEventCount = 0;
+    await this.db.prepare(`
+      insert into batches (batch_id, client_id, captured_at, received_at, event_count, duplicate_event_count, raw_json)
+      values (?, ?, ?, ?, ?, 0, ?)
+    `).bind(batch.batchId, batch.clientId, batch.capturedAt, receivedAt, batch.events.length, JSON.stringify(batch)).run();
+
+    for (const event of batch.events) {
+      const sampleId = getSampleId(event);
+      const inserted = await this.db.prepare(`
+        insert or ignore into events (event_id, batch_id, client_id, sample_id, captured_at, received_at, raw_json)
+        values (?, ?, ?, ?, ?, ?, ?)
+      `).bind(event.eventId, batch.batchId, batch.clientId, sampleId, event.capturedAt, receivedAt, JSON.stringify(event)).run();
+      if (changesOf(inserted) === 0) {
+        duplicateEventCount += 1;
+        continue;
+      }
+
+      if (!sampleId) continue;
+      const existingSample = await firstRow(this.db.prepare('select json from samples where sample_id = ?').bind(sampleId));
+      const aggregate = mergeAggregate(existingSample ? JSON.parse(existingSample.json) : null, event);
+      const row = toSampleRow(sampleId, aggregate, receivedAt);
+      await this.db.prepare(`
+        insert into samples (sample_id, bvid, title, up_name, up_mid, category, last_seen_at, seen_count, click_count, feedback, json)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        on conflict(sample_id) do update set
+          bvid = excluded.bvid,
+          title = excluded.title,
+          up_name = excluded.up_name,
+          up_mid = excluded.up_mid,
+          category = excluded.category,
+          last_seen_at = excluded.last_seen_at,
+          seen_count = excluded.seen_count,
+          click_count = excluded.click_count,
+          feedback = excluded.feedback,
+          json = excluded.json
+      `).bind(
+        row.sampleId,
+        row.bvid,
+        row.title,
+        row.upName,
+        row.upMid,
+        row.category,
+        row.lastSeenAt,
+        row.seenCount,
+        row.clickCount,
+        row.feedback,
+        row.json
+      ).run();
+    }
+
+    await this.db.prepare('update batches set duplicate_event_count = ? where batch_id = ?').bind(duplicateEventCount, batch.batchId).run();
+    return { duplicateBatch: false, eventCount: batch.events.length, duplicateEventCount };
+  }
+
+  async getReportSummary() {
+    await this.ready;
+    const row = await firstRow(this.db.prepare(`
+      select
+        (select count(*) from batches) as batchCount,
+        (select count(*) from events) as eventCount,
+        (select coalesce(sum(duplicate_event_count), 0) from batches) as duplicateEventCount,
+        (select count(*) from samples) as sampleCount
+    `));
+    return row;
+  }
+
+  async listReportBatches(options = {}) {
+    await this.ready;
+    const limit = normalizeLimit(options.limit, 200);
+    const offset = normalizeOffset(options.offset);
+    const items = await allRows(this.db.prepare(`
+      select batch_id as batchId, client_id as clientId, captured_at as capturedAt, received_at as receivedAt,
+        event_count as eventCount, duplicate_event_count as duplicateEventCount
+      from batches order by received_at desc limit ? offset ?
+    `).bind(limit, offset));
+    const total = await firstRow(this.db.prepare('select count(*) as count from batches'));
+    return { items, total: total.count };
+  }
+
+  async listReportSamples(options = {}) {
+    await this.ready;
+    const query = normalizeSampleListOptions(options);
+    const { whereSql, args } = getSampleWhere(query);
+    const orderBy = getSampleOrderBy(query.sort);
+    const total = await firstRow(this.db.prepare(`select count(*) as count from samples ${whereSql}`).bind(...args));
+    const rows = await allRows(this.db.prepare(`select json from samples ${whereSql} order by ${orderBy} limit ? offset ?`).bind(...args, query.limit, query.offset));
+    return { items: rows.map((row) => JSON.parse(row.json)), total: total.count };
+  }
+
+  async getReportAnalytics(options = {}) {
+    await this.ready;
+    const { sinceIso, tzOffsetMinutes } = normalizeAnalyticsOptions(options);
+    const samples = (await allRows(this.db.prepare('select json from samples'))).map((row) => JSON.parse(row.json));
+    const events = (await allRows(this.db.prepare('select raw_json as json from events where captured_at >= ?').bind(sinceIso))).map((row) => JSON.parse(row.json));
+    return buildReportAnalytics({
+      samples,
+      events,
+      metrics: {
+        batchCount: (await firstRow(this.db.prepare('select count(*) as count from batches'))).count,
+        eventCount: (await firstRow(this.db.prepare('select count(*) as count from events'))).count
+      },
+      tzOffsetMinutes
+    });
+  }
+}
+
+export { D1Storage };

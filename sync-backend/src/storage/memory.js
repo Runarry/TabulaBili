@@ -1,4 +1,13 @@
 import { getSampleId, mergeAggregate } from '../report-aggregate.js';
+import {
+  buildReportAnalytics,
+  filterSamples,
+  normalizeAnalyticsOptions,
+  normalizeLimit,
+  normalizeOffset,
+  normalizeSampleListOptions,
+  sortSamples
+} from './helpers.js';
 
 class MemoryStorage {
   constructor() {
@@ -29,6 +38,7 @@ class MemoryStorage {
       capturedAt: batch.capturedAt,
       receivedAt,
       eventCount: batch.events.length,
+      duplicateEventCount: 0,
       raw: batch
     });
 
@@ -42,6 +52,8 @@ class MemoryStorage {
       if (!sampleId) continue;
       this.samples.set(sampleId, mergeAggregate(this.samples.get(sampleId), event));
     }
+    const storedBatch = this.batches.get(batch.batchId);
+    if (storedBatch) storedBatch.duplicateEventCount = duplicateEventCount;
 
     return { duplicateBatch: false, eventCount: batch.events.length, duplicateEventCount };
   }
@@ -50,14 +62,14 @@ class MemoryStorage {
     return {
       batchCount: this.batches.size,
       eventCount: this.events.size,
-      duplicateEventCount: [...this.batches.values()].reduce((sum) => sum + 0, 0),
+      duplicateEventCount: [...this.batches.values()].reduce((sum, batch) => sum + Number(batch.duplicateEventCount || 0), 0),
       sampleCount: this.samples.size
     };
   }
 
   async listReportBatches(options = {}) {
-    const limit = Math.min(200, Math.max(1, options.limit || 50));
-    const offset = Math.max(0, options.offset || 0);
+    const limit = normalizeLimit(options.limit, 200);
+    const offset = normalizeOffset(options.offset);
     const items = [...this.batches.values()]
       .sort((a, b) => String(b.receivedAt).localeCompare(String(a.receivedAt)))
       .slice(offset, offset + limit)
@@ -66,13 +78,24 @@ class MemoryStorage {
   }
 
   async listReportSamples(options = {}) {
-    const limit = Math.min(10000, Math.max(1, options.limit || 50));
-    const offset = Math.max(0, options.offset || 0);
-    const q = String(options.q || '').toLowerCase();
-    const filtered = [...this.samples.values()]
-      .filter((item) => !q || [item.id, item.bvid, item.title, item.upName].some((value) => String(value || '').toLowerCase().includes(q)))
-      .sort((a, b) => String(b.lastSeenAt).localeCompare(String(a.lastSeenAt)));
-    return { items: filtered.slice(offset, offset + limit), total: filtered.length };
+    const query = normalizeSampleListOptions(options);
+    const filtered = sortSamples(filterSamples([...this.samples.values()], query), query.sort);
+    return { items: filtered.slice(query.offset, query.offset + query.limit), total: filtered.length };
+  }
+
+  async getReportAnalytics(options = {}) {
+    const { sinceMs, tzOffsetMinutes } = normalizeAnalyticsOptions(options);
+    const samples = [...this.samples.values()];
+    const events = [...this.events.values()];
+    return buildReportAnalytics({
+      samples,
+      events: events.filter((event) => Date.parse(event.capturedAt || event.receivedAt || '') >= sinceMs),
+      metrics: {
+        batchCount: this.batches.size,
+        eventCount: this.events.size
+      },
+      tzOffsetMinutes
+    });
   }
 }
 

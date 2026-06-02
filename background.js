@@ -1,3 +1,7 @@
+if (typeof globalThis.TabulaBiliAnalysis === 'undefined' && typeof importScripts === 'function') {
+  importScripts('analysis-common.js');
+}
+
 if (typeof globalThis.TabulaBiliSync === 'undefined' && typeof importScripts === 'function') {
   importScripts('sync-common.js');
 }
@@ -8,6 +12,7 @@ const GLOBAL_FEED_RULE_ID = 100;
 const FUSION_FEED_RULE_ID = 101;
 const FUSION_BRANCH_PARAM = 'tabula_mix_branch';
 const FUSION_BRANCH_VALUE = 'clean';
+const analysisStore = globalThis.TabulaBiliAnalysis;
 const syncStore = globalThis.TabulaBiliSync;
 const CONFIG_SYNC_ALARM = 'tabulabili-config-sync';
 const REPORT_SYNC_ALARM = 'tabulabili-report-sync';
@@ -44,6 +49,131 @@ function storageSet(values) {
       else resolve();
     });
   });
+}
+
+async function notifyAnalysisUpdated(extra = {}) {
+  await storageSet({
+    [analysisStore.UPDATED_AT_KEY]: {
+      at: new Date().toISOString(),
+      ...extra
+    }
+  });
+}
+
+async function getAnalysisSettingsState() {
+  const result = await storageGet([
+    'bili_analysis_enabled',
+    analysisStore.SETTINGS_KEY
+  ]);
+  return {
+    enabled: result.bili_analysis_enabled === true,
+    settings: analysisStore.normalizeSettings(result[analysisStore.SETTINGS_KEY])
+  };
+}
+
+async function ensureAnalysisMigrated() {
+  const result = await storageGet([
+    analysisStore.INDEXEDDB_MIGRATED_KEY,
+    analysisStore.SAMPLES_KEY,
+    analysisStore.SETTINGS_KEY
+  ]);
+  if (result[analysisStore.INDEXEDDB_MIGRATED_KEY] === true) {
+    return { migrated: false };
+  }
+
+  const legacySamples = analysisStore.normalizeSamples(result[analysisStore.SAMPLES_KEY]);
+  const settings = analysisStore.normalizeSettings(result[analysisStore.SETTINGS_KEY]);
+  if (legacySamples.length) {
+    await analysisStore.replaceSamples(legacySamples, settings);
+  }
+  await storageSet({
+    [analysisStore.INDEXEDDB_MIGRATED_KEY]: true,
+    [analysisStore.SAMPLES_KEY]: []
+  });
+  await notifyAnalysisUpdated({ reason: 'migrated', count: legacySamples.length });
+  return { migrated: true, count: legacySamples.length };
+}
+
+function withReportKind(samples, eventKind) {
+  const capturedAt = new Date().toISOString();
+  return (Array.isArray(samples) ? samples : [])
+    .filter((sample) => sample && sample.id)
+    .map((sample) => ({
+      ...sample,
+      eventKind,
+      capturedAt: eventKind === 'impression' ? (sample.capturedAt || capturedAt) : capturedAt
+    }));
+}
+
+async function captureAnalysisSamples(payload) {
+  await ensureAnalysisMigrated();
+  const state = await getAnalysisSettingsState();
+  if (!state.enabled) return { skipped: true, reason: 'disabled' };
+
+  const source = payload && typeof payload === 'object' ? payload : {};
+  const samples = Array.isArray(source.samples) ? source.samples : [];
+  const result = await analysisStore.captureSamples(samples, state.settings);
+  await notifyAnalysisUpdated({ reason: 'capture', count: result.stored });
+  const report = await queueReportPayload({
+    ...source,
+    samples: withReportKind(samples, 'impression')
+  });
+  return { ...result, report };
+}
+
+async function recordAnalysisClick(videoId) {
+  await ensureAnalysisMigrated();
+  const state = await getAnalysisSettingsState();
+  if (!state.enabled) return { skipped: true, reason: 'disabled' };
+  if (!state.settings.captureClicks) return { skipped: true, reason: 'clicks_disabled' };
+
+  const sample = await analysisStore.recordClick(videoId);
+  if (!sample) return { updated: false };
+  await notifyAnalysisUpdated({ reason: 'click', sampleId: sample.id });
+  const report = await queueReportPayload({
+    capturedAt: new Date().toISOString(),
+    samples: withReportKind([sample], 'click')
+  });
+  return { updated: true, sample, report };
+}
+
+async function updateAnalysisFeedback(sampleId, feedback) {
+  await ensureAnalysisMigrated();
+  const sample = await analysisStore.updateSampleFeedback(sampleId, feedback);
+  if (!sample) return { updated: false };
+  await notifyAnalysisUpdated({ reason: 'feedback', sampleId: sample.id });
+  const report = await queueReportPayload({
+    capturedAt: new Date().toISOString(),
+    samples: withReportKind([sample], 'feedback')
+  });
+  return { updated: true, sample, report };
+}
+
+async function updateAnalysisUpFeedback(criteria, feedback) {
+  await ensureAnalysisMigrated();
+  const result = await analysisStore.updateUpFeedback(criteria, feedback);
+  if (!result.updated) return result;
+  await notifyAnalysisUpdated({ reason: 'up_feedback', count: result.updated });
+  const report = await queueReportPayload({
+    capturedAt: new Date().toISOString(),
+    samples: withReportKind(result.samples, 'feedback')
+  });
+  return { ...result, report };
+}
+
+async function trimAnalysisSamples() {
+  await ensureAnalysisMigrated();
+  const state = await getAnalysisSettingsState();
+  await analysisStore.trimStoredSamples(state.settings);
+  await notifyAnalysisUpdated({ reason: 'trim' });
+  return { trimmed: true };
+}
+
+async function clearAnalysisSamples() {
+  await analysisStore.clearSamples();
+  await storageSet({ [analysisStore.SAMPLES_KEY]: [] });
+  await notifyAnalysisUpdated({ reason: 'clear' });
+  return { cleared: true };
 }
 
 async function setSyncStatus(ok, message, extra = {}) {
@@ -257,6 +387,7 @@ async function scheduleSyncAlarms() {
 
 async function initializeSyncBackground() {
   await ensureSyncClientId();
+  await ensureAnalysisMigrated();
   await scheduleSyncAlarms();
   syncConfigNow().catch((error) => {
     console.warn('[TabulaBili] Failed to initialize config sync:', error);
@@ -442,6 +573,12 @@ extensionApi.storage.onChanged.addListener((changes, areaName) => {
     });
   }
 
+  if (changes[analysisStore.SETTINGS_KEY]) {
+    trimAnalysisSamples().catch((error) => {
+      console.warn('[TabulaBili] Failed to trim analysis samples after settings change:', error);
+    });
+  }
+
   const changedConfigKeys = [
     ...syncStore.CONFIG_FIELD_KEYS,
     'bili_block_rules'
@@ -496,6 +633,76 @@ async function evaluateMixedRequest(sender) {
 extensionApi.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message) {
     return false;
+  }
+
+  if (message.action === 'ensureAnalysisMigrated') {
+    ensureAnalysisMigrated()
+      .then((result) => sendResponse({ success: true, result }))
+      .catch((error) => {
+        console.warn('[TabulaBili] Failed to migrate analysis samples:', error);
+        sendResponse({ success: false, error: error.message });
+      });
+    return true;
+  }
+
+  if (message.action === 'captureAnalysisSamples') {
+    captureAnalysisSamples(message.payload)
+      .then((result) => sendResponse({ success: true, result }))
+      .catch((error) => {
+        console.warn('[TabulaBili] Failed to capture analysis samples:', error);
+        sendResponse({ success: false, error: error.message });
+      });
+    return true;
+  }
+
+  if (message.action === 'recordAnalysisClick') {
+    recordAnalysisClick(message.videoId)
+      .then((result) => sendResponse({ success: true, result }))
+      .catch((error) => {
+        console.warn('[TabulaBili] Failed to record analysis click:', error);
+        sendResponse({ success: false, error: error.message });
+      });
+    return true;
+  }
+
+  if (message.action === 'updateAnalysisFeedback') {
+    updateAnalysisFeedback(message.sampleId, message.feedback)
+      .then((result) => sendResponse({ success: true, result }))
+      .catch((error) => {
+        console.warn('[TabulaBili] Failed to update analysis feedback:', error);
+        sendResponse({ success: false, error: error.message });
+      });
+    return true;
+  }
+
+  if (message.action === 'updateAnalysisUpFeedback') {
+    updateAnalysisUpFeedback(message.criteria, message.feedback)
+      .then((result) => sendResponse({ success: true, result }))
+      .catch((error) => {
+        console.warn('[TabulaBili] Failed to update UP feedback:', error);
+        sendResponse({ success: false, error: error.message });
+      });
+    return true;
+  }
+
+  if (message.action === 'trimAnalysisSamples') {
+    trimAnalysisSamples()
+      .then((result) => sendResponse({ success: true, result }))
+      .catch((error) => {
+        console.warn('[TabulaBili] Failed to trim analysis samples:', error);
+        sendResponse({ success: false, error: error.message });
+      });
+    return true;
+  }
+
+  if (message.action === 'clearAnalysisSamples') {
+    clearAnalysisSamples()
+      .then((result) => sendResponse({ success: true, result }))
+      .catch((error) => {
+        console.warn('[TabulaBili] Failed to clear analysis samples:', error);
+        sendResponse({ success: false, error: error.message });
+      });
+    return true;
   }
 
   if (message.action === 'syncBackendNow') {

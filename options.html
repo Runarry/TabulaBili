@@ -206,6 +206,19 @@
             <h2 class="section-title options-section-title">UP 主统计</h2>
             <span class="rule-count" id="analysisUpCount">0 位</span>
           </div>
+          <div class="analysis-toolbar">
+            <input id="analysisUpSearchInput" class="field-input analysis-search" type="search" placeholder="搜索 UP 名称或 MID">
+            <select id="analysisUpPageSize" class="field-input analysis-select">
+              <option value="25">25 条/页</option>
+              <option value="50">50 条/页</option>
+              <option value="100">100 条/页</option>
+            </select>
+            <div class="analysis-pager">
+              <button type="button" class="secondary-btn" id="analysisUpPrevBtn">上一页</button>
+              <span class="rule-count" id="analysisUpPageInfo">第 1 页</span>
+              <button type="button" class="secondary-btn" id="analysisUpNextBtn">下一页</button>
+            </div>
+          </div>
           <div class="analysis-list" id="analysisUpList"></div>
         </section>
 
@@ -213,6 +226,27 @@
           <div class="panel-heading compact">
             <h2 class="section-title options-section-title">最近推荐样本</h2>
             <span class="rule-count" id="analysisSampleCount">0 条</span>
+          </div>
+          <div class="analysis-toolbar">
+            <input id="analysisSearchInput" class="field-input analysis-search" type="search" placeholder="搜索标题 / UP / BV">
+            <select id="analysisFeedbackFilter" class="field-input analysis-select">
+              <option value="all">全部标注</option>
+              <option value="unset">未标注</option>
+              <option value="like">喜欢</option>
+              <option value="dislike">不喜欢</option>
+              <option value="neutral">一般</option>
+              <option value="blocked">已屏蔽</option>
+            </select>
+            <select id="analysisPageSize" class="field-input analysis-select">
+              <option value="25">25 条/页</option>
+              <option value="50">50 条/页</option>
+              <option value="100">100 条/页</option>
+            </select>
+            <div class="analysis-pager">
+              <button type="button" class="secondary-btn" id="analysisPrevPageBtn">上一页</button>
+              <span class="rule-count" id="analysisPageInfo">第 1 页</span>
+              <button type="button" class="secondary-btn" id="analysisNextPageBtn">下一页</button>
+            </div>
           </div>
           <div class="analysis-list" id="analysisSampleList"></div>
         </section>

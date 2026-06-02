@@ -31,15 +31,24 @@ function normalizeCountMap(value) {
 function mergeAggregate(existingValue, event) {
   const existing = existingValue && typeof existingValue === 'object' ? existingValue : null;
   const capturedAt = event.capturedAt || new Date().toISOString();
+  const eventKind = event.eventKind === 'click' || event.eventKind === 'feedback'
+    ? event.eventKind
+    : 'impression';
   const modes = normalizeCountMap(existing && existing.modes);
   const sources = normalizeCountMap(existing && existing.sources);
-  increment(modes, event.mode || 'unknown');
-  increment(sources, event.source || 'unknown');
+  if (eventKind === 'impression') {
+    increment(modes, event.mode || 'unknown');
+    increment(sources, event.source || 'unknown');
+  }
 
   const positions = Array.isArray(existing && existing.positions) ? existing.positions.slice(-29) : [];
-  if (Number.isFinite(Number(event.position)) && Number(event.position) > 0) {
+  if (eventKind === 'impression' && Number.isFinite(Number(event.position)) && Number(event.position) > 0) {
     positions.push(Number(event.position));
   }
+  const nextFeedback = eventKind === 'feedback' || (event.feedback && event.feedback !== 'unset')
+    ? (event.feedback || 'unset')
+    : ((existing && existing.feedback) || 'unset');
+  const nextClickCount = Number((existing && existing.clickCount) || 0) + (eventKind === 'click' ? 1 : 0);
 
   return {
     id: getSampleId(event),
@@ -57,12 +66,15 @@ function mergeAggregate(existingValue, event) {
       like: Number((event.stats && event.stats.like) || (existing && existing.stats && existing.stats.like) || 0),
       danmaku: Number((event.stats && event.stats.danmaku) || (existing && existing.stats && existing.stats.danmaku) || 0)
     },
-    feedback: event.feedback && event.feedback !== 'unset'
-      ? event.feedback
-      : ((existing && existing.feedback) || 'unset'),
+    feedback: nextFeedback,
     firstSeenAt: minIsoDate(existing && existing.firstSeenAt, capturedAt),
-    lastSeenAt: maxIsoDate(existing && existing.lastSeenAt, capturedAt),
-    seenCount: Number((existing && existing.seenCount) || 0) + 1,
+    lastSeenAt: eventKind === 'impression'
+      ? maxIsoDate(existing && existing.lastSeenAt, capturedAt)
+      : ((existing && existing.lastSeenAt) || capturedAt),
+    seenCount: Number((existing && existing.seenCount) || 0) + (eventKind === 'impression' ? 1 : 0),
+    clickCount: nextClickCount,
+    lastClickedAt: eventKind === 'click' ? capturedAt : ((existing && existing.lastClickedAt) || ''),
+    feedbackUpdatedAt: eventKind === 'feedback' ? capturedAt : ((existing && existing.feedbackUpdatedAt) || ''),
     modes,
     sources,
     positions,
@@ -88,6 +100,7 @@ function normalizeReportPayload(payload) {
       .map((event) => ({
         ...event,
         eventId: String(event.eventId).trim(),
+        eventKind: event.eventKind === 'click' || event.eventKind === 'feedback' ? event.eventKind : 'impression',
         batchId,
         clientId,
         capturedAt: String(event.capturedAt || capturedAt)
@@ -95,8 +108,25 @@ function normalizeReportPayload(payload) {
   };
 }
 
+function toSampleRow(sampleId, aggregate, fallbackSeenAt) {
+  return {
+    sampleId,
+    bvid: aggregate.bvid || '',
+    title: aggregate.title || '',
+    upName: aggregate.upName || '',
+    upMid: aggregate.upMid || '',
+    category: aggregate.category || '',
+    lastSeenAt: aggregate.lastSeenAt || aggregate.updatedAt || fallbackSeenAt,
+    seenCount: Number(aggregate.seenCount || 0),
+    clickCount: Number(aggregate.clickCount || 0),
+    feedback: aggregate.feedback || 'unset',
+    json: JSON.stringify(aggregate)
+  };
+}
+
 export {
   getSampleId,
   mergeAggregate,
-  normalizeReportPayload
+  normalizeReportPayload,
+  toSampleRow
 };

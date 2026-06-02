@@ -3,8 +3,7 @@ const usePromiseApi = typeof globalThis.browser !== 'undefined';
 const DEFAULT_FUSION_CLEAN_RATIO = 50;
 const analysisStore = globalThis.TabulaBiliAnalysis;
 
-let pendingAnalysisSamples = [];
-let analysisFlushTimer = null;
+let lastAnalysisWrite = Promise.resolve();
 
 function getLastRuntimeError() {
   return extensionApi.runtime.lastError
@@ -174,38 +173,14 @@ async function syncSettingsConfig() {
   });
 }
 
-function queueAnalysisSamples(samples) {
-  if (!Array.isArray(samples) || !samples.length) return;
-
-  pendingAnalysisSamples.push(...samples);
-  if (analysisFlushTimer) {
-    clearTimeout(analysisFlushTimer);
-  }
-
-  analysisFlushTimer = setTimeout(() => {
-    analysisFlushTimer = null;
-    flushAnalysisSamples().catch((error) => {
-      console.warn('[TabulaBili] Failed to store analysis samples:', error);
-    });
-  }, 500);
-}
-
-async function flushAnalysisSamples() {
-  const samples = pendingAnalysisSamples;
-  pendingAnalysisSamples = [];
+function queueAnalysisPayload(payload) {
+  const samples = payload && Array.isArray(payload.samples) ? payload.samples : [];
   if (!samples.length) return;
 
-  const result = await storageGet([
-    'bili_analysis_enabled',
-    analysisStore.SAMPLES_KEY,
-    analysisStore.SETTINGS_KEY
-  ]);
-
-  if (result.bili_analysis_enabled !== true) return;
-
-  const settings = analysisStore.normalizeSettings(result[analysisStore.SETTINGS_KEY]);
-  const merged = analysisStore.mergeSamples(result[analysisStore.SAMPLES_KEY], samples, settings);
-  await storageSet({ [analysisStore.SAMPLES_KEY]: merged });
+  lastAnalysisWrite = sendRuntimeMessage({ action: 'captureAnalysisSamples', payload })
+    .catch((error) => {
+      console.warn('[TabulaBili] Failed to capture analysis samples:', error);
+    });
 }
 
 function getVideoIdFromUrl(value) {
@@ -225,27 +200,8 @@ function getVideoIdFromUrl(value) {
 
 async function trackAnalysisClick(videoId) {
   if (!videoId) return;
-  if (pendingAnalysisSamples.length) {
-    await flushAnalysisSamples();
-  }
-
-  const result = await storageGet([
-    'bili_analysis_enabled',
-    analysisStore.SAMPLES_KEY,
-    analysisStore.SETTINGS_KEY
-  ]);
-  if (result.bili_analysis_enabled !== true) return;
-
-  const settings = analysisStore.normalizeSettings(result[analysisStore.SETTINGS_KEY]);
-  if (!settings.captureClicks) return;
-
-  const samples = analysisStore.normalizeSamples(result[analysisStore.SAMPLES_KEY]);
-  const target = samples.find((sample) => sample.id === videoId || sample.bvid === videoId);
-  if (!target) return;
-
-  target.clickCount = analysisStore.getPositiveInteger(target.clickCount, 0) + 1;
-  target.lastClickedAt = new Date().toISOString();
-  await storageSet({ [analysisStore.SAMPLES_KEY]: analysisStore.trimSamples(samples, settings) });
+  await lastAnalysisWrite.catch(() => null);
+  await sendRuntimeMessage({ action: 'recordAnalysisClick', videoId });
 }
 
 const fingerprintReady = captureBiliFingerprint().catch((error) => {
@@ -264,10 +220,7 @@ window.addEventListener('tabula_analysis_samples', (event) => {
 
   try {
     const parsed = JSON.parse(detail);
-    queueAnalysisSamples(parsed && parsed.samples);
-    sendRuntimeMessage({ action: 'queueReportSamples', payload: parsed }).catch((error) => {
-      console.warn('[TabulaBili] Failed to queue backend report:', error);
-    });
+    queueAnalysisPayload(parsed);
   } catch (error) {
     console.warn('[TabulaBili] Failed to parse analysis samples:', error);
   }

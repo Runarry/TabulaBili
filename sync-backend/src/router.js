@@ -58,8 +58,11 @@ function createApp(options) {
     async fetch(request) {
       const url = new URL(request.url);
       if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: corsHeaders() });
-      if (url.pathname === '/' || url.pathname === '/index.html') {
-        return text(adminPage(), 200, 'text/html; charset=utf-8');
+      if (url.pathname === '/' || url.pathname === '/index.html' || url.pathname === '/data') {
+        return text(adminPage('data'), 200, 'text/html; charset=utf-8');
+      }
+      if (url.pathname === '/analytics') {
+        return text(adminPage('analytics'), 200, 'text/html; charset=utf-8');
       }
       if (!url.pathname.startsWith('/api/')) return json({ error: 'not_found' }, 404);
       if (!(await requireAuth(request, url))) return json({ error: 'unauthorized' }, 401);
@@ -104,12 +107,21 @@ function createApp(options) {
         const result = await storage.listReportSamples({
           limit: Number(url.searchParams.get('limit') || 50),
           offset: Number(url.searchParams.get('offset') || 0),
-          q: url.searchParams.get('q') || ''
+          q: url.searchParams.get('q') || '',
+          feedback: url.searchParams.get('feedback') || 'all',
+          sort: url.searchParams.get('sort') || 'lastSeenAt'
         });
         if (url.searchParams.get('export') === '1') {
           return text(JSON.stringify(result.items, null, 2), 200, 'application/json; charset=utf-8');
         }
         return json(result);
+      }
+
+      if (url.pathname === '/api/reports/analytics' && request.method === 'GET') {
+        return json(await storage.getReportAnalytics({
+          days: Number(url.searchParams.get('days') || 30),
+          tzOffsetMinutes: Number(url.searchParams.get('tzOffsetMinutes') || 0)
+        }));
       }
 
       return json({ error: 'not_found' }, 404);

@@ -1,5 +1,14 @@
 import Database from 'better-sqlite3';
-import { getSampleId, mergeAggregate } from '../report-aggregate.js';
+import { getSampleId, mergeAggregate, toSampleRow } from '../report-aggregate.js';
+import {
+  buildReportAnalytics,
+  getSampleOrderBy,
+  getSampleWhere,
+  normalizeAnalyticsOptions,
+  normalizeLimit,
+  normalizeOffset,
+  normalizeSampleListOptions
+} from './helpers.js';
 
 class SqliteStorage {
   constructor(filename) {
@@ -30,11 +39,40 @@ class SqliteStorage {
       );
       create table if not exists samples (
         sample_id text primary key,
+        bvid text not null default '',
+        title text not null default '',
+        up_name text not null default '',
+        up_mid text not null default '',
+        category text not null default '',
         last_seen_at text not null,
         seen_count integer not null,
+        click_count integer not null default 0,
+        feedback text not null default 'unset',
         json text not null
       );
+      create index if not exists idx_batches_received_at on batches(received_at desc);
+      create index if not exists idx_events_captured_at on events(captured_at);
+      create index if not exists idx_events_kind on events(raw_json);
+      create index if not exists idx_samples_last_seen_at on samples(last_seen_at desc);
+      create index if not exists idx_samples_seen_count on samples(seen_count desc);
+      create index if not exists idx_samples_click_count on samples(click_count desc);
+      create index if not exists idx_samples_feedback on samples(feedback);
     `);
+    this.ensureColumn('batches', 'duplicate_event_count', 'integer not null default 0');
+    this.ensureColumn('samples', 'bvid', "text not null default ''");
+    this.ensureColumn('samples', 'title', "text not null default ''");
+    this.ensureColumn('samples', 'up_name', "text not null default ''");
+    this.ensureColumn('samples', 'up_mid', "text not null default ''");
+    this.ensureColumn('samples', 'category', "text not null default ''");
+    this.ensureColumn('samples', 'click_count', 'integer not null default 0');
+    this.ensureColumn('samples', 'feedback', "text not null default 'unset'");
+  }
+
+  ensureColumn(table, column, definition) {
+    const columns = this.db.prepare(`pragma table_info(${table})`).all();
+    if (!columns.some((item) => item.name === column)) {
+      this.db.prepare(`alter table ${table} add column ${column} ${definition}`).run();
+    }
   }
 
   async getConfig() {
@@ -53,7 +91,7 @@ class SqliteStorage {
       return {
         duplicateBatch: true,
         eventCount: existing.event_count,
-        duplicateEventCount: existing.event_count
+        duplicateEventCount: existing.duplicate_event_count
       };
     }
 
@@ -71,11 +109,18 @@ class SqliteStorage {
       `);
       const getSample = this.db.prepare('select json from samples where sample_id = ?');
       const upsertSample = this.db.prepare(`
-        insert into samples (sample_id, last_seen_at, seen_count, json)
-        values (?, ?, ?, ?)
+        insert into samples (sample_id, bvid, title, up_name, up_mid, category, last_seen_at, seen_count, click_count, feedback, json)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         on conflict(sample_id) do update set
+          bvid = excluded.bvid,
+          title = excluded.title,
+          up_name = excluded.up_name,
+          up_mid = excluded.up_mid,
+          category = excluded.category,
           last_seen_at = excluded.last_seen_at,
           seen_count = excluded.seen_count,
+          click_count = excluded.click_count,
+          feedback = excluded.feedback,
           json = excluded.json
       `);
 
@@ -90,7 +135,20 @@ class SqliteStorage {
         if (!sampleId) continue;
         const existingSample = getSample.get(sampleId);
         const aggregate = mergeAggregate(existingSample ? JSON.parse(existingSample.json) : null, event);
-        upsertSample.run(sampleId, aggregate.lastSeenAt, aggregate.seenCount, JSON.stringify(aggregate));
+        const row = toSampleRow(sampleId, aggregate, receivedAt);
+        upsertSample.run(
+          row.sampleId,
+          row.bvid,
+          row.title,
+          row.upName,
+          row.upMid,
+          row.category,
+          row.lastSeenAt,
+          row.seenCount,
+          row.clickCount,
+          row.feedback,
+          row.json
+        );
       }
 
       this.db.prepare('update batches set duplicate_event_count = ? where batch_id = ?').run(duplicateEventCount, batch.batchId);
@@ -113,8 +171,8 @@ class SqliteStorage {
   }
 
   async listReportBatches(options = {}) {
-    const limit = Math.min(200, Math.max(1, options.limit || 50));
-    const offset = Math.max(0, options.offset || 0);
+    const limit = normalizeLimit(options.limit, 200);
+    const offset = normalizeOffset(options.offset);
     const rows = this.db.prepare(`
       select batch_id as batchId, client_id as clientId, captured_at as capturedAt, received_at as receivedAt,
         event_count as eventCount, duplicate_event_count as duplicateEventCount
@@ -125,16 +183,27 @@ class SqliteStorage {
   }
 
   async listReportSamples(options = {}) {
-    const limit = Math.min(10000, Math.max(1, options.limit || 50));
-    const offset = Math.max(0, options.offset || 0);
-    const q = String(options.q || '').trim();
-    const total = q
-      ? this.db.prepare('select count(*) as count from samples where json like ?').get(`%${q}%`).count
-      : this.db.prepare('select count(*) as count from samples').get().count;
-    const rows = q
-      ? this.db.prepare('select json from samples where json like ? order by last_seen_at desc limit ? offset ?').all(`%${q}%`, limit, offset)
-      : this.db.prepare('select json from samples order by last_seen_at desc limit ? offset ?').all(limit, offset);
+    const query = normalizeSampleListOptions(options);
+    const { whereSql, args } = getSampleWhere(query);
+    const orderBy = getSampleOrderBy(query.sort);
+    const total = this.db.prepare(`select count(*) as count from samples ${whereSql}`).get(...args).count;
+    const rows = this.db.prepare(`select json from samples ${whereSql} order by ${orderBy} limit ? offset ?`).all(...args, query.limit, query.offset);
     return { items: rows.map((row) => JSON.parse(row.json)), total };
+  }
+
+  async getReportAnalytics(options = {}) {
+    const { sinceIso, tzOffsetMinutes } = normalizeAnalyticsOptions(options);
+    const samples = this.db.prepare('select json from samples').all().map((row) => JSON.parse(row.json));
+    const events = this.db.prepare('select raw_json as json from events where captured_at >= ?').all(sinceIso).map((row) => JSON.parse(row.json));
+    return buildReportAnalytics({
+      samples,
+      events,
+      metrics: {
+        batchCount: this.db.prepare('select count(*) as count from batches').get().count,
+        eventCount: this.db.prepare('select count(*) as count from events').get().count
+      },
+      tzOffsetMinutes
+    });
   }
 }
 

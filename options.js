@@ -132,17 +132,6 @@ function getTodayKey() {
   return analysisStore.getLocalDateKey(new Date());
 }
 
-function isWithinDays(value, days) {
-  const time = analysisStore.getDateTime(value);
-  return time > 0 && Date.now() - time <= days * 24 * 60 * 60 * 1000;
-}
-
-function sortAnalysisSamples(samples) {
-  return samples
-    .slice()
-    .sort((a, b) => analysisStore.getDateTime(b.lastSeenAt || b.capturedAt) - analysisStore.getDateTime(a.lastSeenAt || a.capturedAt));
-}
-
 function getFeedbackLabel(feedback) {
   const labels = {
     like: '喜欢',
@@ -210,14 +199,26 @@ document.addEventListener('DOMContentLoaded', async () => {
   const analysisMessage = document.getElementById('analysisMessage');
   const analysisUpCount = document.getElementById('analysisUpCount');
   const analysisUpList = document.getElementById('analysisUpList');
+  const analysisUpSearchInput = document.getElementById('analysisUpSearchInput');
+  const analysisUpPageSizeInput = document.getElementById('analysisUpPageSize');
+  const analysisUpPrevBtn = document.getElementById('analysisUpPrevBtn');
+  const analysisUpNextBtn = document.getElementById('analysisUpNextBtn');
+  const analysisUpPageInfo = document.getElementById('analysisUpPageInfo');
   const analysisSampleCount = document.getElementById('analysisSampleCount');
   const analysisSampleList = document.getElementById('analysisSampleList');
+  const analysisSearchInput = document.getElementById('analysisSearchInput');
+  const analysisFeedbackFilter = document.getElementById('analysisFeedbackFilter');
+  const analysisPageSizeInput = document.getElementById('analysisPageSize');
+  const analysisPrevPageBtn = document.getElementById('analysisPrevPageBtn');
+  const analysisNextPageBtn = document.getElementById('analysisNextPageBtn');
+  const analysisPageInfo = document.getElementById('analysisPageInfo');
 
   let rules = [];
   let fusionCleanRatio = DEFAULT_FUSION_CLEAN_RATIO;
   let analysisEnabled = false;
   let analysisSettings = { ...analysisStore.DEFAULT_SETTINGS };
-  let analysisSamples = [];
+  let analysisSampleState = { page: 1, pageSize: 25, q: '', feedback: 'all', total: 0 };
+  let analysisUpState = { page: 1, pageSize: 25, q: '', total: 0 };
   let syncEnabled = false;
   let syncEndpoint = '';
   let syncSecret = '';
@@ -319,18 +320,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       captureClicks: analysisCaptureClicksInput.checked
     });
     analysisEnabled = analysisEnabledInput.checked;
-    analysisSamples = analysisStore.trimSamples(analysisSamples, analysisSettings);
 
     await storageSet({
       bili_analysis_enabled: analysisEnabled,
-      [analysisStore.SETTINGS_KEY]: analysisSettings,
-      [analysisStore.SAMPLES_KEY]: analysisSamples
+      [analysisStore.SETTINGS_KEY]: analysisSettings
     });
-    renderAnalysis();
-  }
-
-  async function persistAnalysisSamples() {
-    await storageSet({ [analysisStore.SAMPLES_KEY]: analysisSamples });
+    await sendRuntimeMessage({ action: 'trimAnalysisSamples' });
+    await renderAnalysis();
   }
 
   async function persistSyncSettings() {
@@ -354,11 +350,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     analysisCaptureClicksInput.checked = analysisSettings.captureClicks;
   }
 
-  function renderAnalysis() {
+  async function renderAnalysis() {
     renderAnalysisControls();
-    renderAnalysisSummary();
-    renderUpStats();
-    renderSampleStats();
+    await Promise.all([
+      renderAnalysisSummary(),
+      renderUpStats(),
+      renderSampleStats()
+    ]);
   }
 
   function renderSyncControls() {
@@ -394,67 +392,37 @@ document.addEventListener('DOMContentLoaded', async () => {
     return sent ? `${prefix}已上报 ${sent} 个批次。` : `${prefix}没有待上报数据。`;
   }
 
-  function renderAnalysisSummary() {
-    const todayKey = getTodayKey();
-    const todayCount = analysisSamples.filter((sample) => {
-      const key = analysisStore.getLocalDateKey(sample.lastSeenAt || sample.capturedAt) || sample.dateKey;
-      return key === todayKey;
-    }).length;
-    const weekCount = analysisSamples.filter((sample) => isWithinDays(sample.lastSeenAt || sample.capturedAt, 7)).length;
-    const clickedCount = analysisSamples.filter((sample) => sample.clickCount > 0).length;
-    const dislikedCount = analysisSamples.filter((sample) => sample.feedback === 'dislike').length;
-
-    analysisTotalSamples.textContent = String(analysisSamples.length);
-    analysisTodaySamples.textContent = String(todayCount);
-    analysisWeekSamples.textContent = String(weekCount);
-    analysisClickedSamples.textContent = String(clickedCount);
-    analysisDislikedSamples.textContent = String(dislikedCount);
+  function renderAnalysisSafely() {
+    renderAnalysis().catch((error) => {
+      console.warn('[TabulaBili] Failed to render analysis data:', error);
+      setAnalysisMessage('统计数据加载失败，请刷新后重试。', true);
+    });
   }
 
-  function buildUpStats() {
-    const byUp = new Map();
+  async function renderAnalysisSummary() {
+    const summary = await analysisStore.getSummary();
+    analysisTotalSamples.textContent = String(summary.total);
+    analysisTodaySamples.textContent = String(summary.today);
+    analysisWeekSamples.textContent = String(summary.week);
+    analysisClickedSamples.textContent = String(summary.clicked);
+    analysisDislikedSamples.textContent = String(summary.disliked);
+  }
 
-    for (const sample of analysisSamples) {
-      const key = sample.upMid || sample.upName;
-      if (!key) continue;
-
-      if (!byUp.has(key)) {
-        byUp.set(key, {
-          key,
-          upName: sample.upName || '(未知 UP)',
-          upMid: sample.upMid || '',
-          seenCount: 0,
-          sampleCount: 0,
-          clickCount: 0,
-          dislikeCount: 0,
-          blockedCount: 0,
-          lastSeenAt: ''
-        });
-      }
-
-      const stat = byUp.get(key);
-      stat.seenCount += sample.seenCount;
-      stat.sampleCount += 1;
-      stat.clickCount += sample.clickCount;
-      if (sample.feedback === 'dislike') stat.dislikeCount += 1;
-      if (sample.feedback === 'blocked') stat.blockedCount += 1;
-      if (analysisStore.getDateTime(sample.lastSeenAt) > analysisStore.getDateTime(stat.lastSeenAt)) {
-        stat.lastSeenAt = sample.lastSeenAt;
-      }
+  async function renderUpStats() {
+    const result = await analysisStore.listUpStats(analysisUpState);
+    const stats = result.items;
+    analysisUpState.total = result.total;
+    const totalPages = Math.max(1, Math.ceil(result.total / result.pageSize));
+    if (analysisUpState.page > totalPages) {
+      analysisUpState.page = totalPages;
+      return renderUpStats();
     }
 
-    return [...byUp.values()]
-      .sort((a, b) => (
-        b.seenCount - a.seenCount
-        || analysisStore.getDateTime(b.lastSeenAt) - analysisStore.getDateTime(a.lastSeenAt)
-      ))
-      .slice(0, 50);
-  }
-
-  function renderUpStats() {
-    const stats = buildUpStats();
     analysisUpList.textContent = '';
-    analysisUpCount.textContent = `${stats.length} 位`;
+    analysisUpCount.textContent = `${result.total} 位`;
+    analysisUpPageInfo.textContent = `第 ${analysisUpState.page} / ${totalPages} 页`;
+    analysisUpPrevBtn.disabled = analysisUpState.page <= 1;
+    analysisUpNextBtn.disabled = analysisUpState.page >= totalPages;
 
     if (!stats.length) {
       const empty = document.createElement('div');
@@ -501,10 +469,21 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
-  function renderSampleStats() {
-    const samples = analysisSamples.slice(0, 100);
+  async function renderSampleStats() {
+    const result = await analysisStore.listSamples(analysisSampleState);
+    const samples = result.items;
+    analysisSampleState.total = result.total;
+    const totalPages = Math.max(1, Math.ceil(result.total / result.pageSize));
+    if (analysisSampleState.page > totalPages) {
+      analysisSampleState.page = totalPages;
+      return renderSampleStats();
+    }
+
     analysisSampleList.textContent = '';
-    analysisSampleCount.textContent = `${analysisSamples.length} 条`;
+    analysisSampleCount.textContent = `${result.total} 条`;
+    analysisPageInfo.textContent = `第 ${analysisSampleState.page} / ${totalPages} 页`;
+    analysisPrevPageBtn.disabled = analysisSampleState.page <= 1;
+    analysisNextPageBtn.disabled = analysisSampleState.page >= totalPages;
 
     if (!samples.length) {
       const empty = document.createElement('div');
@@ -576,25 +555,24 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   async function updateSampleFeedback(sampleId, feedback) {
-    analysisSamples = analysisSamples.map((sample) => (
-      sample.id === sampleId
-        ? { ...sample, feedback, feedbackUpdatedAt: new Date().toISOString() }
-        : sample
-    ));
-    await persistAnalysisSamples();
-    renderAnalysis();
+    const response = await sendRuntimeMessage({ action: 'updateAnalysisFeedback', sampleId, feedback });
+    if (!response || response.success !== true) {
+      throw new Error(response && response.error ? response.error : '标注失败');
+    }
+    await renderAnalysis();
     setAnalysisMessage('标注已保存。');
   }
 
   async function markUpFeedback(stat, feedback) {
-    const now = new Date().toISOString();
-    analysisSamples = analysisSamples.map((sample) => (
-      (sample.upMid && sample.upMid === stat.upMid) || (!stat.upMid && sample.upName === stat.upName)
-        ? { ...sample, feedback, feedbackUpdatedAt: now }
-        : sample
-    ));
-    await persistAnalysisSamples();
-    renderAnalysis();
+    const response = await sendRuntimeMessage({
+      action: 'updateAnalysisUpFeedback',
+      criteria: { upMid: stat.upMid, upName: stat.upName },
+      feedback
+    });
+    if (!response || response.success !== true) {
+      throw new Error(response && response.error ? response.error : '标注失败');
+    }
+    await renderAnalysis();
     setAnalysisMessage('UP 主相关样本已标注。');
   }
 
@@ -624,22 +602,28 @@ document.addEventListener('DOMContentLoaded', async () => {
       renderRules();
     }
 
-    const now = new Date().toISOString();
-    analysisSamples = analysisSamples.map((sample) => {
-      const matched = sampleId
-        ? sample.id === sampleId
-        : sample.upName === pattern;
-      return matched ? { ...sample, feedback: 'blocked', feedbackUpdatedAt: now } : sample;
-    });
-    await persistAnalysisSamples();
-    renderAnalysis();
+    const response = sampleId
+      ? await sendRuntimeMessage({ action: 'updateAnalysisFeedback', sampleId, feedback: 'blocked' })
+      : await sendRuntimeMessage({
+        action: 'updateAnalysisUpFeedback',
+        criteria: { upName: pattern },
+        feedback: 'blocked'
+      });
+    if (!response || response.success !== true) {
+      throw new Error(response && response.error ? response.error : '标注失败');
+    }
+    await renderAnalysis();
     setAnalysisMessage(exists
       ? '该 UP 主已在屏蔽规则中。'
       : (blockerEnabled ? '已添加 UP 主屏蔽规则。' : '已添加 UP 主屏蔽规则，内容屏蔽开关当前关闭。'));
   }
 
-  function exportAnalysisCsv() {
-    if (!analysisSamples.length) {
+  async function exportAnalysisCsv() {
+    const samples = await analysisStore.exportSamples({
+      q: analysisSampleState.q,
+      feedback: analysisSampleState.feedback
+    });
+    if (!samples.length) {
       setAnalysisMessage('没有可导出的统计样本。', true);
       return;
     }
@@ -668,7 +652,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       ['danmaku', (sample) => sample.stats && sample.stats.danmaku],
       ['uri', (sample) => sample.uri]
     ];
-    const rows = analysisSamples.map((sample) => columns.map(([, getValue]) => getValue(sample)));
+    const rows = samples.map((sample) => columns.map(([, getValue]) => getValue(sample)));
 
     const csv = [columns.map(([header]) => header), ...rows]
       .map((row) => row.map(csvEscape).join(','))
@@ -677,14 +661,18 @@ document.addEventListener('DOMContentLoaded', async () => {
     setAnalysisMessage('CSV 已导出。');
   }
 
-  function exportAnalysisJsonl() {
-    if (!analysisSamples.length) {
+  async function exportAnalysisJsonl() {
+    const samples = await analysisStore.exportSamples({
+      q: analysisSampleState.q,
+      feedback: analysisSampleState.feedback
+    });
+    if (!samples.length) {
       setAnalysisMessage('没有可导出的统计样本。', true);
       return;
     }
     if (!window.confirm(ANALYSIS_PRIVACY_PROMPT)) return;
 
-    const jsonl = analysisSamples.map((sample) => JSON.stringify(sample)).join('\n');
+    const jsonl = samples.map((sample) => JSON.stringify(sample)).join('\n');
     makeDownload(`tabulabili-analysis-${getTodayKey()}.jsonl`, 'application/jsonl;charset=utf-8', jsonl);
     setAnalysisMessage('JSONL 已导出。');
   }
@@ -753,6 +741,55 @@ document.addEventListener('DOMContentLoaded', async () => {
     activateOptionsTab(getTabFromHash());
   });
 
+  let analysisSampleSearchTimer = null;
+  let analysisUpSearchTimer = null;
+  analysisSearchInput.addEventListener('input', () => {
+    analysisSampleState.q = analysisSearchInput.value.trim();
+    analysisSampleState.page = 1;
+    clearTimeout(analysisSampleSearchTimer);
+    analysisSampleSearchTimer = setTimeout(renderAnalysisSafely, 220);
+  });
+  analysisFeedbackFilter.addEventListener('change', () => {
+    analysisSampleState.feedback = analysisFeedbackFilter.value;
+    analysisSampleState.page = 1;
+    renderAnalysisSafely();
+  });
+  analysisPageSizeInput.addEventListener('change', () => {
+    analysisSampleState.pageSize = Number(analysisPageSizeInput.value || 25);
+    analysisSampleState.page = 1;
+    renderAnalysisSafely();
+  });
+  analysisPrevPageBtn.addEventListener('click', () => {
+    analysisSampleState.page = Math.max(1, analysisSampleState.page - 1);
+    renderAnalysisSafely();
+  });
+  analysisNextPageBtn.addEventListener('click', () => {
+    const totalPages = Math.max(1, Math.ceil(analysisSampleState.total / analysisSampleState.pageSize));
+    analysisSampleState.page = Math.min(totalPages, analysisSampleState.page + 1);
+    renderAnalysisSafely();
+  });
+
+  analysisUpSearchInput.addEventListener('input', () => {
+    analysisUpState.q = analysisUpSearchInput.value.trim();
+    analysisUpState.page = 1;
+    clearTimeout(analysisUpSearchTimer);
+    analysisUpSearchTimer = setTimeout(renderAnalysisSafely, 220);
+  });
+  analysisUpPageSizeInput.addEventListener('change', () => {
+    analysisUpState.pageSize = Number(analysisUpPageSizeInput.value || 25);
+    analysisUpState.page = 1;
+    renderAnalysisSafely();
+  });
+  analysisUpPrevBtn.addEventListener('click', () => {
+    analysisUpState.page = Math.max(1, analysisUpState.page - 1);
+    renderAnalysisSafely();
+  });
+  analysisUpNextBtn.addEventListener('click', () => {
+    const totalPages = Math.max(1, Math.ceil(analysisUpState.total / analysisUpState.pageSize));
+    analysisUpState.page = Math.min(totalPages, analysisUpState.page + 1);
+    renderAnalysisSafely();
+  });
+
   activateOptionsTab(getTabFromHash());
 
   try {
@@ -761,7 +798,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       'bili_block_rules',
       'bili_fusion_clean_ratio',
       'bili_analysis_enabled',
-      analysisStore.SAMPLES_KEY,
       analysisStore.SETTINGS_KEY,
       syncStore.ENDPOINT_KEY,
       syncStore.SECRET_KEY,
@@ -777,21 +813,24 @@ document.addEventListener('DOMContentLoaded', async () => {
     renderRules();
     analysisEnabled = result.bili_analysis_enabled === true;
     analysisSettings = analysisStore.normalizeSettings(result[analysisStore.SETTINGS_KEY]);
-    analysisSamples = sortAnalysisSamples(analysisStore.normalizeSamples(result[analysisStore.SAMPLES_KEY]));
+    const migration = await sendRuntimeMessage({ action: 'ensureAnalysisMigrated' });
+    if (!migration || migration.success !== true) {
+      throw new Error(migration && migration.error ? migration.error : '统计数据迁移失败');
+    }
     syncEndpoint = syncStore.normalizeEndpoint(result[syncStore.ENDPOINT_KEY]);
     syncSecret = typeof result[syncStore.SECRET_KEY] === 'string' ? result[syncStore.SECRET_KEY] : '';
     syncEnabled = result[syncStore.ENABLED_KEY] === true;
     reportFrequency = syncStore.normalizeFrequency(result[syncStore.REPORT_FREQUENCY_KEY]);
     syncStatus = result[syncStore.LAST_STATUS_KEY] || null;
     syncQueuedBatches = getQueueLength(result[syncStore.REPORT_QUEUE_KEY]);
-    renderAnalysis();
+    await renderAnalysis();
     renderSyncControls();
   } catch (error) {
     console.warn('[TabulaBili] Failed to load blocker settings:', error);
     renderFusionRatio();
     enabledInput.checked = true;
     renderRules();
-    renderAnalysis();
+    await renderAnalysis().catch(() => null);
     renderSyncControls();
     setMessage('设置加载失败，请刷新后重试。', true);
   }
@@ -898,16 +937,30 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   });
 
-  analysisExportCsvBtn.addEventListener('click', exportAnalysisCsv);
-  analysisExportJsonlBtn.addEventListener('click', exportAnalysisJsonl);
+  analysisExportCsvBtn.addEventListener('click', () => {
+    exportAnalysisCsv().catch((error) => {
+      console.warn('[TabulaBili] Failed to export analysis CSV:', error);
+      setAnalysisMessage('导出失败，请重试。', true);
+    });
+  });
+  analysisExportJsonlBtn.addEventListener('click', () => {
+    exportAnalysisJsonl().catch((error) => {
+      console.warn('[TabulaBili] Failed to export analysis JSONL:', error);
+      setAnalysisMessage('导出失败，请重试。', true);
+    });
+  });
 
   analysisClearBtn.addEventListener('click', async () => {
     if (!window.confirm('确定清空所有本地统计样本和标注吗？此操作不可恢复。')) return;
 
     try {
-      analysisSamples = [];
-      await persistAnalysisSamples();
-      renderAnalysis();
+      const response = await sendRuntimeMessage({ action: 'clearAnalysisSamples' });
+      if (!response || response.success !== true) {
+        throw new Error(response && response.error ? response.error : '清空失败');
+      }
+      analysisSampleState.page = 1;
+      analysisUpState.page = 1;
+      await renderAnalysis();
       setAnalysisMessage('统计数据已清空。');
     } catch (error) {
       console.warn('[TabulaBili] Failed to clear analysis samples:', error);
@@ -965,12 +1018,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       analysisSettings = analysisStore.normalizeSettings(changes[analysisStore.SETTINGS_KEY].newValue);
       shouldRenderAnalysis = true;
     }
-    if (changes[analysisStore.SAMPLES_KEY]) {
-      analysisSamples = sortAnalysisSamples(analysisStore.normalizeSamples(changes[analysisStore.SAMPLES_KEY].newValue));
+    if (changes[analysisStore.UPDATED_AT_KEY]) {
       shouldRenderAnalysis = true;
     }
 
-    if (shouldRenderAnalysis) renderAnalysis();
+    if (shouldRenderAnalysis) renderAnalysis().catch((error) => {
+      console.warn('[TabulaBili] Failed to render analysis data:', error);
+    });
 
     let shouldRenderSync = false;
     if (changes[syncStore.ENDPOINT_KEY]) {

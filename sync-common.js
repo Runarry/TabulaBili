@@ -207,10 +207,12 @@ globalThis.TabulaBiliSync = (() => {
         const eventSeed = stableStringify({
           clientId,
           capturedAt: sample.capturedAt || capturedAt,
+          eventKind: sample.eventKind || 'impression',
           id: sample.id,
           mode: sample.mode,
           source: sample.source,
-          position: sample.position
+          position: sample.position,
+          feedback: sample.feedback
         });
         return {
           ...sample,
