@@ -106,6 +106,40 @@ class MemoryStorage {
       range: query
     });
   }
+
+  async cleanupReports(options = {}) {
+    const before = String(options.before || '');
+    const dryRun = options.dryRun !== false;
+    const plan = this.getCleanupPlan(before);
+    const matched = {
+      events: plan.eventIds.length,
+      batches: plan.batchIds.length,
+      orphanSamples: plan.orphanSampleIds.length
+    };
+    if (dryRun) return { before, dryRun, matched, deleted: { events: 0, batches: 0, orphanSamples: 0 } };
+
+    for (const id of plan.eventIds) this.events.delete(id);
+    for (const id of plan.batchIds) this.batches.delete(id);
+    for (const id of plan.orphanSampleIds) this.samples.delete(id);
+    return { before, dryRun, matched, deleted: { ...matched } };
+  }
+
+  getCleanupPlan(before) {
+    const eventIds = [];
+    const batchIds = [];
+    const remainingSampleIds = new Set();
+
+    for (const [id, event] of this.events.entries()) {
+      if (String(event.capturedAt || '') < before) eventIds.push(id);
+      else if (event.sampleId) remainingSampleIds.add(event.sampleId);
+    }
+    for (const [id, batch] of this.batches.entries()) {
+      if (String(batch.receivedAt || '') < before) batchIds.push(id);
+    }
+
+    const orphanSampleIds = [...this.samples.keys()].filter((id) => !remainingSampleIds.has(id));
+    return { eventIds, batchIds, orphanSampleIds };
+  }
 }
 
 export { MemoryStorage };

@@ -23,6 +23,11 @@ class SqliteStorage {
         id integer primary key check (id = 1),
         json text not null
       );
+      create table if not exists schema_migrations (
+        version integer primary key,
+        name text not null,
+        applied_at text not null
+      );
       create table if not exists batches (
         batch_id text primary key,
         client_id text not null,
@@ -106,6 +111,11 @@ class SqliteStorage {
       create index if not exists idx_samples_click_count on samples(click_count desc);
       create index if not exists idx_samples_feedback on samples(feedback);
     `);
+    this.recordMigrations([
+      [1, 'base_tables'],
+      [2, 'structured_event_columns'],
+      [3, 'sample_timestamps']
+    ]);
   }
 
   ensureColumns(columns) {
@@ -118,6 +128,14 @@ class SqliteStorage {
     const columns = this.db.prepare(`pragma table_info(${table})`).all();
     if (!columns.some((item) => item.name === column)) {
       this.db.prepare(`alter table ${table} add column ${column} ${definition}`).run();
+    }
+  }
+
+  recordMigrations(migrations) {
+    const appliedAt = new Date().toISOString();
+    const insert = this.db.prepare('insert or ignore into schema_migrations (version, name, applied_at) values (?, ?, ?)');
+    for (const [version, name] of migrations) {
+      insert.run(version, name, appliedAt);
     }
   }
 
@@ -294,6 +312,39 @@ class SqliteStorage {
       order by captured_at asc
     `).all(...args);
     return buildReportAnalytics({ events, range: query });
+  }
+
+  async cleanupReports(options = {}) {
+    const before = String(options.before || '');
+    const dryRun = options.dryRun !== false;
+    const matched = this.getCleanupCounts(before);
+    if (dryRun) return { before, dryRun, matched, deleted: { events: 0, batches: 0, orphanSamples: 0 } };
+
+    const tx = this.db.transaction(() => {
+      const events = this.db.prepare('delete from events where captured_at < ?').run(before).changes;
+      const batches = this.db.prepare('delete from batches where received_at < ?').run(before).changes;
+      const orphanSamples = this.db.prepare(`
+        delete from samples
+        where not exists (select 1 from events where events.sample_id = samples.sample_id)
+      `).run().changes;
+      return { events, batches, orphanSamples };
+    });
+
+    return { before, dryRun, matched, deleted: tx() };
+  }
+
+  getCleanupCounts(before) {
+    const events = this.db.prepare('select count(*) as count from events where captured_at < ?').get(before).count;
+    const batches = this.db.prepare('select count(*) as count from batches where received_at < ?').get(before).count;
+    const orphanSamples = this.db.prepare(`
+      select count(*) as count from samples
+      where not exists (
+        select 1 from events
+        where events.sample_id = samples.sample_id
+          and events.captured_at >= ?
+      )
+    `).get(before).count;
+    return { events, batches, orphanSamples };
   }
 }
 

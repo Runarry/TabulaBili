@@ -75,6 +75,25 @@ function getReportEventOptions(url, sampleId) {
   };
 }
 
+function getCleanupOptions(body) {
+  const source = body && typeof body === 'object' ? body : {};
+  const parsedRetentionDays = Number(source.retentionDays || 365);
+  const retentionDays = Number.isFinite(parsedRetentionDays) && parsedRetentionDays > 0
+    ? parsedRetentionDays
+    : 365;
+  const before = source.before
+    ? String(source.before)
+    : new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000).toISOString();
+  return {
+    before,
+    dryRun: source.dryRun !== false
+  };
+}
+
+function isValidDate(value) {
+  return Number.isFinite(Date.parse(value || ''));
+}
+
 function createApp(options) {
   const storage = options.storage;
   const secret = options.secret;
@@ -125,6 +144,14 @@ function createApp(options) {
 
       if (url.pathname === '/api/reports/summary' && request.method === 'GET') {
         return json(await storage.getReportSummary());
+      }
+
+      if (url.pathname === '/api/reports/cleanup' && request.method === 'POST') {
+        if (typeof storage.cleanupReports !== 'function') return json({ error: 'cleanup_not_supported' }, 501);
+        const cleanupOptions = getCleanupOptions(await readJson(request));
+        if (!isValidDate(cleanupOptions.before)) return json({ error: 'invalid_before' }, 400);
+        cleanupOptions.before = new Date(cleanupOptions.before).toISOString();
+        return json(await storage.cleanupReports(cleanupOptions));
       }
 
       if (url.pathname === '/api/reports/batches' && request.method === 'GET') {

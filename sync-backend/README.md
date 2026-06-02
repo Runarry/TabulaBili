@@ -16,8 +16,72 @@ Authorization: Bearer <SYNC_SECRET>
 - `POST /api/reports`
 - `GET /api/reports/summary`
 - `GET /api/reports/samples`
+- `GET /api/reports/events?sampleId=<id>`
+- `GET /api/reports/samples/<sampleId>/events`
 - `GET /api/reports/batches`
 - `GET /api/reports/analytics`
+- `POST /api/reports/cleanup`
+
+### 数据统计接口
+
+`GET /api/reports/analytics` 支持：
+
+- `days`：统计最近 1-90 天。
+- `tzOffsetMinutes`：趋势日期使用的时区偏移。
+- `clientId`、`mode`、`source`、`category`、`feedback`：维度筛选。
+
+返回值中的核心指标：
+
+- `impressionCount`：范围内曝光事件数。
+- `clickCount`：范围内点击事件数。
+- `feedbackCount`：范围内反馈事件数。
+- `distinctSampleCount`：范围内出现过的视频数。
+- `distinctUpCount`：范围内出现过的 UP 数。
+- `ctr`：`clickCount / impressionCount`。
+- `feedbackRate`：`feedbackCount / impressionCount`。
+- `negativeFeedbackRate`：`dislike + blocked` 反馈占曝光比例。
+- `repeatImpressionRate`：同一视频重复曝光占曝光比例。
+
+`GET /api/reports/samples` 支持分页、搜索、标注筛选，并可按 `mode`、`source`、`category`、`upMid`、`upName`、`minSeenCount`、`minClickCount`、`since`、`until`、`hasFeedback` 过滤。排序支持 `lastSeenAt`、`seenCount`、`clickCount`、`ctr`、`negativeFeedback`、`repeatCount`、`firstSeenAt`、`lastClickedAt`。
+
+### 数据保留与清理
+
+后端不会自动删除数据。建议根据 D1/SQLite 数据量定期备份并清理旧明细事件。
+
+清理接口默认 dry run，不会删除数据：
+
+```http
+POST /api/reports/cleanup
+Authorization: Bearer <SYNC_SECRET>
+Content-Type: application/json
+
+{
+  "before": "2026-01-01T00:00:00.000Z",
+  "dryRun": true
+}
+```
+
+确认返回的 `matched` 数量后，将 `dryRun` 设置为 `false` 才会删除：
+
+- `events.captured_at < before` 的事件明细。
+- `batches.received_at < before` 的批次记录。
+- 没有任何剩余事件关联的样本聚合。
+
+如果请求体不提供 `before`，可以提供 `retentionDays`，默认按 365 天计算清理边界。
+
+### Schema 迁移
+
+D1 和 SQLite 会在启动或首次访问时自动创建表、补齐缺失列和索引，并在 `schema_migrations` 中记录已应用版本。当前记录：
+
+- `1 base_tables`
+- `2 structured_event_columns`
+- `3 sample_timestamps`
+
+重复运行初始化是幂等的，不需要手动执行 SQL migration。
+
+### 隐私说明
+
+上报数据包含推荐视频 ID、标题、UP、分类、展示位置、点击与反馈等分析字段。服务使用单个 `SYNC_SECRET` 保护，适合个人自托管；不要与不可信用户共享后台地址或密钥。管理页会把密钥保存在浏览器 `localStorage`，公共设备上使用后应清除站点数据。
 
 ## Docker + SQLite
 

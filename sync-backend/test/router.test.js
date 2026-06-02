@@ -3,6 +3,12 @@ import assert from 'node:assert/strict';
 import { createApp } from '../src/router.js';
 import { MemoryStorage } from '../src/storage/memory.js';
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+function daysAgo(days) {
+  return new Date(Date.now() - days * DAY_MS).toISOString();
+}
+
 test('api routes require bearer secret', async () => {
   const app = createApp({ secret: 'secret', storage: new MemoryStorage() });
   const rejected = await app.fetch(new Request('http://local/api/config'));
@@ -50,6 +56,48 @@ test('admin routes render data and analytics pages', async () => {
   assert.match(analyticsHtml, /维度对比/);
   assert.match(analyticsHtml, /重复推荐视频/);
   assert.doesNotMatch(analyticsHtml, /auth=/);
+});
+
+test('report cleanup supports dry run and actual deletion', async () => {
+  const storage = new MemoryStorage();
+  const app = createApp({ secret: 'secret', storage });
+  const headers = { authorization: 'Bearer secret', 'content-type': 'application/json' };
+  await app.fetch(new Request('http://local/api/reports', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      batchId: 'cleanup-b1',
+      clientId: 'c1',
+      capturedAt: daysAgo(40),
+      events: [
+        { eventId: 'cleanup-e1', id: 'BV_OLD', bvid: 'BV_OLD', title: 'old', capturedAt: daysAgo(40), mode: 'pure', source: 'feed', position: 1 }
+      ]
+    })
+  }));
+
+  const dryRunResponse = await app.fetch(new Request('http://local/api/reports/cleanup', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ before: daysAgo(10), dryRun: true })
+  }));
+  const dryRun = await dryRunResponse.json();
+  assert.equal(dryRun.matched.events, 1);
+  assert.equal(dryRun.matched.orphanSamples, 1);
+  assert.equal(dryRun.deleted.events, 0);
+
+  const cleanupResponse = await app.fetch(new Request('http://local/api/reports/cleanup', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ before: daysAgo(10), dryRun: false })
+  }));
+  const cleanup = await cleanupResponse.json();
+  assert.equal(cleanup.deleted.events, 1);
+  assert.equal(cleanup.deleted.orphanSamples, 1);
+
+  const summary = await app.fetch(new Request('http://local/api/reports/summary', { headers }));
+  const body = await summary.json();
+  assert.equal(body.eventCount, 0);
+  assert.equal(body.sampleCount, 0);
 });
 
 test('report APIs expose paginated samples and analytics', async () => {

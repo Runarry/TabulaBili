@@ -39,6 +39,11 @@ class D1Storage {
         id integer primary key check (id = 1),
         json text not null
       )`,
+      `create table if not exists schema_migrations (
+        version integer primary key,
+        name text not null,
+        applied_at text not null
+      )`,
       `create table if not exists batches (
         batch_id text primary key,
         client_id text not null,
@@ -128,6 +133,11 @@ class D1Storage {
     for (const sql of indexStatements) {
       await this.db.prepare(sql).run();
     }
+    await this.recordMigrations([
+      [1, 'base_tables'],
+      [2, 'structured_event_columns'],
+      [3, 'sample_timestamps']
+    ]);
   }
 
   async ensureColumns(columns) {
@@ -140,6 +150,16 @@ class D1Storage {
     const columns = await allRows(this.db.prepare(`pragma table_info(${table})`));
     if (!columns.some((item) => item.name === column)) {
       await this.db.prepare(`alter table ${table} add column ${column} ${definition}`).run();
+    }
+  }
+
+  async recordMigrations(migrations) {
+    const appliedAt = new Date().toISOString();
+    for (const [version, name] of migrations) {
+      await this.db.prepare(`
+        insert or ignore into schema_migrations (version, name, applied_at)
+        values (?, ?, ?)
+      `).bind(version, name, appliedAt).run();
     }
   }
 
@@ -319,6 +339,36 @@ class D1Storage {
       order by captured_at asc
     `).bind(...args));
     return buildReportAnalytics({ events, range: query });
+  }
+
+  async cleanupReports(options = {}) {
+    await this.ready;
+    const before = String(options.before || '');
+    const dryRun = options.dryRun !== false;
+    const matched = await this.getCleanupCounts(before);
+    if (dryRun) return { before, dryRun, matched, deleted: { events: 0, batches: 0, orphanSamples: 0 } };
+
+    const events = changesOf(await this.db.prepare('delete from events where captured_at < ?').bind(before).run());
+    const batches = changesOf(await this.db.prepare('delete from batches where received_at < ?').bind(before).run());
+    const orphanSamples = changesOf(await this.db.prepare(`
+      delete from samples
+      where not exists (select 1 from events where events.sample_id = samples.sample_id)
+    `).run());
+    return { before, dryRun, matched, deleted: { events, batches, orphanSamples } };
+  }
+
+  async getCleanupCounts(before) {
+    const events = await firstRow(this.db.prepare('select count(*) as count from events where captured_at < ?').bind(before));
+    const batches = await firstRow(this.db.prepare('select count(*) as count from batches where received_at < ?').bind(before));
+    const orphanSamples = await firstRow(this.db.prepare(`
+      select count(*) as count from samples
+      where not exists (
+        select 1 from events
+        where events.sample_id = samples.sample_id
+          and events.captured_at >= ?
+      )
+    `).bind(before));
+    return { events: events.count, batches: batches.count, orphanSamples: orphanSamples.count };
   }
 }
 

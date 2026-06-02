@@ -85,6 +85,13 @@ test('D1 storage initializes schema and supports report APIs', { skip: DatabaseS
   const timeline = await timelineResponse.json();
   assert.equal(timeline.total, 3);
 
+  const migrations = fake.db.prepare('select version, name from schema_migrations order by version').all();
+  assert.deepEqual(migrations.map((row) => ({ ...row })), [
+    { version: 1, name: 'base_tables' },
+    { version: 2, name: 'structured_event_columns' },
+    { version: 3, name: 'sample_timestamps' }
+  ]);
+
   const impression = fake.db.prepare('select event_kind, mode, source, category, position, bvid, up_name, up_mid from events where event_id = ?').get('e1');
   assert.deepEqual({ ...impression }, {
     event_kind: 'impression',
