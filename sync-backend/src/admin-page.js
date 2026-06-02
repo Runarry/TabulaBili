@@ -40,15 +40,14 @@ function adminPage(activePage = 'data') {
     .muted { color: #667085; }
     .error { color: #b42318; }
     .pager { display: flex; gap: 8px; align-items: center; justify-content: flex-end; margin-top: 10px; flex-wrap: wrap; }
-    .bar { display: grid; grid-template-columns: minmax(120px, 1fr) minmax(120px, 3fr) 64px; gap: 10px; align-items: center; margin: 8px 0; font-size: 13px; }
-    .bar-track { height: 10px; background: #edf0f4; border-radius: 999px; overflow: hidden; }
-    .bar-fill { height: 100%; background: #2563eb; }
+    .table-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    .table-panel h3 { margin: 0 0 8px; font-size: 15px; }
     @media (max-width: 760px) {
       .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .table-grid { grid-template-columns: 1fr; }
       header { display: block; }
       .login { margin-top: 12px; }
       .toolbar input, .toolbar select, .toolbar button { width: 100%; }
-      .bar { grid-template-columns: 1fr; gap: 4px; }
     }
   </style>
 </head>
@@ -83,6 +82,19 @@ function adminPage(activePage = 'data') {
       const response = await fetch(path, { headers: { Authorization: 'Bearer ' + state.secret } });
       if (!response.ok) throw new Error(await response.text());
       return response.json();
+    }
+    async function download(path, filename) {
+      const response = await fetch(path, { headers: { Authorization: 'Bearer ' + state.secret } });
+      if (!response.ok) throw new Error(await response.text());
+      const blob = await response.blob();
+      const href = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = href;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(href);
     }
     function fmt(value) {
       const date = new Date(value);
@@ -189,7 +201,27 @@ function analyticsBody() {
       <div class="toolbar">
         <h2>分析概览</h2>
         <select id="daysInput"><option value="7">近 7 天</option><option value="30" selected>近 30 天</option><option value="90">近 90 天</option></select>
+        <select id="modeFilter">
+          <option value="">全部模式</option>
+          <option value="pure">pure</option>
+          <option value="mixed">mixed</option>
+          <option value="fusion">fusion</option>
+          <option value="origin">origin</option>
+          <option value="refresh">refresh</option>
+        </select>
+        <input id="sourceFilter" placeholder="来源">
+        <input id="categoryFilter" placeholder="分类">
+        <select id="analyticsFeedbackFilter">
+          <option value="">全部反馈</option>
+          <option value="like">like</option>
+          <option value="dislike">dislike</option>
+          <option value="neutral">neutral</option>
+          <option value="blocked">blocked</option>
+          <option value="unset">unset</option>
+        </select>
+        <input id="clientFilter" placeholder="clientId">
         <button class="secondary" type="button" id="refreshBtn">刷新</button>
+        <button class="secondary" type="button" id="exportAnalyticsBtn">导出 JSON</button>
       </div>
       <div class="grid">
         <div class="metric"><span>视频</span><strong id="metricSamples">0</strong></div>
@@ -217,8 +249,44 @@ function analyticsBody() {
       </table>
     </section>
     <section>
-      <h2>分布</h2>
-      <div id="distributionView"></div>
+      <h2>维度对比</h2>
+      <div class="table-grid">
+        <div class="table-panel">
+          <h3>模式</h3>
+          <table>
+            <thead><tr><th>模式</th><th>曝光</th><th>点击</th><th>CTR</th><th>负反馈率</th><th>均位</th></tr></thead>
+            <tbody id="modeRows"></tbody>
+          </table>
+        </div>
+        <div class="table-panel">
+          <h3>来源</h3>
+          <table>
+            <thead><tr><th>来源</th><th>曝光</th><th>点击</th><th>CTR</th><th>负反馈率</th><th>均位</th></tr></thead>
+            <tbody id="sourceRows"></tbody>
+          </table>
+        </div>
+        <div class="table-panel">
+          <h3>分类</h3>
+          <table>
+            <thead><tr><th>分类</th><th>曝光</th><th>点击</th><th>CTR</th><th>负反馈率</th><th>均位</th></tr></thead>
+            <tbody id="categoryRows"></tbody>
+          </table>
+        </div>
+        <div class="table-panel">
+          <h3>位置</h3>
+          <table>
+            <thead><tr><th>位置</th><th>曝光</th><th>点击</th><th>CTR</th><th>负反馈率</th><th>均位</th></tr></thead>
+            <tbody id="positionRows"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+    <section>
+      <h2>重复推荐视频</h2>
+      <table>
+        <thead><tr><th>视频</th><th>UP 主</th><th>曝光</th><th>重复</th><th>点击</th><th>CTR</th></tr></thead>
+        <tbody id="repeatedRows"></tbody>
+      </table>
     </section>`;
 }
 
@@ -286,7 +354,8 @@ function dataScript() {
       const query = '&q=' + encodeURIComponent(sampleState.q)
         + '&feedback=' + encodeURIComponent(sampleState.feedback)
         + '&sort=' + encodeURIComponent(sampleState.sort);
-      window.open('/api/reports/samples?limit=10000&export=1&auth=' + encodeURIComponent(state.secret) + query, '_blank');
+      download('/api/reports/samples?limit=10000&export=1' + query, 'tabulabili-samples.json')
+        .catch((error) => setMessage(error.message, true));
     });`;
 }
 
@@ -295,21 +364,49 @@ function analyticsScript() {
     function pct(value) {
       return (Number(value || 0) * 100).toFixed(2) + '%';
     }
-    function bars(title, rows) {
-      const max = Math.max(1, ...rows.map((row) => Number(row.count || row.seenCount || row.impressions || 0)));
-      return '<h3>' + esc(title) + '</h3>' + rows.map((row) => {
-        const value = Number(row.count || row.seenCount || row.impressions || 0);
-        return '<div class="bar"><span>' + esc(row.key || row.upName || '') + '</span><div class="bar-track"><div class="bar-fill" style="width:' + Math.round(value / max * 100) + '%"></div></div><strong>' + esc(value) + '</strong></div>';
-      }).join('');
+    function avg(value) {
+      const number = Number(value || 0);
+      return Number.isFinite(number) && number > 0 ? number.toFixed(1) : '';
+    }
+    function emptyRow(columns) {
+      return '<tr><td class="muted" colspan="' + columns + '">无数据</td></tr>';
+    }
+    function renderRows(rows, columns, render) {
+      return rows && rows.length ? rows.map(render).join('') : emptyRow(columns);
+    }
+    function dimensionRows(rows) {
+      return renderRows(rows, 6, (row) =>
+        '<tr><td>' + esc(row.key) + '</td><td>' + esc(row.impressions) + '</td><td>' + esc(row.clicks) + '</td><td>' + esc(pct(row.ctr)) + '</td><td>' + esc(pct(row.negativeFeedbackRate)) + '</td><td>' + esc(avg(row.avgPosition)) + '</td></tr>'
+      );
+    }
+    const analyticsFilters = [
+      ['mode', 'modeFilter'],
+      ['source', 'sourceFilter'],
+      ['category', 'categoryFilter'],
+      ['feedback', 'analyticsFeedbackFilter'],
+      ['clientId', 'clientFilter']
+    ];
+    function analyticsParams() {
+      const params = new URLSearchParams();
+      params.set('days', $('daysInput').value || '30');
+      params.set('tzOffsetMinutes', String(-new Date().getTimezoneOffset()));
+      for (const item of analyticsFilters) {
+        const value = $(item[1]).value.trim();
+        if (value) params.set(item[0], value);
+      }
+      return params.toString();
+    }
+    function refreshAnalytics() {
+      refresh().catch((error) => setMessage(error.message, true));
     }
     async function refresh() {
       if (!state.secret) {
         setMessage('请输入服务密钥。');
         return;
       }
-      const tzOffsetMinutes = -new Date().getTimezoneOffset();
-      const days = Number($('daysInput').value || 30);
-      const result = await api('/api/reports/analytics?days=' + days + '&tzOffsetMinutes=' + tzOffsetMinutes);
+      const result = await api('/api/reports/analytics?' + analyticsParams());
+      const dimensions = result.dimensions || {};
+      const top = result.top || {};
       metric('metricSamples', result.metrics.sampleCount);
       metric('metricUps', result.metrics.distinctUpCount);
       metric('metricImpressions', result.metrics.impressionCount);
@@ -318,24 +415,35 @@ function analyticsScript() {
       metric('metricFeedbackRate', pct(result.metrics.feedbackRate));
       metric('metricNegativeRate', pct(result.metrics.negativeFeedbackRate));
       metric('metricRepeatRate', pct(result.metrics.repeatImpressionRate));
-      $('trendRows').innerHTML = result.trends.map((row) =>
+      $('trendRows').innerHTML = renderRows(result.trends, 5, (row) =>
         '<tr><td>' + esc(row.date) + '</td><td>' + esc(row.impressions) + '</td><td>' + esc(row.clicks) + '</td><td>' + esc(pct(row.ctr)) + '</td><td>' + esc(row.feedbacks) + '</td></tr>'
-      ).join('');
-      $('topUpRows').innerHTML = result.topUps.map((row) =>
+      );
+      $('topUpRows').innerHTML = renderRows(result.topUps || top.ups, 6, (row) =>
         '<tr><td>' + esc(row.upName || row.key) + '</td><td>' + esc(row.sampleCount) + '</td><td>' + esc(row.seenCount) + '</td><td>' + esc(row.clickCount) + '</td><td>' + esc(pct(row.ctr)) + '</td><td>' + esc(pct(row.negativeFeedbackRate)) + '</td></tr>'
-      ).join('');
-      const dimensions = result.dimensions || {};
-      $('distributionView').innerHTML = [
-        bars('分类', dimensions.categories || result.categories || []),
-        bars('来源', dimensions.sources || result.sources || []),
-        bars('模式', dimensions.modes || result.modes || []),
-        bars('位置', dimensions.positions || []),
-        bars('反馈', result.feedback || [])
-      ].join('');
+      );
+      $('modeRows').innerHTML = dimensionRows(dimensions.modes || result.modes || []);
+      $('sourceRows').innerHTML = dimensionRows(dimensions.sources || result.sources || []);
+      $('categoryRows').innerHTML = dimensionRows(dimensions.categories || result.categories || []);
+      $('positionRows').innerHTML = dimensionRows(dimensions.positions || []);
+      $('repeatedRows').innerHTML = renderRows(top.repeatedSamples, 6, (row) =>
+        '<tr><td>' + esc(row.title || row.bvid || row.sampleId) + '<div class="muted">' + esc(row.bvid || row.sampleId) + '</div></td><td>' + esc(row.upName || '') + '</td><td>' + esc(row.impressions) + '</td><td>' + esc(row.repeatImpressionCount) + '</td><td>' + esc(row.clicks) + '</td><td>' + esc(pct(row.ctr)) + '</td></tr>'
+      );
       setMessage('已刷新。');
     }
-    $('refreshBtn').addEventListener('click', () => refresh().catch((error) => setMessage(error.message, true)));
-    $('daysInput').addEventListener('change', () => refresh().catch((error) => setMessage(error.message, true)));`;
+    $('refreshBtn').addEventListener('click', refreshAnalytics);
+    $('exportAnalyticsBtn').addEventListener('click', () => {
+      download('/api/reports/analytics?' + analyticsParams(), 'tabulabili-analytics.json')
+        .catch((error) => setMessage(error.message, true));
+    });
+    ['daysInput', 'modeFilter', 'analyticsFeedbackFilter'].forEach((id) => {
+      $(id).addEventListener('change', refreshAnalytics);
+    });
+    ['sourceFilter', 'categoryFilter', 'clientFilter'].forEach((id) => {
+      $(id).addEventListener('change', refreshAnalytics);
+      $(id).addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') refreshAnalytics();
+      });
+    });`;
 }
 
 export { adminPage };

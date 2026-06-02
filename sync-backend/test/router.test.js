@@ -39,11 +39,17 @@ test('admin routes render data and analytics pages', async () => {
   const app = createApp({ secret: 'secret', storage: new MemoryStorage() });
   const data = await app.fetch(new Request('http://local/'));
   assert.equal(data.status, 200);
-  assert.match(await data.text(), /聚合样本/);
+  const dataHtml = await data.text();
+  assert.match(dataHtml, /聚合样本/);
+  assert.doesNotMatch(dataHtml, /auth=/);
 
   const analytics = await app.fetch(new Request('http://local/analytics'));
   assert.equal(analytics.status, 200);
-  assert.match(await analytics.text(), /分析概览/);
+  const analyticsHtml = await analytics.text();
+  assert.match(analyticsHtml, /分析概览/);
+  assert.match(analyticsHtml, /维度对比/);
+  assert.match(analyticsHtml, /重复推荐视频/);
+  assert.doesNotMatch(analyticsHtml, /auth=/);
 });
 
 test('report APIs expose paginated samples and analytics', async () => {
