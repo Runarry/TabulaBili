@@ -38,7 +38,8 @@ class FakeD1 {
 }
 
 test('D1 storage initializes schema and supports report APIs', { skip: DatabaseSync ? false : 'node:sqlite unavailable' }, async () => {
-  const storage = new D1Storage(new FakeD1());
+  const fake = new FakeD1();
+  const storage = new D1Storage(fake);
   const app = createApp({ secret: 'secret', storage });
   const headers = { authorization: 'Bearer secret', 'content-type': 'application/json' };
 
@@ -50,7 +51,7 @@ test('D1 storage initializes schema and supports report APIs', { skip: DatabaseS
       clientId: 'c1',
       capturedAt: '2026-06-01T00:00:00.000Z',
       events: [
-        { eventId: 'e1', id: 'BV1', bvid: 'BV1', title: 'alpha', upName: 'up', capturedAt: '2026-06-01T00:00:00.000Z', mode: 'pure', source: 'feed', position: 1 },
+        { eventId: 'e1', id: 'BV1', bvid: 'BV1', title: 'alpha', upName: 'up', upMid: '42', category: 'cat-a', capturedAt: '2026-06-01T00:00:00.000Z', mode: 'pure', source: 'feed', position: 1 },
         { eventId: 'e2', id: 'BV1', bvid: 'BV1', eventKind: 'click', capturedAt: '2026-06-01T00:01:00.000Z' },
         { eventId: 'e3', id: 'BV1', bvid: 'BV1', eventKind: 'feedback', feedback: 'like', capturedAt: '2026-06-01T00:02:00.000Z' }
       ]
@@ -68,4 +69,31 @@ test('D1 storage initializes schema and supports report APIs', { skip: DatabaseS
   const analytics = await analyticsResponse.json();
   assert.equal(analytics.metrics.sampleCount, 1);
   assert.equal(analytics.metrics.clickCount, 1);
+  assert.equal(analytics.range.days, 90);
+
+  const impression = fake.db.prepare('select event_kind, mode, source, category, position, bvid, up_name, up_mid from events where event_id = ?').get('e1');
+  assert.deepEqual({ ...impression }, {
+    event_kind: 'impression',
+    mode: 'pure',
+    source: 'feed',
+    category: 'cat-a',
+    position: 1,
+    bvid: 'BV1',
+    up_name: 'up',
+    up_mid: '42'
+  });
+
+  const feedback = fake.db.prepare('select event_kind, feedback, category, up_name, up_mid from events where event_id = ?').get('e3');
+  assert.deepEqual({ ...feedback }, {
+    event_kind: 'feedback',
+    feedback: 'like',
+    category: 'cat-a',
+    up_name: 'up',
+    up_mid: '42'
+  });
+
+  const sample = fake.db.prepare('select first_seen_at, last_clicked_at, feedback_updated_at from samples where sample_id = ?').get('BV1');
+  assert.equal(sample.first_seen_at, '2026-06-01T00:00:00.000Z');
+  assert.equal(sample.last_clicked_at, '2026-06-01T00:01:00.000Z');
+  assert.equal(sample.feedback_updated_at, '2026-06-01T00:02:00.000Z');
 });

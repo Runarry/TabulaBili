@@ -120,7 +120,12 @@ function createApp(options) {
       if (url.pathname === '/api/reports/analytics' && request.method === 'GET') {
         return json(await storage.getReportAnalytics({
           days: Number(url.searchParams.get('days') || 30),
-          tzOffsetMinutes: Number(url.searchParams.get('tzOffsetMinutes') || 0)
+          tzOffsetMinutes: Number(url.searchParams.get('tzOffsetMinutes') || 0),
+          clientId: url.searchParams.get('clientId') || '',
+          mode: url.searchParams.get('mode') || '',
+          source: url.searchParams.get('source') || '',
+          category: url.searchParams.get('category') || '',
+          feedback: url.searchParams.get('feedback') || ''
         }));
       }
 

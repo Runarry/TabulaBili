@@ -19,6 +19,14 @@ function getSampleId(event) {
   return String(event && (event.id || event.bvid || event.aid || event.uri || event.eventId) || '').trim();
 }
 
+function normalizeEventKind(value) {
+  return value === 'click' || value === 'feedback' ? value : 'impression';
+}
+
+function normalizeText(value) {
+  return String(value || '').trim();
+}
+
 function increment(map, key) {
   if (!key) return;
   map[key] = (map[key] || 0) + 1;
@@ -31,9 +39,7 @@ function normalizeCountMap(value) {
 function mergeAggregate(existingValue, event) {
   const existing = existingValue && typeof existingValue === 'object' ? existingValue : null;
   const capturedAt = event.capturedAt || new Date().toISOString();
-  const eventKind = event.eventKind === 'click' || event.eventKind === 'feedback'
-    ? event.eventKind
-    : 'impression';
+  const eventKind = normalizeEventKind(event.eventKind);
   const modes = normalizeCountMap(existing && existing.modes);
   const sources = normalizeCountMap(existing && existing.sources);
   if (eventKind === 'impression') {
@@ -116,17 +122,48 @@ function toSampleRow(sampleId, aggregate, fallbackSeenAt) {
     upName: aggregate.upName || '',
     upMid: aggregate.upMid || '',
     category: aggregate.category || '',
+    firstSeenAt: aggregate.firstSeenAt || aggregate.lastSeenAt || aggregate.updatedAt || fallbackSeenAt,
     lastSeenAt: aggregate.lastSeenAt || aggregate.updatedAt || fallbackSeenAt,
     seenCount: Number(aggregate.seenCount || 0),
     clickCount: Number(aggregate.clickCount || 0),
     feedback: aggregate.feedback || 'unset',
+    lastClickedAt: aggregate.lastClickedAt || '',
+    feedbackUpdatedAt: aggregate.feedbackUpdatedAt || '',
     json: JSON.stringify(aggregate)
+  };
+}
+
+function toEventRow(event, batch, receivedAt, existingSample = null) {
+  const sampleId = getSampleId(event);
+  const eventKind = normalizeEventKind(event && event.eventKind);
+  const position = Number(event && event.position);
+  const fallback = existingSample && typeof existingSample === 'object' ? existingSample : {};
+
+  return {
+    eventId: normalizeText(event && event.eventId),
+    batchId: normalizeText((event && event.batchId) || (batch && batch.batchId)),
+    clientId: normalizeText((event && event.clientId) || (batch && batch.clientId)),
+    sampleId,
+    capturedAt: normalizeText((event && event.capturedAt) || (batch && batch.capturedAt) || receivedAt),
+    receivedAt: normalizeText(receivedAt),
+    eventKind,
+    mode: normalizeText(event && event.mode),
+    source: normalizeText(event && event.source),
+    category: normalizeText((event && event.category) || fallback.category),
+    feedback: normalizeText(event && event.feedback),
+    position: Number.isFinite(position) && position > 0 ? position : 0,
+    bvid: normalizeText((event && event.bvid) || fallback.bvid),
+    upName: normalizeText((event && event.upName) || fallback.upName),
+    upMid: normalizeText((event && event.upMid) || fallback.upMid),
+    rawJson: JSON.stringify(event || {})
   };
 }
 
 export {
   getSampleId,
   mergeAggregate,
+  normalizeEventKind,
   normalizeReportPayload,
+  toEventRow,
   toSampleRow
 };

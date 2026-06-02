@@ -1,6 +1,7 @@
-import { getSampleId, mergeAggregate } from '../report-aggregate.js';
+import { getSampleId, mergeAggregate, toEventRow } from '../report-aggregate.js';
 import {
   buildReportAnalytics,
+  eventMatchesAnalyticsOptions,
   filterSamples,
   normalizeAnalyticsOptions,
   normalizeLimit,
@@ -47,10 +48,12 @@ class MemoryStorage {
         duplicateEventCount += 1;
         continue;
       }
-      this.events.set(event.eventId, { ...event, receivedAt });
       const sampleId = getSampleId(event);
+      const existingAggregate = sampleId ? this.samples.get(sampleId) : null;
+      const eventRow = toEventRow(event, batch, receivedAt, existingAggregate);
+      this.events.set(event.eventId, eventRow);
       if (!sampleId) continue;
-      this.samples.set(sampleId, mergeAggregate(this.samples.get(sampleId), event));
+      this.samples.set(sampleId, mergeAggregate(existingAggregate, event));
     }
     const storedBatch = this.batches.get(batch.batchId);
     if (storedBatch) storedBatch.duplicateEventCount = duplicateEventCount;
@@ -84,17 +87,11 @@ class MemoryStorage {
   }
 
   async getReportAnalytics(options = {}) {
-    const { sinceMs, tzOffsetMinutes } = normalizeAnalyticsOptions(options);
-    const samples = [...this.samples.values()];
-    const events = [...this.events.values()];
+    const query = normalizeAnalyticsOptions(options);
+    const events = [...this.events.values()].filter((event) => eventMatchesAnalyticsOptions(event, query));
     return buildReportAnalytics({
-      samples,
-      events: events.filter((event) => Date.parse(event.capturedAt || event.receivedAt || '') >= sinceMs),
-      metrics: {
-        batchCount: this.batches.size,
-        eventCount: this.events.size
-      },
-      tzOffsetMinutes
+      events,
+      range: query
     });
   }
 }
