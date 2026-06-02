@@ -296,6 +296,13 @@ body.options-page {
   flex-wrap: wrap;
 }
 
+.sync-settings {
+  display: grid;
+  grid-template-columns: minmax(220px, 2fr) minmax(180px, 1.5fr) minmax(120px, 0.8fr);
+  gap: 10px;
+  align-items: flex-end;
+}
+
 .analysis-click-switch {
   height: 34px;
 }
@@ -440,6 +447,10 @@ body.options-page {
 
   .options-tab {
     min-width: 72px;
+  }
+
+  .sync-settings {
+    grid-template-columns: 1fr;
   }
 
   .rule-form {

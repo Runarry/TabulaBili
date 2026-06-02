@@ -6,14 +6,16 @@
   "description": "通过精细化控制网络请求与首屏加载，提供纯净、探索、混合、融合等多维度的B站首页推荐流体验，打破信息茧房。",
   "permissions": [
     "storage",
-    "declarativeNetRequest"
+    "declarativeNetRequest",
+    "alarms"
   ],
   "host_permissions": [
     "*://api.bilibili.com/*",
-    "*://www.bilibili.com/*"
+    "*://www.bilibili.com/*",
+    "<all_urls>"
   ],
   "background": {
-    "scripts": ["background.js"],
+    "scripts": ["sync-common.js", "background.js"],
     "service_worker": "background.js"
   },
   "content_scripts": [

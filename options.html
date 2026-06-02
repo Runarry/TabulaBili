@@ -91,6 +91,41 @@
         <section class="settings-panel">
           <div class="panel-heading">
             <div>
+              <h2 class="section-title options-section-title">同步与上报</h2>
+              <p class="panel-desc">连接自建后端，同步配置并批量上报推荐样本。</p>
+            </div>
+            <label class="switch-row" for="syncEnabled">
+              <span>启用</span>
+              <input type="checkbox" id="syncEnabled">
+            </label>
+          </div>
+
+          <div class="sync-settings">
+            <label class="field field-grow">
+              <span class="field-label">后端 URL</span>
+              <input id="syncEndpoint" class="field-input" type="url" autocomplete="off" placeholder="https://example.workers.dev">
+            </label>
+            <label class="field field-grow">
+              <span class="field-label">服务密钥</span>
+              <input id="syncSecret" class="field-input" type="password" autocomplete="current-password">
+            </label>
+            <label class="field">
+              <span class="field-label">上报频率（分钟）</span>
+              <input id="reportFrequency" class="field-input" type="number" min="5" max="1440" step="5" value="30">
+            </label>
+          </div>
+
+          <div class="analysis-actions">
+            <button type="button" class="secondary-btn" id="syncSaveBtn">保存连接</button>
+            <button type="button" class="secondary-btn" id="syncNowBtn">立即同步</button>
+            <button type="button" class="secondary-btn" id="reportNowBtn">立即上报</button>
+          </div>
+          <p class="form-message" id="syncMessage" role="status"></p>
+        </section>
+
+        <section class="settings-panel">
+          <div class="panel-heading">
+            <div>
               <h2 class="section-title options-section-title">内容屏蔽</h2>
               <p class="panel-desc">规则会作用于所有模式，并在屏蔽后自动尝试补足首页数量。</p>
             </div>
@@ -186,6 +221,7 @@
   </div>
 
   <script src="analysis-common.js"></script>
+  <script src="sync-common.js"></script>
   <script src="options.js"></script>
 </body>
 </html>

@@ -265,6 +265,9 @@ window.addEventListener('tabula_analysis_samples', (event) => {
   try {
     const parsed = JSON.parse(detail);
     queueAnalysisSamples(parsed && parsed.samples);
+    sendRuntimeMessage({ action: 'queueReportSamples', payload: parsed }).catch((error) => {
+      console.warn('[TabulaBili] Failed to queue backend report:', error);
+    });
   } catch (error) {
     console.warn('[TabulaBili] Failed to parse analysis samples:', error);
   }

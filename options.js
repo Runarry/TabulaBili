@@ -2,6 +2,7 @@ const extensionApi = globalThis.browser ?? globalThis.chrome;
 const usePromiseApi = typeof globalThis.browser !== 'undefined';
 const DEFAULT_FUSION_CLEAN_RATIO = 50;
 const analysisStore = globalThis.TabulaBiliAnalysis;
+const syncStore = globalThis.TabulaBiliSync;
 const ANALYSIS_PRIVACY_PROMPT = '导出的文件包含你的首页推荐标题、UP 主和人工标注，仅保存在本地。请确认后再分享给其他软件。';
 
 function getLastRuntimeError() {
@@ -178,6 +179,14 @@ document.addEventListener('DOMContentLoaded', async () => {
   const analysisCaptureClicksInput = document.getElementById('analysisCaptureClicks');
   const analysisSaveSettingsBtn = document.getElementById('analysisSaveSettingsBtn');
   const analysisSettingsMessage = document.getElementById('analysisSettingsMessage');
+  const syncEnabledInput = document.getElementById('syncEnabled');
+  const syncEndpointInput = document.getElementById('syncEndpoint');
+  const syncSecretInput = document.getElementById('syncSecret');
+  const reportFrequencyInput = document.getElementById('reportFrequency');
+  const syncSaveBtn = document.getElementById('syncSaveBtn');
+  const syncNowBtn = document.getElementById('syncNowBtn');
+  const reportNowBtn = document.getElementById('reportNowBtn');
+  const syncMessage = document.getElementById('syncMessage');
   const analysisTotalSamples = document.getElementById('analysisTotalSamples');
   const analysisTodaySamples = document.getElementById('analysisTodaySamples');
   const analysisWeekSamples = document.getElementById('analysisWeekSamples');
@@ -197,6 +206,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   let analysisEnabled = false;
   let analysisSettings = { ...analysisStore.DEFAULT_SETTINGS };
   let analysisSamples = [];
+  let syncEnabled = false;
+  let syncEndpoint = '';
+  let syncSecret = '';
+  let reportFrequency = syncStore.normalizeFrequency();
+  let syncStatus = null;
   let refreshTimer = null;
 
   function getTabFromHash() {
@@ -240,6 +254,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   function setAnalysisMessage(text, isError = false) {
     analysisMessage.textContent = text;
     analysisMessage.classList.toggle('error', isError);
+  }
+
+  function setSyncMessage(text, isError = false) {
+    syncMessage.textContent = text;
+    syncMessage.classList.toggle('error', isError);
   }
 
   function renderFusionRatio() {
@@ -301,6 +320,20 @@ document.addEventListener('DOMContentLoaded', async () => {
     await storageSet({ [analysisStore.SAMPLES_KEY]: analysisSamples });
   }
 
+  async function persistSyncSettings() {
+    syncEndpoint = syncStore.normalizeEndpoint(syncEndpointInput.value);
+    syncSecret = syncSecretInput.value.trim();
+    reportFrequency = syncStore.normalizeFrequency(reportFrequencyInput.value);
+    syncEnabled = syncEnabledInput.checked;
+    await storageSet({
+      [syncStore.ENDPOINT_KEY]: syncEndpoint,
+      [syncStore.SECRET_KEY]: syncSecret,
+      [syncStore.ENABLED_KEY]: syncEnabled,
+      [syncStore.REPORT_FREQUENCY_KEY]: reportFrequency
+    });
+    renderSyncControls();
+  }
+
   function renderAnalysisControls() {
     analysisEnabledInput.checked = analysisEnabled;
     analysisRetentionDaysInput.value = String(analysisSettings.retentionDays);
@@ -313,6 +346,21 @@ document.addEventListener('DOMContentLoaded', async () => {
     renderAnalysisSummary();
     renderUpStats();
     renderSampleStats();
+  }
+
+  function renderSyncControls() {
+    syncEnabledInput.checked = syncEnabled;
+    syncEndpointInput.value = syncEndpoint;
+    syncSecretInput.value = syncSecret;
+    reportFrequencyInput.value = String(reportFrequency);
+
+    if (syncStatus && syncStatus.message) {
+      const date = new Date(syncStatus.at || 0);
+      const suffix = Number.isNaN(date.getTime()) ? '' : `（${date.toLocaleString('zh-CN')}）`;
+      setSyncMessage(`${syncStatus.message}${suffix}`, syncStatus.ok === false);
+    } else {
+      setSyncMessage(syncEnabled ? '同步已启用，保存后可立即同步。' : '同步未启用。');
+    }
   }
 
   function renderAnalysisSummary() {
@@ -683,7 +731,12 @@ document.addEventListener('DOMContentLoaded', async () => {
       'bili_fusion_clean_ratio',
       'bili_analysis_enabled',
       analysisStore.SAMPLES_KEY,
-      analysisStore.SETTINGS_KEY
+      analysisStore.SETTINGS_KEY,
+      syncStore.ENDPOINT_KEY,
+      syncStore.SECRET_KEY,
+      syncStore.ENABLED_KEY,
+      syncStore.REPORT_FREQUENCY_KEY,
+      syncStore.LAST_STATUS_KEY
     ]);
     fusionCleanRatio = normalizeFusionCleanRatio(result.bili_fusion_clean_ratio);
     renderFusionRatio();
@@ -693,13 +746,20 @@ document.addEventListener('DOMContentLoaded', async () => {
     analysisEnabled = result.bili_analysis_enabled === true;
     analysisSettings = analysisStore.normalizeSettings(result[analysisStore.SETTINGS_KEY]);
     analysisSamples = sortAnalysisSamples(analysisStore.normalizeSamples(result[analysisStore.SAMPLES_KEY]));
+    syncEndpoint = syncStore.normalizeEndpoint(result[syncStore.ENDPOINT_KEY]);
+    syncSecret = typeof result[syncStore.SECRET_KEY] === 'string' ? result[syncStore.SECRET_KEY] : '';
+    syncEnabled = result[syncStore.ENABLED_KEY] === true;
+    reportFrequency = syncStore.normalizeFrequency(result[syncStore.REPORT_FREQUENCY_KEY]);
+    syncStatus = result[syncStore.LAST_STATUS_KEY] || null;
     renderAnalysis();
+    renderSyncControls();
   } catch (error) {
     console.warn('[TabulaBili] Failed to load blocker settings:', error);
     renderFusionRatio();
     enabledInput.checked = true;
     renderRules();
     renderAnalysis();
+    renderSyncControls();
     setMessage('设置加载失败，请刷新后重试。', true);
   }
 
@@ -747,6 +807,61 @@ document.addEventListener('DOMContentLoaded', async () => {
     } catch (error) {
       console.warn('[TabulaBili] Failed to save analysis settings:', error);
       setAnalysisSettingsMessage('保存失败，请重试。', true);
+    }
+  });
+
+  syncSaveBtn.addEventListener('click', async () => {
+    try {
+      await persistSyncSettings();
+      setSyncMessage('同步连接已保存。');
+    } catch (error) {
+      console.warn('[TabulaBili] Failed to save sync settings:', error);
+      setSyncMessage('保存失败，请重试。', true);
+    }
+  });
+
+  syncEnabledInput.addEventListener('change', async () => {
+    try {
+      await persistSyncSettings();
+      setSyncMessage(syncEnabled ? '同步已启用。' : '同步已关闭。');
+    } catch (error) {
+      console.warn('[TabulaBili] Failed to save sync enabled state:', error);
+      setSyncMessage('保存失败，请重试。', true);
+    }
+  });
+
+  syncNowBtn.addEventListener('click', async () => {
+    try {
+      await persistSyncSettings();
+      syncNowBtn.disabled = true;
+      const response = await sendRuntimeMessage({ action: 'syncBackendNow' });
+      if (!response || response.success !== true) {
+        throw new Error(response && response.error ? response.error : '同步失败');
+      }
+      setSyncMessage('配置和队列已同步。');
+    } catch (error) {
+      console.warn('[TabulaBili] Manual sync failed:', error);
+      setSyncMessage(`同步失败：${error.message}`, true);
+    } finally {
+      syncNowBtn.disabled = false;
+    }
+  });
+
+  reportNowBtn.addEventListener('click', async () => {
+    try {
+      await persistSyncSettings();
+      reportNowBtn.disabled = true;
+      const response = await sendRuntimeMessage({ action: 'reportBackendNow' });
+      if (!response || response.success !== true) {
+        throw new Error(response && response.error ? response.error : '上报失败');
+      }
+      const sent = response.result && Number(response.result.sent || 0);
+      setSyncMessage(sent ? `已上报 ${sent} 个批次。` : '没有待上报数据。');
+    } catch (error) {
+      console.warn('[TabulaBili] Manual report failed:', error);
+      setSyncMessage(`上报失败：${error.message}`, true);
+    } finally {
+      reportNowBtn.disabled = false;
     }
   });
 
@@ -823,5 +938,29 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     if (shouldRenderAnalysis) renderAnalysis();
+
+    let shouldRenderSync = false;
+    if (changes[syncStore.ENDPOINT_KEY]) {
+      syncEndpoint = syncStore.normalizeEndpoint(changes[syncStore.ENDPOINT_KEY].newValue);
+      shouldRenderSync = true;
+    }
+    if (changes[syncStore.SECRET_KEY]) {
+      syncSecret = typeof changes[syncStore.SECRET_KEY].newValue === 'string' ? changes[syncStore.SECRET_KEY].newValue : '';
+      shouldRenderSync = true;
+    }
+    if (changes[syncStore.ENABLED_KEY]) {
+      syncEnabled = changes[syncStore.ENABLED_KEY].newValue === true;
+      shouldRenderSync = true;
+    }
+    if (changes[syncStore.REPORT_FREQUENCY_KEY]) {
+      reportFrequency = syncStore.normalizeFrequency(changes[syncStore.REPORT_FREQUENCY_KEY].newValue);
+      shouldRenderSync = true;
+    }
+    if (changes[syncStore.LAST_STATUS_KEY]) {
+      syncStatus = changes[syncStore.LAST_STATUS_KEY].newValue || null;
+      shouldRenderSync = true;
+    }
+
+    if (shouldRenderSync) renderSyncControls();
   });
 });

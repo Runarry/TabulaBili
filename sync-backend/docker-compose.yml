@@ -1,0 +1,13 @@
+services:
+  tabulabili-sync:
+    build: .
+    ports:
+      - "8787:8787"
+    environment:
+      SYNC_SECRET: "change-me-long-random-secret"
+      SQLITE_PATH: "/data/tabulabili-sync.db"
+    volumes:
+      - tabulabili-sync-data:/data
+
+volumes:
+  tabulabili-sync-data:
