@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "deploy": "npx wrangler deploy --config wrangler.local.toml",
+    "migrate:remote": "npx wrangler d1 migrations apply tabulabili-sync --remote --config wrangler.local.toml",
     "start": "node src/node-server.js",
     "test": "node --test"
   },

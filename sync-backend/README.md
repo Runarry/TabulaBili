@@ -97,18 +97,19 @@ Content-Type: application/json
 
 ### Schema 迁移
 
-D1 和 SQLite 会在启动或首次访问时自动创建表、补齐缺失列和索引，并在 `schema_migrations` 中记录已应用版本。当前记录：
+D1 推荐在部署前执行 `migrations/0001_schema.sql`，运行时仍保留兼容性的自动创建和补齐逻辑。Worker 同一 isolate 内只会初始化一次；如果 `schema_migrations` 已记录最新版本，会快速跳过完整 DDL/索引检查。SQLite 仍在启动时自动创建表、补齐缺失列和索引。当前记录：
 
 - `1 base_tables`
 - `2 structured_event_columns`
 - `3 sample_timestamps`
 - `4 daily_metrics`
+- `5 analytics_indexes`
 
-重复运行初始化是幂等的，不需要手动执行 SQL migration。
+重复运行初始化是幂等的。新 D1 部署建议优先执行 migration，避免首次请求承担完整 schema 初始化成本。
 
 ### 性能说明
 
-后端写入事件时会同步维护 `daily_metrics` 汇总表，维度包括 `date`、`clientId`、`mode`、`source` 和 `category`。当前 `/api/reports/analytics` 仍会读取时间范围内事件明细，因为 Top UP、重复推荐、位置效果和钻取仍依赖明细事件；当事件量继续增长时，可以优先把概览和趋势切到 `daily_metrics` 查询。
+后端写入事件时会同步维护 `daily_metrics` 汇总表，维度包括 `date`、`clientId`、`mode`、`source` 和 `category`。Cloudflare D1 部署会使用 storage-level bulk 写入减少 D1 往返；`/api/reports/summary` 和 `/api/reports/analytics` 有短 TTL 内存缓存，写入或清理后会失效。`/api/reports/analytics` 在无反馈筛选时会优先使用 `daily_metrics` 提供概要计数，UTC 趋势也会使用 `daily_metrics`；Top UP、重复推荐、位置效果和钻取仍依赖明细事件。
 
 ### 隐私说明
 
@@ -170,12 +171,22 @@ npx wrangler secret put SYNC_SECRET --config wrangler.local.toml
 
 这个密钥就是后台页面登录密钥，也是扩展端同步密钥。
 
-### 4. 部署代码
+`wrangler.local.toml.example` 已包含：
+
+```toml
+[placement]
+mode = "smart"
+```
+
+实际部署配置 `wrangler.local.toml` 也应保留该配置，让 Worker 根据 D1/后端访问模式自动优化运行位置。
+
+### 4. 应用 D1 migration 并部署代码
 
 在 `sync-backend/` 目录运行：
 
 ```bash
 npm install
+npm run migrate:remote
 npm run deploy
 ```
 
@@ -185,7 +196,7 @@ npm run deploy
 npx wrangler deploy --config wrangler.local.toml
 ```
 
-这样 D1 binding 会由本地 `wrangler.local.toml` 随部署一起提交，避免普通 `npx wrangler deploy` 用缺少 D1 的配置覆盖 Cloudflare 后台绑定。
+这样 D1 表/索引会先在远端创建，D1 binding 和 Smart Placement 配置会由本地 `wrangler.local.toml` 随部署一起提交，避免普通 `npx wrangler deploy` 用缺少 D1 的配置覆盖 Cloudflare 后台绑定。
 
 ### 5. 验证后台
 
@@ -193,7 +204,7 @@ npx wrangler deploy --config wrangler.local.toml
 2. 输入 `SYNC_SECRET` 登录。
 3. `/data` 能看到配置、批次和样本，`/analytics` 能看到分析页面即部署成功。
 
-D1 表和索引会在 Worker 首次访问时自动创建。旧 KV 数据不会自动迁移到 D1。
+D1 表和索引建议通过 migration 创建；Worker 首次访问时仍会兜底初始化。旧 KV 数据不会自动迁移到 D1。
 
 ### 6. 配置扩展
 

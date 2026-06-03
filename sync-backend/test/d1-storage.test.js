@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createApp } from '../src/router.js';
 import { D1Storage } from '../src/storage/d1.js';
+import worker from '../src/worker.js';
 
 let DatabaseSync = null;
 try {
@@ -13,9 +14,11 @@ try {
 class FakeD1 {
   constructor() {
     this.db = new DatabaseSync(':memory:');
+    this.preparedSql = [];
   }
 
   prepare(sql) {
+    this.preparedSql.push(sql);
     const db = this.db;
     return {
       args: [],
@@ -35,6 +38,30 @@ class FakeD1 {
       }
     };
   }
+}
+
+function schemaPrepareCount(fake) {
+  return fake.preparedSql.filter((sql) =>
+    /create table|create index|pragma table_info|schema_migrations/i.test(sql)
+  ).length;
+}
+
+function makeLargeBatches() {
+  return Array.from({ length: 50 }, (_, batchIndex) => ({
+    batchId: `d1-bulk-b${batchIndex}`,
+    clientId: 'c1',
+    capturedAt: '2026-06-01T00:00:00.000Z',
+    events: Array.from({ length: 40 }, (_, eventIndex) => ({
+      eventId: `d1-bulk-e${batchIndex}-${eventIndex}`,
+      id: `BV_D1_BULK_${batchIndex}_${eventIndex}`,
+      bvid: `BV_D1_BULK_${batchIndex}_${eventIndex}`,
+      title: `bulk ${batchIndex} ${eventIndex}`,
+      capturedAt: '2026-06-01T00:00:00.000Z',
+      mode: 'pure',
+      source: 'feed',
+      position: eventIndex + 1
+    }))
+  }));
 }
 
 test('D1 storage initializes schema and supports report APIs', { skip: DatabaseSync ? false : 'node:sqlite unavailable' }, async () => {
@@ -159,6 +186,12 @@ test('D1 storage initializes schema and supports report APIs', { skip: DatabaseS
   assert.equal(repeatedAnalytics.top.repeatedSamples[0].sampleId, 'BV1');
   assert.equal(repeatedAnalytics.feedback.some((row) => row.key === 'dislike' && row.count === 1), true);
 
+  fake.db.prepare('delete from daily_metrics').run();
+  const noDailyMetricsResponse = await app.fetch(new Request('http://local/api/reports/analytics?days=90&tzOffsetMinutes=0', { headers }));
+  const noDailyMetrics = await noDailyMetricsResponse.json();
+  assert.equal(noDailyMetrics.metrics.eventCount, 5);
+  assert.equal(noDailyMetrics.metrics.impressionCount, 2);
+
   const duplicateEventResponse = await app.fetch(new Request('http://local/api/reports', {
     method: 'POST',
     headers,
@@ -180,4 +213,53 @@ test('D1 storage initializes schema and supports report APIs', { skip: DatabaseS
   assert.equal(feedbackFiltered.metrics.eventCount, 1);
   assert.equal(feedbackFiltered.metrics.feedbackCount, 1);
   assert.equal(feedbackFiltered.metrics.impressionCount, 0);
+});
+
+test('Worker reuses D1 storage and does not rerun schema initialization per request', { skip: DatabaseSync ? false : 'node:sqlite unavailable' }, async () => {
+  const fake = new FakeD1();
+  const env = { TABULABILI_SYNC_DB: fake, SYNC_SECRET: 'secret' };
+  const headers = { authorization: 'Bearer secret', 'content-type': 'application/json' };
+
+  const health = await worker.fetch(new Request('http://local/api/health'), env);
+  assert.equal(health.status, 200);
+  assert.equal(schemaPrepareCount(fake), 0);
+
+  const write = await worker.fetch(new Request('http://local/api/reports', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      batchId: 'worker-cache-b1',
+      clientId: 'c1',
+      capturedAt: '2026-06-01T00:00:00.000Z',
+      events: [
+        { eventId: 'worker-cache-e1', id: 'BV_WORKER_CACHE', capturedAt: '2026-06-01T00:00:00.000Z' }
+      ]
+    })
+  }), env);
+  assert.equal(write.status, 200);
+  const afterWrite = schemaPrepareCount(fake);
+  assert.ok(afterWrite > 0);
+
+  const summary = await worker.fetch(new Request('http://local/api/reports/summary', { headers }), env);
+  assert.equal(summary.status, 200);
+  assert.equal(schemaPrepareCount(fake), afterWrite);
+});
+
+test('D1 bulk storage handles documented maximum payload idempotently', { skip: DatabaseSync ? false : 'node:sqlite unavailable' }, async () => {
+  const fake = new FakeD1();
+  const storage = new D1Storage(fake);
+  const batches = makeLargeBatches();
+
+  const saved = await storage.saveBulkReportBatches(batches);
+  assert.equal(saved.results.length, 50);
+  assert.equal(saved.duplicateBatchCount, 0);
+  assert.equal(saved.duplicateEventCount, 0);
+
+  const summary = await storage.getReportSummary();
+  assert.equal(summary.batchCount, 50);
+  assert.equal(summary.eventCount, 2000);
+
+  const duplicate = await storage.saveBulkReportBatches(batches);
+  assert.equal(duplicate.duplicateBatchCount, 50);
+  assert.equal(duplicate.duplicateEventCount, 2000);
 });

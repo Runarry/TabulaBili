@@ -534,19 +534,25 @@ function finalizeSqlFeedbackRows(rows) {
 function buildReportAnalyticsFromSqlRows({
   range,
   metricsRow,
+  dailyMetricsRow,
   repeatRow,
   trends,
   dimensions,
   top
 }) {
-  const impressionCount = toNumber(metricsRow && metricsRow.impressionCount);
-  const clickCount = toNumber(metricsRow && metricsRow.clickCount);
-  const feedbackCount = toNumber(metricsRow && metricsRow.feedbackCount);
-  const negativeFeedbackCount = toNumber(metricsRow && metricsRow.negativeFeedbackCount);
+  const eventCount = toNumber(metricsRow && metricsRow.eventCount);
+  const dailyEventCount = toNumber(dailyMetricsRow && dailyMetricsRow.eventCount);
+  const countRow = dailyMetricsRow && dailyEventCount === eventCount
+    ? dailyMetricsRow
+    : metricsRow;
+  const impressionCount = toNumber(countRow && countRow.impressionCount);
+  const clickCount = toNumber(countRow && countRow.clickCount);
+  const feedbackCount = toNumber(countRow && countRow.feedbackCount);
+  const negativeFeedbackCount = toNumber(countRow && countRow.negativeFeedbackCount);
   const repeatImpressionCount = toNumber(repeatRow && repeatRow.repeatImpressionCount);
   const metrics = {
     batchCount: toNumber(metricsRow && metricsRow.batchCount),
-    eventCount: toNumber(metricsRow && metricsRow.eventCount),
+    eventCount: toNumber(countRow && countRow.eventCount),
     sampleCount: toNumber(metricsRow && metricsRow.sampleCount),
     distinctSampleCount: toNumber(metricsRow && metricsRow.sampleCount),
     distinctUpCount: toNumber(metricsRow && metricsRow.distinctUpCount),

@@ -17,11 +17,14 @@ const syncStore = globalThis.TabulaBiliSync;
 const CONFIG_SYNC_ALARM = 'tabulabili-config-sync';
 const REPORT_SYNC_ALARM = 'tabulabili-report-sync';
 const CONFIG_SYNC_DEBOUNCE_MS = 1200;
+const REPORT_FLUSH_DEBOUNCE_MS = 1500;
 const REPORT_BULK_BATCH_LIMIT = 50;
 const REPORT_BULK_EVENT_LIMIT = 500;
 const ANALYSIS_UPDATE_DEBOUNCE_MS = 1000;
 
 let configSyncTimer = null;
+let reportFlushTimer = null;
+let reportFlushPromise = null;
 let applyingRemoteConfigUntil = 0;
 let reportQueueMigration = null;
 let syncClientIdCache = '';
@@ -444,7 +447,36 @@ async function deleteReportBatches(batches) {
   await syncStore.deleteReportBatches(batches.map((batch) => batch.batchId));
 }
 
+function queueReportFlush() {
+  if (reportFlushTimer) clearTimeout(reportFlushTimer);
+  reportFlushTimer = setTimeout(() => {
+    reportFlushTimer = null;
+    flushReportQueue(false).catch((error) => {
+      console.warn('[TabulaBili] Background report flush failed:', error);
+    });
+  }, REPORT_FLUSH_DEBOUNCE_MS);
+}
+
 async function flushReportQueue(force = false) {
+  if (force && reportFlushTimer) {
+    clearTimeout(reportFlushTimer);
+    reportFlushTimer = null;
+  }
+
+  if (reportFlushPromise) {
+    if (!force) return reportFlushPromise;
+    await reportFlushPromise.catch(() => null);
+    if (reportFlushPromise) return reportFlushPromise;
+  }
+
+  reportFlushPromise = flushReportQueueNow(force)
+    .finally(() => {
+      reportFlushPromise = null;
+    });
+  return reportFlushPromise;
+}
+
+async function flushReportQueueNow(force = false) {
   await ensureReportQueueMigrated();
   const connection = await getSyncConnection();
   const queuedBatches = await updateReportQueueStatus();
@@ -543,9 +575,7 @@ async function initializeSyncBackground() {
   syncConfigNow().catch((error) => {
     console.warn('[TabulaBili] Failed to initialize config sync:', error);
   });
-  flushReportQueue(false).catch((error) => {
-    console.warn('[TabulaBili] Failed to initialize report sync:', error);
-  });
+  queueReportFlush();
 }
 
 function updateSessionRules(options) {
@@ -757,9 +787,7 @@ if (extensionApi.alarms && extensionApi.alarms.onAlarm) {
       });
     }
     if (alarm.name === REPORT_SYNC_ALARM) {
-      flushReportQueue(false).catch((error) => {
-        console.warn('[TabulaBili] Scheduled report sync failed:', error);
-      });
+      queueReportFlush();
     }
   });
 }
@@ -941,7 +969,7 @@ extensionApi.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === 'queueReportSamples') {
     queueReportPayload(message.payload)
       .then((result) => {
-        flushReportQueue(false).catch(() => null);
+        queueReportFlush();
         sendResponse({ success: true, result });
       })
       .catch((error) => {

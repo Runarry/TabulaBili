@@ -41,6 +41,63 @@ function localDateSql(tzOffsetMinutes) {
   return `date(datetime(captured_at, '${sign}${offset} minutes'))`;
 }
 
+function canUseDailyMetrics(query) {
+  return !query.feedback;
+}
+
+function dailyMetricWhere(query) {
+  const where = ['date >= ?'];
+  const args = [query.sinceIso.slice(0, 10)];
+  const filters = [
+    ['clientId', 'client_id'],
+    ['mode', 'mode'],
+    ['source', 'source'],
+    ['category', 'category']
+  ];
+
+  for (const [key, column] of filters) {
+    if (!query[key]) continue;
+    where.push(`${column} = ?`);
+    args.push(query[key]);
+  }
+
+  return {
+    whereSql: `where ${where.join(' and ')}`,
+    args
+  };
+}
+
+function dailyMetricsQuery(whereSql, args) {
+  return {
+    sql: `
+      select
+        coalesce(sum(impressions), 0) as impressionCount,
+        coalesce(sum(clicks), 0) as clickCount,
+        coalesce(sum(feedbacks), 0) as feedbackCount,
+        coalesce(sum(negative_feedbacks), 0) as negativeFeedbackCount,
+        coalesce(sum(impressions + clicks + feedbacks), 0) as eventCount
+      from daily_metrics ${whereSql}
+    `,
+    args
+  };
+}
+
+function dailyTrendsQuery(whereSql, args) {
+  return {
+    sql: `
+      select date,
+        coalesce(sum(impressions), 0) as impressions,
+        coalesce(sum(clicks), 0) as clicks,
+        coalesce(sum(feedbacks), 0) as feedbacks,
+        coalesce(sum(negative_feedbacks), 0) as negativeFeedbacks
+      from daily_metrics ${whereSql}
+      group by date
+      order by date asc
+    `,
+    args
+  };
+}
+
 function dimensionQuery(keySql, whereSql, args) {
   return {
     sql: `
@@ -81,6 +138,7 @@ function sampleTopQuery(whereSql, args, options = {}) {
 function buildAnalyticsQuerySpecs(options = {}) {
   const query = normalizeAnalyticsOptions(options);
   const { whereSql, args } = getAnalyticsEventWhere(query);
+  const dailyWhere = canUseDailyMetrics(query) ? dailyMetricWhere(query) : null;
   const feedbackWhereSql = appendWhereCondition(whereSql, "event_kind = 'feedback'");
   const sampleWhereSql = appendWhereCondition(whereSql, "sample_id <> ''");
   const repeatedWhereSql = appendWhereCondition(sampleWhereSql, "event_kind = 'impression'");
@@ -89,6 +147,7 @@ function buildAnalyticsQuerySpecs(options = {}) {
 
   return {
     range: query,
+    dailyMetrics: dailyWhere ? dailyMetricsQuery(dailyWhere.whereSql, dailyWhere.args) : null,
     metrics: {
       sql: `
         select
@@ -129,6 +188,9 @@ function buildAnalyticsQuerySpecs(options = {}) {
       `,
       args
     },
+    dailyTrends: dailyWhere && !query.tzOffsetMinutes
+      ? dailyTrendsQuery(dailyWhere.whereSql, dailyWhere.args)
+      : null,
     dimensions: {
       modes: dimensionQuery("coalesce(nullif(mode, ''), 'unknown')", whereSql, args),
       sources: dimensionQuery("coalesce(nullif(source, ''), 'unknown')", whereSql, args),
@@ -166,8 +228,10 @@ function buildAnalyticsQuerySpecs(options = {}) {
 async function executeAnalyticsQueries(specs, runner) {
   const [
     metricsRow,
+    dailyMetricsRow,
     repeatRow,
     trends,
+    dailyTrends,
     modes,
     sources,
     categories,
@@ -178,8 +242,10 @@ async function executeAnalyticsQueries(specs, runner) {
     repeatedSamples
   ] = await Promise.all([
     runner.first(specs.metrics),
+    specs.dailyMetrics ? runner.first(specs.dailyMetrics) : null,
     runner.first(specs.repeat),
     runner.all(specs.trends),
+    specs.dailyTrends ? runner.all(specs.dailyTrends) : null,
     runner.all(specs.dimensions.modes),
     runner.all(specs.dimensions.sources),
     runner.all(specs.dimensions.categories),
@@ -189,12 +255,15 @@ async function executeAnalyticsQueries(specs, runner) {
     runner.all(specs.top.samples),
     runner.all(specs.top.repeatedSamples)
   ]);
+  const useDailyTrends = dailyTrends
+    && Number(dailyMetricsRow && dailyMetricsRow.eventCount || 0) === Number(metricsRow && metricsRow.eventCount || 0);
 
   return buildReportAnalyticsFromSqlRows({
     range: specs.range,
     metricsRow,
+    dailyMetricsRow,
     repeatRow,
-    trends,
+    trends: useDailyTrends ? dailyTrends : trends,
     dimensions: { modes, sources, categories, positions, feedback },
     top: { ups, samples, repeatedSamples }
   });

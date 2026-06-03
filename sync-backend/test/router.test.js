@@ -29,8 +29,30 @@ function makeBatch(batchId, eventId, extra = {}) {
   };
 }
 
+class CountingStorage extends MemoryStorage {
+  constructor() {
+    super();
+    this.summaryCalls = 0;
+    this.analyticsCalls = 0;
+  }
+
+  async getReportSummary() {
+    this.summaryCalls += 1;
+    return super.getReportSummary();
+  }
+
+  async getReportAnalytics(options = {}) {
+    this.analyticsCalls += 1;
+    return super.getReportAnalytics(options);
+  }
+}
+
 test('api routes require bearer secret', async () => {
   const app = createApp({ secret: 'secret', storage: new MemoryStorage() });
+  const health = await app.fetch(new Request('http://local/api/health'));
+  assert.equal(health.status, 200);
+  assert.equal((await health.json()).ok, true);
+
   const rejected = await app.fetch(new Request('http://local/api/config'));
   assert.equal(rejected.status, 401);
 
@@ -161,6 +183,32 @@ test('bulk report endpoint validates payload before saving', async () => {
   const summary = await summaryResponse.json();
   assert.equal(summary.batchCount, 0);
   assert.equal(summary.eventCount, 0);
+});
+
+test('report summary and analytics cache are invalidated after writes', async () => {
+  const storage = new CountingStorage();
+  const app = createApp({ secret: 'secret', storage });
+  const headers = { authorization: 'Bearer secret', 'content-type': 'application/json' };
+
+  await app.fetch(new Request('http://local/api/reports/summary', { headers }));
+  await app.fetch(new Request('http://local/api/reports/summary', { headers }));
+  assert.equal(storage.summaryCalls, 1);
+
+  await app.fetch(new Request('http://local/api/reports/analytics?days=90&tzOffsetMinutes=0', { headers }));
+  await app.fetch(new Request('http://local/api/reports/analytics?tzOffsetMinutes=0&days=90', { headers }));
+  assert.equal(storage.analyticsCalls, 1);
+
+  const response = await app.fetch(new Request('http://local/api/reports', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(makeBatch('cache-b1', 'cache-e1', { sampleId: 'BV_CACHE', title: 'cache' }))
+  }));
+  assert.equal(response.status, 200);
+
+  await app.fetch(new Request('http://local/api/reports/summary', { headers }));
+  await app.fetch(new Request('http://local/api/reports/analytics?days=90&tzOffsetMinutes=0', { headers }));
+  assert.equal(storage.summaryCalls, 2);
+  assert.equal(storage.analyticsCalls, 2);
 });
 
 test('bulk report endpoint accepts documented maximum payload size', async () => {

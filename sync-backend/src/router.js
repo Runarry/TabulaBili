@@ -4,6 +4,7 @@ import { normalizeReportPayload } from './report-aggregate.js';
 
 const MAX_BULK_REPORT_BATCHES = 50;
 const MAX_BULK_REPORT_EVENTS = 2000;
+const REPORT_CACHE_TTL_MS = 15 * 1000;
 
 function json(value, status = 200) {
   return new Response(JSON.stringify(value), {
@@ -140,6 +141,18 @@ async function saveReportBatch(storage, payload) {
 }
 
 async function saveBulkReportBatches(storage, payloads, eventCount) {
+  if (typeof storage.saveBulkReportBatches === 'function') {
+    const result = await storage.saveBulkReportBatches(payloads);
+    return {
+      ok: true,
+      batchCount: payloads.length,
+      eventCount,
+      duplicateBatchCount: Number(result.duplicateBatchCount || 0),
+      duplicateEventCount: Number(result.duplicateEventCount || 0),
+      results: result.results || []
+    };
+  }
+
   const results = [];
   let duplicateBatchCount = 0;
   let duplicateEventCount = 0;
@@ -164,11 +177,39 @@ async function saveBulkReportBatches(storage, payloads, eventCount) {
 function createApp(options) {
   const storage = options.storage;
   const secret = options.secret;
+  const reportCache = new Map();
   if (!storage) throw new Error('storage is required');
   if (!secret) throw new Error('SYNC_SECRET is required');
 
   async function requireAuth(request, url) {
     return getBearer(request, url) === secret;
+  }
+
+  function getReportCache(key) {
+    const cached = reportCache.get(key);
+    if (!cached || cached.expiresAt <= Date.now()) {
+      reportCache.delete(key);
+      return null;
+    }
+    return cached.value;
+  }
+
+  function setReportCache(key, value) {
+    reportCache.set(key, {
+      value,
+      expiresAt: Date.now() + REPORT_CACHE_TTL_MS
+    });
+    return value;
+  }
+
+  function invalidateReportCache() {
+    reportCache.clear();
+  }
+
+  function getAnalyticsCacheKey(url) {
+    const params = new URLSearchParams(url.searchParams);
+    params.sort();
+    return `analytics:${params.toString()}`;
   }
 
   return {
@@ -182,6 +223,9 @@ function createApp(options) {
         return text(adminPage('analytics'), 200, 'text/html; charset=utf-8');
       }
       if (!url.pathname.startsWith('/api/')) return json({ error: 'not_found' }, 404);
+      if (url.pathname === '/api/health' && request.method === 'GET') {
+        return json({ ok: true });
+      }
       if (!(await requireAuth(request, url))) return json({ error: 'unauthorized' }, 401);
 
       if (url.pathname === '/api/auth/check' && request.method === 'POST') {
@@ -205,17 +249,21 @@ function createApp(options) {
         const validated = validateReportPayload(await readJson(request));
         if (validated.error) return json({ error: validated.error }, 400);
         const result = await storage.saveReportBatch(validated.payload);
+        invalidateReportCache();
         return json({ ok: true, ...result });
       }
 
       if (url.pathname === '/api/reports/bulk' && request.method === 'POST') {
         const validated = validateBulkReportPayload(await readJson(request));
         if (validated.error) return json({ error: validated.error }, 400);
-        return json(await saveBulkReportBatches(storage, validated.payloads, validated.eventCount));
+        const result = await saveBulkReportBatches(storage, validated.payloads, validated.eventCount);
+        invalidateReportCache();
+        return json(result);
       }
 
       if (url.pathname === '/api/reports/summary' && request.method === 'GET') {
-        return json(await storage.getReportSummary());
+        const cacheKey = 'summary';
+        return json(getReportCache(cacheKey) || setReportCache(cacheKey, await storage.getReportSummary()));
       }
 
       if (url.pathname === '/api/reports/cleanup' && request.method === 'POST') {
@@ -223,7 +271,9 @@ function createApp(options) {
         const cleanupOptions = getCleanupOptions(await readJson(request));
         if (!isValidDate(cleanupOptions.before)) return json({ error: 'invalid_before' }, 400);
         cleanupOptions.before = new Date(cleanupOptions.before).toISOString();
-        return json(await storage.cleanupReports(cleanupOptions));
+        const result = await storage.cleanupReports(cleanupOptions);
+        if (!cleanupOptions.dryRun) invalidateReportCache();
+        return json(result);
       }
 
       if (url.pathname === '/api/reports/batches' && request.method === 'GET') {
@@ -251,7 +301,10 @@ function createApp(options) {
       }
 
       if (url.pathname === '/api/reports/analytics' && request.method === 'GET') {
-        return json(await storage.getReportAnalytics({
+        const cacheKey = getAnalyticsCacheKey(url);
+        const cached = getReportCache(cacheKey);
+        if (cached) return json(cached);
+        return json(setReportCache(cacheKey, await storage.getReportAnalytics({
           days: Number(url.searchParams.get('days') || 30),
           tzOffsetMinutes: Number(url.searchParams.get('tzOffsetMinutes') || 0),
           clientId: url.searchParams.get('clientId') || '',
@@ -259,7 +312,7 @@ function createApp(options) {
           source: url.searchParams.get('source') || '',
           category: url.searchParams.get('category') || '',
           feedback: url.searchParams.get('feedback') || ''
-        }));
+        })));
       }
 
       return json({ error: 'not_found' }, 404);

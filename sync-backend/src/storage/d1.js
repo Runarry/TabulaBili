@@ -13,6 +13,7 @@ import {
 import { buildAnalyticsQuerySpecs, executeAnalyticsQueries } from './sql-analytics.js';
 
 const MAX_D1_BATCH_STATEMENTS = 100;
+const LATEST_SCHEMA_VERSION = 5;
 
 async function allRows(statement) {
   const result = await statement.all();
@@ -27,14 +28,42 @@ function changesOf(result) {
   return Number(result && result.meta && result.meta.changes || 0);
 }
 
+function summarizeBulkResults(results) {
+  let duplicateBatchCount = 0;
+  let duplicateEventCount = 0;
+
+  for (const result of results) {
+    if (!result) continue;
+    if (result.duplicateBatch) duplicateBatchCount += 1;
+    duplicateEventCount += Number(result.duplicateEventCount || 0);
+  }
+
+  return { duplicateBatchCount, duplicateEventCount, results };
+}
+
 class D1Storage {
   constructor(db) {
     if (!db) throw new Error('TABULABILI_SYNC_DB D1 binding is required');
     this.db = db;
-    this.ready = this.ensureSchema();
+    this.schemaReady = null;
+  }
+
+  getReadDb() {
+    return this.db;
+  }
+
+  async hasCurrentSchema() {
+    try {
+      const row = await firstRow(this.db.prepare('select max(version) as version from schema_migrations'));
+      return Number(row && row.version || 0) >= LATEST_SCHEMA_VERSION;
+    } catch {
+      return false;
+    }
   }
 
   async ensureSchema() {
+    if (await this.hasCurrentSchema()) return;
+
     const baseStatements = [
       `create table if not exists config_store (
         id integer primary key check (id = 1),
@@ -160,6 +189,16 @@ class D1Storage {
     ]);
   }
 
+  ensureReady() {
+    if (!this.schemaReady) {
+      this.schemaReady = this.ensureSchema().catch((error) => {
+        this.schemaReady = null;
+        throw error;
+      });
+    }
+    return this.schemaReady;
+  }
+
   async ensureColumns(columns) {
     for (const [table, column, definition] of columns) {
       await this.ensureColumn(table, column, definition);
@@ -184,13 +223,16 @@ class D1Storage {
   }
 
   async getConfig() {
-    await this.ready;
-    const row = await firstRow(this.db.prepare('select json from config_store where id = 1'));
-    return row ? JSON.parse(row.json) : null;
+    try {
+      const row = await firstRow(this.db.prepare('select json from config_store where id = 1'));
+      return row ? JSON.parse(row.json) : null;
+    } catch {
+      return null;
+    }
   }
 
   async saveConfig(config) {
-    await this.ready;
+    await this.ensureReady();
     await this.db.prepare(`
       insert into config_store (id, json) values (1, ?)
       on conflict(id) do update set json = excluded.json
@@ -229,6 +271,36 @@ class D1Storage {
       }
     }
     return aggregates;
+  }
+
+  async getExistingBatches(batchIds) {
+    const ids = [...new Set(batchIds.filter(Boolean))];
+    const batches = new Map();
+    for (let index = 0; index < ids.length; index += 50) {
+      const chunk = ids.slice(index, index + 50);
+      const placeholders = chunk.map(() => '?').join(', ');
+      const rows = await allRows(this.db.prepare(`
+        select batch_id as batchId, event_count as eventCount, duplicate_event_count as duplicateEventCount
+        from batches
+        where batch_id in (${placeholders})
+      `).bind(...chunk));
+      for (const row of rows) {
+        batches.set(row.batchId, row);
+      }
+    }
+    return batches;
+  }
+
+  createInsertBatchStatement(batch, receivedAt) {
+    return this.db.prepare(`
+      insert or ignore into batches (batch_id, client_id, captured_at, received_at, event_count, duplicate_event_count, raw_json)
+      values (?, ?, ?, ?, ?, 0, ?)
+    `).bind(batch.batchId, batch.clientId, batch.capturedAt, receivedAt, batch.events.length, JSON.stringify(batch));
+  }
+
+  createUpdateBatchDuplicateStatement(batchId, duplicateEventCount) {
+    return this.db.prepare('update batches set duplicate_event_count = ? where batch_id = ?')
+      .bind(duplicateEventCount, batchId);
   }
 
   buildEventEntries(batch, receivedAt, existingAggregates) {
@@ -336,36 +408,84 @@ class D1Storage {
     );
   }
 
-  async saveReportBatch(batch) {
-    await this.ready;
-    const existing = await firstRow(this.db.prepare('select event_count as eventCount, duplicate_event_count as duplicateEventCount from batches where batch_id = ?').bind(batch.batchId));
-    if (existing) {
-      return {
-        duplicateBatch: true,
-        eventCount: existing.eventCount,
-        duplicateEventCount: existing.duplicateEventCount
-      };
+  async saveBulkReportBatches(batches) {
+    await this.ensureReady();
+    const payloads = Array.isArray(batches) ? batches : [];
+    const existingBatches = await this.getExistingBatches(payloads.map((batch) => batch.batchId));
+    const results = new Array(payloads.length);
+    const newBatchInfos = [];
+
+    for (let index = 0; index < payloads.length; index += 1) {
+      const batch = payloads[index];
+      const existing = existingBatches.get(batch.batchId);
+      if (existing) {
+        results[index] = {
+          batchId: batch.batchId,
+          duplicateBatch: true,
+          eventCount: Number(existing.eventCount || batch.events.length),
+          duplicateEventCount: Number(existing.eventCount || batch.events.length)
+        };
+        continue;
+      }
+
+      newBatchInfos.push({
+        index,
+        batch,
+        receivedAt: new Date().toISOString(),
+        duplicateEventCount: 0
+      });
     }
 
-    const receivedAt = new Date().toISOString();
-    await this.db.prepare(`
-      insert into batches (batch_id, client_id, captured_at, received_at, event_count, duplicate_event_count, raw_json)
-      values (?, ?, ?, ?, ?, 0, ?)
-    `).bind(batch.batchId, batch.clientId, batch.capturedAt, receivedAt, batch.events.length, JSON.stringify(batch)).run();
+    if (!newBatchInfos.length) return summarizeBulkResults(results);
 
-    const existingAggregates = await this.getSampleAggregates(batch.events.map(getSampleId));
-    const eventEntries = this.buildEventEntries(batch, receivedAt, existingAggregates);
-    const insertEventStatements = eventEntries.map(({ eventRow }) => this.createInsertEventStatement(eventRow));
-    const insertResults = await this.runStatements(insertEventStatements);
+    const insertBatchResults = await this.runStatements(newBatchInfos.map((info) =>
+      this.createInsertBatchStatement(info.batch, info.receivedAt)));
+    const activeBatchInfos = [];
+
+    for (let index = 0; index < newBatchInfos.length; index += 1) {
+      const info = newBatchInfos[index];
+      if (changesOf(insertBatchResults[index]) === 0) {
+        results[info.index] = {
+          batchId: info.batch.batchId,
+          duplicateBatch: true,
+          eventCount: info.batch.events.length,
+          duplicateEventCount: info.batch.events.length
+        };
+        continue;
+      }
+      activeBatchInfos.push(info);
+    }
+
+    if (!activeBatchInfos.length) return summarizeBulkResults(results);
+
+    const existingAggregates = await this.getSampleAggregates(
+      activeBatchInfos.flatMap((info) => info.batch.events.map(getSampleId))
+    );
+    const previewAggregates = new Map(existingAggregates);
+    const eventEntries = [];
+
+    for (const info of activeBatchInfos) {
+      for (const event of info.batch.events) {
+        const sampleId = getSampleId(event);
+        const existingAggregate = sampleId ? (previewAggregates.get(sampleId) || null) : null;
+        const eventRow = toEventRow(event, info.batch, info.receivedAt, existingAggregate);
+        if (sampleId) previewAggregates.set(sampleId, mergeAggregate(existingAggregate, event));
+        eventEntries.push({ info, event, eventRow, sampleId });
+      }
+    }
+
+    const insertResults = await this.runStatements(
+      eventEntries.map(({ eventRow }) => this.createInsertEventStatement(eventRow))
+    );
     const currentAggregates = new Map(existingAggregates);
     const changedSampleIds = new Set();
+    const changedSampleReceivedAt = new Map();
     const dailyMetrics = new Map();
-    let duplicateEventCount = 0;
 
     for (let index = 0; index < eventEntries.length; index += 1) {
-      const { event, eventRow, sampleId } = eventEntries[index];
+      const { info, event, eventRow, sampleId } = eventEntries[index];
       if (changesOf(insertResults[index]) === 0) {
-        duplicateEventCount += 1;
+        info.duplicateEventCount += 1;
         continue;
       }
       addDailyMetricEvent(dailyMetrics, eventRow);
@@ -374,21 +494,37 @@ class D1Storage {
       const aggregate = mergeAggregate(currentAggregates.get(sampleId) || null, event);
       currentAggregates.set(sampleId, aggregate);
       changedSampleIds.add(sampleId);
+      changedSampleReceivedAt.set(sampleId, info.receivedAt);
     }
 
     const sampleStatements = [...changedSampleIds].map((sampleId) =>
-      this.createUpsertSampleStatement(sampleId, currentAggregates.get(sampleId), receivedAt));
+      this.createUpsertSampleStatement(sampleId, currentAggregates.get(sampleId), changedSampleReceivedAt.get(sampleId)));
     const metricStatements = [...dailyMetrics.values()].map((delta) =>
       this.createUpsertDailyMetricStatement(delta));
-    await this.runStatements([...sampleStatements, ...metricStatements]);
+    const batchUpdateStatements = activeBatchInfos.map((info) =>
+      this.createUpdateBatchDuplicateStatement(info.batch.batchId, info.duplicateEventCount));
+    await this.runStatements([...sampleStatements, ...metricStatements, ...batchUpdateStatements]);
 
-    await this.db.prepare('update batches set duplicate_event_count = ? where batch_id = ?').bind(duplicateEventCount, batch.batchId).run();
-    return { duplicateBatch: false, eventCount: batch.events.length, duplicateEventCount };
+    for (const info of activeBatchInfos) {
+      results[info.index] = {
+        batchId: info.batch.batchId,
+        duplicateBatch: false,
+        eventCount: info.batch.events.length,
+        duplicateEventCount: info.duplicateEventCount
+      };
+    }
+
+    return summarizeBulkResults(results);
+  }
+
+  async saveReportBatch(batch) {
+    const result = await this.saveBulkReportBatches([batch]);
+    return result.results[0];
   }
 
   async getReportSummary() {
-    await this.ready;
-    const row = await firstRow(this.db.prepare(`
+    const db = this.getReadDb();
+    const row = await firstRow(db.prepare(`
       select
         (select count(*) from batches) as batchCount,
         (select count(*) from events) as eventCount,
@@ -399,34 +535,34 @@ class D1Storage {
   }
 
   async listReportBatches(options = {}) {
-    await this.ready;
+    const db = this.getReadDb();
     const limit = normalizeLimit(options.limit, 200);
     const offset = normalizeOffset(options.offset);
-    const items = await allRows(this.db.prepare(`
+    const items = await allRows(db.prepare(`
       select batch_id as batchId, client_id as clientId, captured_at as capturedAt, received_at as receivedAt,
         event_count as eventCount, duplicate_event_count as duplicateEventCount
       from batches order by received_at desc limit ? offset ?
     `).bind(limit, offset));
-    const total = await firstRow(this.db.prepare('select count(*) as count from batches'));
+    const total = await firstRow(db.prepare('select count(*) as count from batches'));
     return { items, total: total.count };
   }
 
   async listReportSamples(options = {}) {
-    await this.ready;
+    const db = this.getReadDb();
     const query = normalizeSampleListOptions(options);
     const { whereSql, args } = getSampleWhere(query);
     const orderBy = getSampleOrderBy(query.sort);
-    const total = await firstRow(this.db.prepare(`select count(*) as count from samples ${whereSql}`).bind(...args));
-    const rows = await allRows(this.db.prepare(`select json from samples ${whereSql} order by ${orderBy} limit ? offset ?`).bind(...args, query.limit, query.offset));
+    const total = await firstRow(db.prepare(`select count(*) as count from samples ${whereSql}`).bind(...args));
+    const rows = await allRows(db.prepare(`select json from samples ${whereSql} order by ${orderBy} limit ? offset ?`).bind(...args, query.limit, query.offset));
     return { items: rows.map((row) => JSON.parse(row.json)), total: total.count };
   }
 
   async listReportEvents(options = {}) {
-    await this.ready;
+    const db = this.getReadDb();
     const query = normalizeEventListOptions(options);
     const { whereSql, args } = getReportEventWhere(query);
-    const total = await firstRow(this.db.prepare(`select count(*) as count from events ${whereSql}`).bind(...args));
-    const rows = await allRows(this.db.prepare(`
+    const total = await firstRow(db.prepare(`select count(*) as count from events ${whereSql}`).bind(...args));
+    const rows = await allRows(db.prepare(`
       select event_id as eventId, batch_id as batchId, client_id as clientId, sample_id as sampleId,
         captured_at as capturedAt, received_at as receivedAt, event_kind as eventKind, mode, source,
         category, feedback, position, bvid, up_name as upName, up_mid as upMid, raw_json as json
@@ -438,16 +574,16 @@ class D1Storage {
   }
 
   async getReportAnalytics(options = {}) {
-    await this.ready;
+    const db = this.getReadDb();
     const specs = buildAnalyticsQuerySpecs(options);
     return executeAnalyticsQueries(specs, {
-      first: ({ sql, args }) => firstRow(this.db.prepare(sql).bind(...args)),
-      all: ({ sql, args }) => allRows(this.db.prepare(sql).bind(...args))
+      first: ({ sql, args }) => firstRow(db.prepare(sql).bind(...args)),
+      all: ({ sql, args }) => allRows(db.prepare(sql).bind(...args))
     });
   }
 
   async cleanupReports(options = {}) {
-    await this.ready;
+    await this.ensureReady();
     const before = String(options.before || '');
     const dryRun = options.dryRun !== false;
     const matched = await this.getCleanupCounts(before);
