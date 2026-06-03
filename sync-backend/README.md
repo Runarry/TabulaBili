@@ -97,7 +97,7 @@ Content-Type: application/json
 
 ### Schema 迁移
 
-D1 推荐在部署前执行 `migrations/0001_schema.sql`，运行时仍保留兼容性的自动创建和补齐逻辑。Worker 同一 isolate 内只会初始化一次；如果 `schema_migrations` 已记录最新版本，会快速跳过完整 DDL/索引检查。SQLite 仍在启动时自动创建表、补齐缺失列和索引。当前记录：
+D1 推荐在部署前执行 `migrations/0001_schema.sql`。运行时仍保留兼容性的自动创建和补齐逻辑，但只在写入、配置保存和清理这些会修改数据的路径上触发；读接口在空库或未建表时会直接返回空结果，不承担建表成本。Worker 同一 isolate 内只会初始化一次；如果 `schema_migrations` 已记录最新版本，会快速跳过完整 DDL/索引检查。SQLite 仍在启动时自动创建表、补齐缺失列和索引。当前记录：
 
 - `1 base_tables`
 - `2 structured_event_columns`
@@ -105,7 +105,7 @@ D1 推荐在部署前执行 `migrations/0001_schema.sql`，运行时仍保留兼
 - `4 daily_metrics`
 - `5 analytics_indexes`
 
-重复运行初始化是幂等的。新 D1 部署建议优先执行 migration，避免首次请求承担完整 schema 初始化成本。
+重复运行初始化是幂等的。新 D1 部署建议优先执行 migration，避免首次写入请求承担完整 schema 初始化成本。
 
 ### 性能说明
 
@@ -204,7 +204,7 @@ npx wrangler deploy --config wrangler.local.toml
 2. 输入 `SYNC_SECRET` 登录。
 3. `/data` 能看到配置、批次和样本，`/analytics` 能看到分析页面即部署成功。
 
-D1 表和索引建议通过 migration 创建；Worker 首次访问时仍会兜底初始化。旧 KV 数据不会自动迁移到 D1。
+D1 表和索引建议通过 migration 创建。写入事件、保存配置和清理数据时 Worker 会兜底初始化；只读报表接口在空库或未建表时返回空数据，不会自动建表。旧 KV 数据不会自动迁移到 D1。
 
 ### 6. 配置扩展
 

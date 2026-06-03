@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createApp } from '../src/router.js';
 import { D1Storage } from '../src/storage/d1.js';
+import { buildAnalyticsQuerySpecs, executeAnalyticsQueries } from '../src/storage/sql-analytics.js';
 import worker from '../src/worker.js';
 
 let DatabaseSync = null;
@@ -215,6 +216,27 @@ test('D1 storage initializes schema and supports report APIs', { skip: DatabaseS
   assert.equal(feedbackFiltered.metrics.impressionCount, 0);
 });
 
+test('D1 config reads only treat a missing config table as empty', { skip: DatabaseSync ? false : 'node:sqlite unavailable' }, async () => {
+  const fake = new FakeD1();
+  const storage = new D1Storage(fake);
+
+  assert.equal(await storage.getConfig(), null);
+
+  await storage.ensureReady();
+  fake.db.prepare('insert into config_store (id, json) values (1, ?)').run('{bad json');
+  await assert.rejects(() => storage.getConfig(), SyntaxError);
+});
+
+test('D1 config reads rethrow non-schema D1 failures', async () => {
+  const storage = new D1Storage({
+    prepare() {
+      throw new Error('D1 unavailable');
+    }
+  });
+
+  await assert.rejects(() => storage.getConfig(), /D1 unavailable/);
+});
+
 test('Worker reuses D1 storage and does not rerun schema initialization per request', { skip: DatabaseSync ? false : 'node:sqlite unavailable' }, async () => {
   const fake = new FakeD1();
   const env = { TABULABILI_SYNC_DB: fake, SYNC_SECRET: 'secret' };
@@ -222,6 +244,28 @@ test('Worker reuses D1 storage and does not rerun schema initialization per requ
 
   const health = await worker.fetch(new Request('http://local/api/health'), env);
   assert.equal(health.status, 200);
+  assert.equal(schemaPrepareCount(fake), 0);
+
+  const emptySummaryResponse = await worker.fetch(new Request('http://local/api/reports/summary', { headers }), env);
+  assert.equal(emptySummaryResponse.status, 200);
+  assert.deepEqual(await emptySummaryResponse.json(), {
+    batchCount: 0,
+    eventCount: 0,
+    duplicateEventCount: 0,
+    sampleCount: 0
+  });
+  assert.equal(schemaPrepareCount(fake), 0);
+
+  const emptySamplesResponse = await worker.fetch(new Request('http://local/api/reports/samples', { headers }), env);
+  assert.equal(emptySamplesResponse.status, 200);
+  assert.deepEqual(await emptySamplesResponse.json(), { items: [], total: 0 });
+  assert.equal(schemaPrepareCount(fake), 0);
+
+  const emptyAnalyticsResponse = await worker.fetch(new Request('http://local/api/reports/analytics?days=90&tzOffsetMinutes=0', { headers }), env);
+  assert.equal(emptyAnalyticsResponse.status, 200);
+  const emptyAnalytics = await emptyAnalyticsResponse.json();
+  assert.equal(emptyAnalytics.metrics.eventCount, 0);
+  assert.deepEqual(emptyAnalytics.trends, []);
   assert.equal(schemaPrepareCount(fake), 0);
 
   const write = await worker.fetch(new Request('http://local/api/reports', {
@@ -262,4 +306,100 @@ test('D1 bulk storage handles documented maximum payload idempotently', { skip: 
   const duplicate = await storage.saveBulkReportBatches(batches);
   assert.equal(duplicate.duplicateBatchCount, 50);
   assert.equal(duplicate.duplicateEventCount, 2000);
+});
+
+test('analytics uses daily metrics trends when daily rollup is complete', async () => {
+  const specs = buildAnalyticsQuerySpecs({ days: 30, tzOffsetMinutes: 0 });
+  let eventTrendCalls = 0;
+  let dailyTrendCalls = 0;
+  const runner = {
+    async first(spec) {
+      if (spec === specs.metrics) {
+        return {
+          batchCount: 1,
+          eventCount: 2,
+          sampleCount: 1,
+          distinctUpCount: 1,
+          impressionCount: 1,
+          clickCount: 1,
+          feedbackCount: 0,
+          negativeFeedbackCount: 0
+        };
+      }
+      if (spec === specs.dailyMetrics) {
+        return {
+          eventCount: 2,
+          impressionCount: 1,
+          clickCount: 1,
+          feedbackCount: 0,
+          negativeFeedbackCount: 0
+        };
+      }
+      if (spec === specs.repeat) return { repeatSampleCount: 0, repeatImpressionCount: 0 };
+      return null;
+    },
+    async all(spec) {
+      if (spec === specs.trends) eventTrendCalls += 1;
+      if (spec === specs.dailyTrends) {
+        dailyTrendCalls += 1;
+        return [{ date: '2026-06-01', impressions: 1, clicks: 1, feedbacks: 0, negativeFeedbacks: 0 }];
+      }
+      return [];
+    }
+  };
+
+  const analytics = await executeAnalyticsQueries(specs, runner);
+  assert.equal(eventTrendCalls, 0);
+  assert.equal(dailyTrendCalls, 1);
+  assert.deepEqual(analytics.trends.map((row) => ({ date: row.date, impressions: row.impressions, clicks: row.clicks })), [
+    { date: '2026-06-01', impressions: 1, clicks: 1 }
+  ]);
+});
+
+test('analytics falls back to event trends when daily rollup is incomplete', async () => {
+  const specs = buildAnalyticsQuerySpecs({ days: 30, tzOffsetMinutes: 0 });
+  let eventTrendCalls = 0;
+  let dailyTrendCalls = 0;
+  const runner = {
+    async first(spec) {
+      if (spec === specs.metrics) {
+        return {
+          batchCount: 1,
+          eventCount: 2,
+          sampleCount: 1,
+          distinctUpCount: 1,
+          impressionCount: 1,
+          clickCount: 1,
+          feedbackCount: 0,
+          negativeFeedbackCount: 0
+        };
+      }
+      if (spec === specs.dailyMetrics) {
+        return {
+          eventCount: 1,
+          impressionCount: 1,
+          clickCount: 0,
+          feedbackCount: 0,
+          negativeFeedbackCount: 0
+        };
+      }
+      if (spec === specs.repeat) return { repeatSampleCount: 0, repeatImpressionCount: 0 };
+      return null;
+    },
+    async all(spec) {
+      if (spec === specs.trends) {
+        eventTrendCalls += 1;
+        return [{ date: '2026-06-01', impressions: 1, clicks: 1, feedbacks: 0, negativeFeedbacks: 0 }];
+      }
+      if (spec === specs.dailyTrends) dailyTrendCalls += 1;
+      return [];
+    }
+  };
+
+  const analytics = await executeAnalyticsQueries(specs, runner);
+  assert.equal(eventTrendCalls, 1);
+  assert.equal(dailyTrendCalls, 0);
+  assert.deepEqual(analytics.trends.map((row) => ({ date: row.date, impressions: row.impressions, clicks: row.clicks })), [
+    { date: '2026-06-01', impressions: 1, clicks: 1 }
+  ]);
 });

@@ -225,13 +225,49 @@ function buildAnalyticsQuerySpecs(options = {}) {
   };
 }
 
+function canIgnoreOptionalError(runner, error) {
+  return typeof runner.canIgnoreOptionalError === 'function'
+    && runner.canIgnoreOptionalError(error);
+}
+
+async function optionalFirst(spec, runner) {
+  if (!spec) return null;
+  try {
+    return await runner.first(spec);
+  } catch (error) {
+    if (canIgnoreOptionalError(runner, error)) return null;
+    throw error;
+  }
+}
+
+async function optionalAll(spec, runner) {
+  if (!spec) return null;
+  try {
+    return await runner.all(spec);
+  } catch (error) {
+    if (canIgnoreOptionalError(runner, error)) return null;
+    throw error;
+  }
+}
+
+function hasCompleteDailyMetrics(metricsRow, dailyMetricsRow) {
+  if (!dailyMetricsRow) return false;
+  return Number(dailyMetricsRow.eventCount || 0) === Number(metricsRow && metricsRow.eventCount || 0);
+}
+
 async function executeAnalyticsQueries(specs, runner) {
+  const [metricsRow, dailyMetricsRow] = await Promise.all([
+    runner.first(specs.metrics),
+    optionalFirst(specs.dailyMetrics, runner)
+  ]);
+  const useDailyTrends = specs.dailyTrends && hasCompleteDailyMetrics(metricsRow, dailyMetricsRow);
+  const trendsPromise = useDailyTrends
+    ? optionalAll(specs.dailyTrends, runner).then((rows) => rows || runner.all(specs.trends))
+    : runner.all(specs.trends);
+
   const [
-    metricsRow,
-    dailyMetricsRow,
     repeatRow,
     trends,
-    dailyTrends,
     modes,
     sources,
     categories,
@@ -241,11 +277,8 @@ async function executeAnalyticsQueries(specs, runner) {
     samples,
     repeatedSamples
   ] = await Promise.all([
-    runner.first(specs.metrics),
-    specs.dailyMetrics ? runner.first(specs.dailyMetrics) : null,
     runner.first(specs.repeat),
-    runner.all(specs.trends),
-    specs.dailyTrends ? runner.all(specs.dailyTrends) : null,
+    trendsPromise,
     runner.all(specs.dimensions.modes),
     runner.all(specs.dimensions.sources),
     runner.all(specs.dimensions.categories),
@@ -255,15 +288,13 @@ async function executeAnalyticsQueries(specs, runner) {
     runner.all(specs.top.samples),
     runner.all(specs.top.repeatedSamples)
   ]);
-  const useDailyTrends = dailyTrends
-    && Number(dailyMetricsRow && dailyMetricsRow.eventCount || 0) === Number(metricsRow && metricsRow.eventCount || 0);
 
   return buildReportAnalyticsFromSqlRows({
     range: specs.range,
     metricsRow,
     dailyMetricsRow,
     repeatRow,
-    trends: useDailyTrends ? dailyTrends : trends,
+    trends,
     dimensions: { modes, sources, categories, positions, feedback },
     top: { ups, samples, repeatedSamples }
   });

@@ -41,6 +41,12 @@ function summarizeBulkResults(results) {
   return { duplicateBatchCount, duplicateEventCount, results };
 }
 
+function isMissingTableError(error, tableNames = []) {
+  const message = String(error && error.message || error || '').toLowerCase();
+  if (!message.includes('no such table')) return false;
+  return !tableNames.length || tableNames.some((tableName) => message.includes(String(tableName).toLowerCase()));
+}
+
 class D1Storage {
   constructor(db) {
     if (!db) throw new Error('TABULABILI_SYNC_DB D1 binding is required');
@@ -226,7 +232,8 @@ class D1Storage {
     try {
       const row = await firstRow(this.db.prepare('select json from config_store where id = 1'));
       return row ? JSON.parse(row.json) : null;
-    } catch {
+    } catch (error) {
+      if (!isMissingTableError(error, ['config_store'])) throw error;
       return null;
     }
   }
@@ -524,27 +531,37 @@ class D1Storage {
 
   async getReportSummary() {
     const db = this.getReadDb();
-    const row = await firstRow(db.prepare(`
-      select
-        (select count(*) from batches) as batchCount,
-        (select count(*) from events) as eventCount,
-        (select coalesce(sum(duplicate_event_count), 0) from batches) as duplicateEventCount,
-        (select count(*) from samples) as sampleCount
-    `));
-    return row;
+    try {
+      const row = await firstRow(db.prepare(`
+        select
+          (select count(*) from batches) as batchCount,
+          (select count(*) from events) as eventCount,
+          (select coalesce(sum(duplicate_event_count), 0) from batches) as duplicateEventCount,
+          (select count(*) from samples) as sampleCount
+      `));
+      return row;
+    } catch (error) {
+      if (!isMissingTableError(error, ['batches', 'events', 'samples'])) throw error;
+      return { batchCount: 0, eventCount: 0, duplicateEventCount: 0, sampleCount: 0 };
+    }
   }
 
   async listReportBatches(options = {}) {
     const db = this.getReadDb();
     const limit = normalizeLimit(options.limit, 200);
     const offset = normalizeOffset(options.offset);
-    const items = await allRows(db.prepare(`
-      select batch_id as batchId, client_id as clientId, captured_at as capturedAt, received_at as receivedAt,
-        event_count as eventCount, duplicate_event_count as duplicateEventCount
-      from batches order by received_at desc limit ? offset ?
-    `).bind(limit, offset));
-    const total = await firstRow(db.prepare('select count(*) as count from batches'));
-    return { items, total: total.count };
+    try {
+      const items = await allRows(db.prepare(`
+        select batch_id as batchId, client_id as clientId, captured_at as capturedAt, received_at as receivedAt,
+          event_count as eventCount, duplicate_event_count as duplicateEventCount
+        from batches order by received_at desc limit ? offset ?
+      `).bind(limit, offset));
+      const total = await firstRow(db.prepare('select count(*) as count from batches'));
+      return { items, total: total.count };
+    } catch (error) {
+      if (!isMissingTableError(error, ['batches'])) throw error;
+      return { items: [], total: 0 };
+    }
   }
 
   async listReportSamples(options = {}) {
@@ -552,34 +569,54 @@ class D1Storage {
     const query = normalizeSampleListOptions(options);
     const { whereSql, args } = getSampleWhere(query);
     const orderBy = getSampleOrderBy(query.sort);
-    const total = await firstRow(db.prepare(`select count(*) as count from samples ${whereSql}`).bind(...args));
-    const rows = await allRows(db.prepare(`select json from samples ${whereSql} order by ${orderBy} limit ? offset ?`).bind(...args, query.limit, query.offset));
-    return { items: rows.map((row) => JSON.parse(row.json)), total: total.count };
+    try {
+      const total = await firstRow(db.prepare(`select count(*) as count from samples ${whereSql}`).bind(...args));
+      const rows = await allRows(db.prepare(`select json from samples ${whereSql} order by ${orderBy} limit ? offset ?`).bind(...args, query.limit, query.offset));
+      return { items: rows.map((row) => JSON.parse(row.json)), total: total.count };
+    } catch (error) {
+      if (!isMissingTableError(error, ['samples', 'events'])) throw error;
+      return { items: [], total: 0 };
+    }
   }
 
   async listReportEvents(options = {}) {
     const db = this.getReadDb();
     const query = normalizeEventListOptions(options);
     const { whereSql, args } = getReportEventWhere(query);
-    const total = await firstRow(db.prepare(`select count(*) as count from events ${whereSql}`).bind(...args));
-    const rows = await allRows(db.prepare(`
-      select event_id as eventId, batch_id as batchId, client_id as clientId, sample_id as sampleId,
-        captured_at as capturedAt, received_at as receivedAt, event_kind as eventKind, mode, source,
-        category, feedback, position, bvid, up_name as upName, up_mid as upMid, raw_json as json
-      from events ${whereSql}
-      order by captured_at desc
-      limit ? offset ?
-    `).bind(...args, query.limit, query.offset));
-    return { items: rows.map(normalizeStoredEvent), total: total.count };
+    try {
+      const total = await firstRow(db.prepare(`select count(*) as count from events ${whereSql}`).bind(...args));
+      const rows = await allRows(db.prepare(`
+        select event_id as eventId, batch_id as batchId, client_id as clientId, sample_id as sampleId,
+          captured_at as capturedAt, received_at as receivedAt, event_kind as eventKind, mode, source,
+          category, feedback, position, bvid, up_name as upName, up_mid as upMid, raw_json as json
+        from events ${whereSql}
+        order by captured_at desc
+        limit ? offset ?
+      `).bind(...args, query.limit, query.offset));
+      return { items: rows.map(normalizeStoredEvent), total: total.count };
+    } catch (error) {
+      if (!isMissingTableError(error, ['events'])) throw error;
+      return { items: [], total: 0 };
+    }
   }
 
   async getReportAnalytics(options = {}) {
     const db = this.getReadDb();
     const specs = buildAnalyticsQuerySpecs(options);
-    return executeAnalyticsQueries(specs, {
-      first: ({ sql, args }) => firstRow(db.prepare(sql).bind(...args)),
-      all: ({ sql, args }) => allRows(db.prepare(sql).bind(...args))
-    });
+    const emptyRunner = {
+      first: () => null,
+      all: () => []
+    };
+    try {
+      return await executeAnalyticsQueries(specs, {
+        first: ({ sql, args }) => firstRow(db.prepare(sql).bind(...args)),
+        all: ({ sql, args }) => allRows(db.prepare(sql).bind(...args)),
+        canIgnoreOptionalError: (error) => isMissingTableError(error, ['daily_metrics'])
+      });
+    } catch (error) {
+      if (!isMissingTableError(error, ['events'])) throw error;
+      return executeAnalyticsQueries(specs, emptyRunner);
+    }
   }
 
   async cleanupReports(options = {}) {

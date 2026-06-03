@@ -464,16 +464,20 @@ async function flushReportQueue(force = false) {
   }
 
   if (reportFlushPromise) {
-    if (!force) return reportFlushPromise;
-    await reportFlushPromise.catch(() => null);
-    if (reportFlushPromise) return reportFlushPromise;
+    const currentPromise = reportFlushPromise;
+    if (!force) return currentPromise;
+    await currentPromise.catch(() => null);
+    if (reportFlushPromise && reportFlushPromise !== currentPromise) return reportFlushPromise;
   }
 
-  reportFlushPromise = flushReportQueueNow(force)
-    .finally(() => {
+  const nextPromise = flushReportQueueNow(force);
+  const trackedPromise = nextPromise.finally(() => {
+    if (reportFlushPromise === trackedPromise) {
       reportFlushPromise = null;
-    });
-  return reportFlushPromise;
+    }
+  });
+  reportFlushPromise = trackedPromise;
+  return trackedPromise;
 }
 
 async function flushReportQueueNow(force = false) {
