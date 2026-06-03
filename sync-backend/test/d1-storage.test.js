@@ -90,7 +90,8 @@ test('D1 storage initializes schema and supports report APIs', { skip: DatabaseS
     { version: 1, name: 'base_tables' },
     { version: 2, name: 'structured_event_columns' },
     { version: 3, name: 'sample_timestamps' },
-    { version: 4, name: 'daily_metrics' }
+    { version: 4, name: 'daily_metrics' },
+    { version: 5, name: 'analytics_indexes' }
   ]);
 
   const dailyMetrics = fake.db.prepare(`
@@ -135,4 +136,48 @@ test('D1 storage initializes schema and supports report APIs', { skip: DatabaseS
   assert.equal(sample.first_seen_at, '2026-06-01T00:00:00.000Z');
   assert.equal(sample.last_clicked_at, '2026-06-01T00:01:00.000Z');
   assert.equal(sample.feedback_updated_at, '2026-06-01T00:02:00.000Z');
+
+  const repeatedResponse = await app.fetch(new Request('http://local/api/reports', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      batchId: 'b2',
+      clientId: 'c1',
+      capturedAt: '2026-06-01T00:03:00.000Z',
+      events: [
+        { eventId: 'e4', id: 'BV1', bvid: 'BV1', title: 'alpha', upName: 'up', upMid: '42', category: 'cat-a', capturedAt: '2026-06-01T00:03:00.000Z', mode: 'pure', source: 'feed', position: 3 },
+        { eventId: 'e5', id: 'BV1', bvid: 'BV1', eventKind: 'feedback', feedback: 'dislike', capturedAt: '2026-06-01T00:04:00.000Z', mode: 'pure', source: 'feed', category: 'cat-a' }
+      ]
+    })
+  }));
+  assert.equal(repeatedResponse.status, 200);
+
+  const repeatedAnalyticsResponse = await app.fetch(new Request('http://local/api/reports/analytics?days=90&mode=pure&source=feed&tzOffsetMinutes=0', { headers }));
+  const repeatedAnalytics = await repeatedAnalyticsResponse.json();
+  assert.equal(repeatedAnalytics.metrics.impressionCount, 2);
+  assert.equal(repeatedAnalytics.metrics.repeatImpressionCount, 1);
+  assert.equal(repeatedAnalytics.top.repeatedSamples[0].sampleId, 'BV1');
+  assert.equal(repeatedAnalytics.feedback.some((row) => row.key === 'dislike' && row.count === 1), true);
+
+  const duplicateEventResponse = await app.fetch(new Request('http://local/api/reports', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      batchId: 'b3',
+      clientId: 'c1',
+      capturedAt: '2026-06-01T00:05:00.000Z',
+      events: [
+        { eventId: 'e4', id: 'BV1', bvid: 'BV1', title: 'alpha', capturedAt: '2026-06-01T00:05:00.000Z', mode: 'pure', source: 'feed', position: 4 },
+        { eventId: 'e6', id: 'BV1', bvid: 'BV1', eventKind: 'click', capturedAt: '2026-06-01T00:06:00.000Z', mode: 'pure', source: 'feed', category: 'cat-a' }
+      ]
+    })
+  }));
+  const duplicateEvent = await duplicateEventResponse.json();
+  assert.equal(duplicateEvent.duplicateEventCount, 1);
+
+  const feedbackFilteredResponse = await app.fetch(new Request('http://local/api/reports/analytics?days=90&feedback=dislike&tzOffsetMinutes=0', { headers }));
+  const feedbackFiltered = await feedbackFilteredResponse.json();
+  assert.equal(feedbackFiltered.metrics.eventCount, 1);
+  assert.equal(feedbackFiltered.metrics.feedbackCount, 1);
+  assert.equal(feedbackFiltered.metrics.impressionCount, 0);
 });

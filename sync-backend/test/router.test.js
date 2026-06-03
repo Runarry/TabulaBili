@@ -163,6 +163,40 @@ test('bulk report endpoint validates payload before saving', async () => {
   assert.equal(summary.eventCount, 0);
 });
 
+test('bulk report endpoint accepts documented maximum payload size', async () => {
+  const storage = new MemoryStorage();
+  const app = createApp({ secret: 'secret', storage });
+  const headers = { authorization: 'Bearer secret', 'content-type': 'application/json' };
+  const batches = Array.from({ length: 50 }, (_, batchIndex) => ({
+    batchId: `max-b${batchIndex}`,
+    clientId: 'c1',
+    capturedAt: '2026-06-01T00:00:00.000Z',
+    events: Array.from({ length: 40 }, (_, eventIndex) => ({
+      eventId: `max-e${batchIndex}-${eventIndex}`,
+      id: `BV_MAX_${batchIndex}_${eventIndex}`,
+      capturedAt: '2026-06-01T00:00:00.000Z',
+      mode: 'pure',
+      source: 'feed',
+      position: eventIndex + 1
+    }))
+  }));
+
+  const response = await app.fetch(new Request('http://local/api/reports/bulk', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ batches })
+  }));
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.batchCount, 50);
+  assert.equal(body.eventCount, 2000);
+
+  const summaryResponse = await app.fetch(new Request('http://local/api/reports/summary', { headers }));
+  const summary = await summaryResponse.json();
+  assert.equal(summary.batchCount, 50);
+  assert.equal(summary.eventCount, 2000);
+});
+
 test('report cleanup supports dry run and actual deletion', async () => {
   const storage = new MemoryStorage();
   const app = createApp({ secret: 'secret', storage });

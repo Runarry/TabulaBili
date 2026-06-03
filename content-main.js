@@ -26,6 +26,7 @@ let cachedWbiMixinKeyTime = 0;
 let analysisEnabled = false;
 const responseAnalysisSources = new WeakMap();
 const responseItemAnalysisSources = new WeakMap();
+const responseFusionPools = new WeakMap();
 
 window.addEventListener('tabula_settings_config', (event) => {
   const detail = typeof event.detail === 'string' ? event.detail : '';
@@ -191,6 +192,10 @@ async function fetchFusionFeedResponse(args, requestUrl) {
     const mergedResponse = createJsonResponse(originBranch.response, originBranch.payload);
     responseAnalysisSources.set(mergedResponse, 'fusion');
     responseItemAnalysisSources.set(mergedResponse, buildItemAnalysisSourceMap(mergedItems));
+    responseFusionPools.set(mergedResponse, {
+      originItems: originBranch.items,
+      cleanItems: cleanBranch.items
+    });
     return mergedResponse;
   }
 
@@ -315,6 +320,16 @@ async function filterFeedResponse(response, originalArgs, originalUrl, currentMo
   const compiledRules = compiledBlockRules;
   if (!analysisEnabled && !compiledRules.length) return response;
 
+  if (!compiledRules.length) {
+    dispatchAnalysisSamplesAsync(response, {
+      currentMode,
+      source: getResponseAnalysisSource(response, currentMode),
+      sourceMap: responseItemAnalysisSources.get(response),
+      responseUrl: originalUrl
+    });
+    return response;
+  }
+
   let payload;
   try {
     payload = await response.clone().json();
@@ -325,20 +340,19 @@ async function filterFeedResponse(response, originalArgs, originalUrl, currentMo
   const items = getPayloadItems(payload);
   if (!items) return response;
 
-  if (!compiledRules.length) {
-    dispatchAnalysisSamples(items, {
-      currentMode,
-      source: getResponseAnalysisSource(response, currentMode),
-      sourceMap: responseItemAnalysisSources.get(response),
-      responseUrl: originalUrl
-    });
-    return response;
-  }
-
   const targetLength = items.length;
   const seenKeys = new Set();
   const initial = filterItems(items, compiledRules, seenKeys, targetLength);
   const filteredItems = initial.items;
+
+  if (initial.blocked > 0 && filteredItems.length < targetLength) {
+    refillFromFusionPools(response, {
+      output: filteredItems,
+      targetLength,
+      seenKeys,
+      compiledRules
+    });
+  }
 
   if (initial.blocked > 0 && filteredItems.length < targetLength) {
     try {
@@ -371,6 +385,25 @@ async function filterFeedResponse(response, originalArgs, originalUrl, currentMo
   return createJsonResponse(response, payload);
 }
 
+function dispatchAnalysisSamplesAsync(response, context) {
+  let clone;
+  try {
+    clone = response.clone();
+  } catch {
+    return;
+  }
+
+  Promise.resolve()
+    .then(() => clone.json())
+    .then((payload) => {
+      const items = getPayloadItems(payload);
+      if (items) dispatchAnalysisSamples(items, context);
+    })
+    .catch((error) => {
+      console.warn('[TabulaBili] Failed to capture async analysis samples:', error);
+    });
+}
+
 function filterItems(items, compiledRules, seenKeys, maxItems) {
   const output = [];
   let blocked = 0;
@@ -392,6 +425,35 @@ function filterItems(items, compiledRules, seenKeys, maxItems) {
   }
 
   return { items: output, blocked };
+}
+
+function refillFromFusionPools(response, options) {
+  const pools = responseFusionPools.get(response);
+  if (!pools) return;
+
+  const branches = [
+    { items: pools.cleanItems, source: 'clean' },
+    { items: pools.originItems, source: 'origin' }
+  ];
+
+  for (const branch of branches) {
+    const items = Array.isArray(branch.items) ? branch.items : [];
+    for (const item of items) {
+      if (options.output.length >= options.targetLength) return;
+      if (shouldBlockItem(item, options.compiledRules)) continue;
+
+      const key = getItemKey(item);
+      if (key) {
+        if (options.seenKeys.has(key)) continue;
+        options.seenKeys.add(key);
+      }
+
+      if (item && typeof item === 'object') {
+        item[ANALYSIS_SOURCE_SYMBOL] = branch.source;
+      }
+      options.output.push(item);
+    }
+  }
 }
 
 function shouldBlockItem(item, compiledRules) {
@@ -604,7 +666,8 @@ function getLocalDateKey(value) {
 }
 
 async function refillItems(options) {
-  for (let pageOffset = 1; pageOffset <= MAX_REFILL_PAGES; pageOffset += 1) {
+  const maxPages = options.currentMode === 'fusion' ? 1 : MAX_REFILL_PAGES;
+  for (let pageOffset = 1; pageOffset <= maxPages; pageOffset += 1) {
     if (options.output.length >= options.targetLength) return;
 
     const refillUrl = await buildSignedRefillUrl(options.originalUrl, pageOffset);

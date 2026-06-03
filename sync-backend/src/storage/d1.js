@@ -1,18 +1,18 @@
 import { getSampleId, mergeAggregate, toEventRow, toSampleRow } from '../report-aggregate.js';
 import {
-  buildReportAnalytics,
-  getAnalyticsEventWhere,
-  getDailyMetricDelta,
+  addDailyMetricEvent,
   getReportEventWhere,
   getSampleOrderBy,
   getSampleWhere,
-  normalizeAnalyticsOptions,
   normalizeEventListOptions,
   normalizeLimit,
   normalizeOffset,
   normalizeSampleListOptions,
   normalizeStoredEvent
 } from './helpers.js';
+import { buildAnalyticsQuerySpecs, executeAnalyticsQueries } from './sql-analytics.js';
+
+const MAX_D1_BATCH_STATEMENTS = 100;
 
 async function allRows(statement) {
   const result = await statement.all();
@@ -109,7 +109,11 @@ class D1Storage {
       'create index if not exists idx_d1_events_source_captured_at on events(source, captured_at)',
       'create index if not exists idx_d1_events_category_captured_at on events(category, captured_at)',
       'create index if not exists idx_d1_events_client_captured_at on events(client_id, captured_at)',
+      'create index if not exists idx_d1_events_feedback_captured_at on events(feedback, captured_at)',
       'create index if not exists idx_d1_events_sample_captured_at on events(sample_id, captured_at)',
+      'create index if not exists idx_d1_events_sample_kind_captured_at on events(sample_id, event_kind, captured_at)',
+      'create index if not exists idx_d1_events_up_mid_captured_at on events(up_mid, captured_at)',
+      'create index if not exists idx_d1_events_up_name_captured_at on events(up_name, captured_at)',
       'create index if not exists idx_d1_samples_last_seen_at on samples(last_seen_at desc)',
       'create index if not exists idx_d1_samples_first_seen_at on samples(first_seen_at)',
       'create index if not exists idx_d1_samples_up_mid on samples(up_mid)',
@@ -151,7 +155,8 @@ class D1Storage {
       [1, 'base_tables'],
       [2, 'structured_event_columns'],
       [3, 'sample_timestamps'],
-      [4, 'daily_metrics']
+      [4, 'daily_metrics'],
+      [5, 'analytics_indexes']
     ]);
   }
 
@@ -192,6 +197,145 @@ class D1Storage {
     `).bind(JSON.stringify(config)).run();
   }
 
+  async runStatements(statements) {
+    const results = [];
+    for (let index = 0; index < statements.length; index += MAX_D1_BATCH_STATEMENTS) {
+      const group = statements.slice(index, index + MAX_D1_BATCH_STATEMENTS);
+      if (!group.length) continue;
+      if (typeof this.db.batch === 'function') {
+        results.push(...await this.db.batch(group));
+      } else {
+        for (const statement of group) {
+          results.push(await statement.run());
+        }
+      }
+    }
+    return results;
+  }
+
+  async getSampleAggregates(sampleIds) {
+    const ids = [...new Set(sampleIds.filter(Boolean))];
+    const aggregates = new Map();
+    for (let index = 0; index < ids.length; index += 50) {
+      const chunk = ids.slice(index, index + 50);
+      const placeholders = chunk.map(() => '?').join(', ');
+      const rows = await allRows(this.db.prepare(`
+        select sample_id as sampleId, json
+        from samples
+        where sample_id in (${placeholders})
+      `).bind(...chunk));
+      for (const row of rows) {
+        aggregates.set(row.sampleId, JSON.parse(row.json));
+      }
+    }
+    return aggregates;
+  }
+
+  buildEventEntries(batch, receivedAt, existingAggregates) {
+    const previewAggregates = new Map(existingAggregates);
+    return batch.events.map((event) => {
+      const sampleId = getSampleId(event);
+      const existingAggregate = sampleId ? (previewAggregates.get(sampleId) || null) : null;
+      const eventRow = toEventRow(event, batch, receivedAt, existingAggregate);
+      if (sampleId) {
+        previewAggregates.set(sampleId, mergeAggregate(existingAggregate, event));
+      }
+      return { event, eventRow, sampleId };
+    });
+  }
+
+  createInsertEventStatement(eventRow) {
+    return this.db.prepare(`
+      insert or ignore into events (
+        event_id, batch_id, client_id, sample_id, captured_at, received_at,
+        event_kind, mode, source, category, feedback, position, bvid, up_name, up_mid, raw_json
+      )
+      values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      eventRow.eventId,
+      eventRow.batchId,
+      eventRow.clientId,
+      eventRow.sampleId,
+      eventRow.capturedAt,
+      eventRow.receivedAt,
+      eventRow.eventKind,
+      eventRow.mode,
+      eventRow.source,
+      eventRow.category,
+      eventRow.feedback,
+      eventRow.position,
+      eventRow.bvid,
+      eventRow.upName,
+      eventRow.upMid,
+      eventRow.rawJson
+    );
+  }
+
+  createUpsertSampleStatement(sampleId, aggregate, receivedAt) {
+    const row = toSampleRow(sampleId, aggregate, receivedAt);
+    return this.db.prepare(`
+      insert into samples (
+        sample_id, bvid, title, up_name, up_mid, category, first_seen_at, last_seen_at,
+        seen_count, click_count, feedback, last_clicked_at, feedback_updated_at, json
+      )
+      values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      on conflict(sample_id) do update set
+        bvid = excluded.bvid,
+        title = excluded.title,
+        up_name = excluded.up_name,
+        up_mid = excluded.up_mid,
+        category = excluded.category,
+        first_seen_at = excluded.first_seen_at,
+        last_seen_at = excluded.last_seen_at,
+        seen_count = excluded.seen_count,
+        click_count = excluded.click_count,
+        feedback = excluded.feedback,
+        last_clicked_at = excluded.last_clicked_at,
+        feedback_updated_at = excluded.feedback_updated_at,
+        json = excluded.json
+    `).bind(
+      row.sampleId,
+      row.bvid,
+      row.title,
+      row.upName,
+      row.upMid,
+      row.category,
+      row.firstSeenAt,
+      row.lastSeenAt,
+      row.seenCount,
+      row.clickCount,
+      row.feedback,
+      row.lastClickedAt,
+      row.feedbackUpdatedAt,
+      row.json
+    );
+  }
+
+  createUpsertDailyMetricStatement(delta) {
+    return this.db.prepare(`
+      insert into daily_metrics (
+        date, client_id, mode, source, category,
+        impressions, clicks, feedbacks, negative_feedbacks
+      )
+      values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      on conflict(date, client_id, mode, source, category) do update set
+        impressions = impressions + excluded.impressions,
+        clicks = clicks + excluded.clicks,
+        feedbacks = feedbacks + excluded.feedbacks,
+        negative_feedbacks = negative_feedbacks + excluded.negative_feedbacks
+    `).bind(
+      delta.date,
+      delta.clientId,
+      delta.mode,
+      delta.source,
+      delta.category,
+      delta.impressions,
+      delta.clicks,
+      delta.feedbacks,
+      delta.negativeFeedbacks
+    );
+  }
+
   async saveReportBatch(batch) {
     await this.ready;
     const existing = await firstRow(this.db.prepare('select event_count as eventCount, duplicate_event_count as duplicateEventCount from batches where batch_id = ?').bind(batch.batchId));
@@ -204,89 +348,39 @@ class D1Storage {
     }
 
     const receivedAt = new Date().toISOString();
-    let duplicateEventCount = 0;
     await this.db.prepare(`
       insert into batches (batch_id, client_id, captured_at, received_at, event_count, duplicate_event_count, raw_json)
       values (?, ?, ?, ?, ?, 0, ?)
     `).bind(batch.batchId, batch.clientId, batch.capturedAt, receivedAt, batch.events.length, JSON.stringify(batch)).run();
 
-    for (const event of batch.events) {
-      const sampleId = getSampleId(event);
-      const existingSample = sampleId
-        ? await firstRow(this.db.prepare('select json from samples where sample_id = ?').bind(sampleId))
-        : null;
-      const existingAggregate = existingSample ? JSON.parse(existingSample.json) : null;
-      const eventRow = toEventRow(event, batch, receivedAt, existingAggregate);
-      const inserted = await this.db.prepare(`
-        insert or ignore into events (
-          event_id, batch_id, client_id, sample_id, captured_at, received_at,
-          event_kind, mode, source, category, feedback, position, bvid, up_name, up_mid, raw_json
-        )
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).bind(
-        eventRow.eventId,
-        eventRow.batchId,
-        eventRow.clientId,
-        eventRow.sampleId,
-        eventRow.capturedAt,
-        eventRow.receivedAt,
-        eventRow.eventKind,
-        eventRow.mode,
-        eventRow.source,
-        eventRow.category,
-        eventRow.feedback,
-        eventRow.position,
-        eventRow.bvid,
-        eventRow.upName,
-        eventRow.upMid,
-        eventRow.rawJson
-      ).run();
-      if (changesOf(inserted) === 0) {
+    const existingAggregates = await this.getSampleAggregates(batch.events.map(getSampleId));
+    const eventEntries = this.buildEventEntries(batch, receivedAt, existingAggregates);
+    const insertEventStatements = eventEntries.map(({ eventRow }) => this.createInsertEventStatement(eventRow));
+    const insertResults = await this.runStatements(insertEventStatements);
+    const currentAggregates = new Map(existingAggregates);
+    const changedSampleIds = new Set();
+    const dailyMetrics = new Map();
+    let duplicateEventCount = 0;
+
+    for (let index = 0; index < eventEntries.length; index += 1) {
+      const { event, eventRow, sampleId } = eventEntries[index];
+      if (changesOf(insertResults[index]) === 0) {
         duplicateEventCount += 1;
         continue;
       }
-      await this.incrementDailyMetrics(eventRow);
+      addDailyMetricEvent(dailyMetrics, eventRow);
 
       if (!sampleId) continue;
-      const aggregate = mergeAggregate(existingAggregate, event);
-      const row = toSampleRow(sampleId, aggregate, receivedAt);
-      await this.db.prepare(`
-        insert into samples (
-          sample_id, bvid, title, up_name, up_mid, category, first_seen_at, last_seen_at,
-          seen_count, click_count, feedback, last_clicked_at, feedback_updated_at, json
-        )
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        on conflict(sample_id) do update set
-          bvid = excluded.bvid,
-          title = excluded.title,
-          up_name = excluded.up_name,
-          up_mid = excluded.up_mid,
-          category = excluded.category,
-          first_seen_at = excluded.first_seen_at,
-          last_seen_at = excluded.last_seen_at,
-          seen_count = excluded.seen_count,
-          click_count = excluded.click_count,
-          feedback = excluded.feedback,
-          last_clicked_at = excluded.last_clicked_at,
-          feedback_updated_at = excluded.feedback_updated_at,
-          json = excluded.json
-      `).bind(
-        row.sampleId,
-        row.bvid,
-        row.title,
-        row.upName,
-        row.upMid,
-        row.category,
-        row.firstSeenAt,
-        row.lastSeenAt,
-        row.seenCount,
-        row.clickCount,
-        row.feedback,
-        row.lastClickedAt,
-        row.feedbackUpdatedAt,
-        row.json
-      ).run();
+      const aggregate = mergeAggregate(currentAggregates.get(sampleId) || null, event);
+      currentAggregates.set(sampleId, aggregate);
+      changedSampleIds.add(sampleId);
     }
+
+    const sampleStatements = [...changedSampleIds].map((sampleId) =>
+      this.createUpsertSampleStatement(sampleId, currentAggregates.get(sampleId), receivedAt));
+    const metricStatements = [...dailyMetrics.values()].map((delta) =>
+      this.createUpsertDailyMetricStatement(delta));
+    await this.runStatements([...sampleStatements, ...metricStatements]);
 
     await this.db.prepare('update batches set duplicate_event_count = ? where batch_id = ?').bind(duplicateEventCount, batch.batchId).run();
     return { duplicateBatch: false, eventCount: batch.events.length, duplicateEventCount };
@@ -345,43 +439,11 @@ class D1Storage {
 
   async getReportAnalytics(options = {}) {
     await this.ready;
-    const query = normalizeAnalyticsOptions(options);
-    const { whereSql, args } = getAnalyticsEventWhere(query);
-    const events = await allRows(this.db.prepare(`
-      select event_id as eventId, batch_id as batchId, client_id as clientId, sample_id as sampleId,
-        captured_at as capturedAt, received_at as receivedAt, event_kind as eventKind, mode, source,
-        category, feedback, position, bvid, up_name as upName, up_mid as upMid, raw_json as json
-      from events ${whereSql}
-      order by captured_at asc
-    `).bind(...args));
-    return buildReportAnalytics({ events, range: query });
-  }
-
-  async incrementDailyMetrics(eventRow) {
-    const delta = getDailyMetricDelta(eventRow);
-    if (!delta) return;
-    await this.db.prepare(`
-      insert into daily_metrics (
-        date, client_id, mode, source, category,
-        impressions, clicks, feedbacks, negative_feedbacks
-      )
-      values (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      on conflict(date, client_id, mode, source, category) do update set
-        impressions = impressions + excluded.impressions,
-        clicks = clicks + excluded.clicks,
-        feedbacks = feedbacks + excluded.feedbacks,
-        negative_feedbacks = negative_feedbacks + excluded.negative_feedbacks
-    `).bind(
-      delta.date,
-      delta.clientId,
-      delta.mode,
-      delta.source,
-      delta.category,
-      delta.impressions,
-      delta.clicks,
-      delta.feedbacks,
-      delta.negativeFeedbacks
-    ).run();
+    const specs = buildAnalyticsQuerySpecs(options);
+    return executeAnalyticsQueries(specs, {
+      first: ({ sql, args }) => firstRow(this.db.prepare(sql).bind(...args)),
+      all: ({ sql, args }) => allRows(this.db.prepare(sql).bind(...args))
+    });
   }
 
   async cleanupReports(options = {}) {

@@ -18,11 +18,23 @@ const CONFIG_SYNC_ALARM = 'tabulabili-config-sync';
 const REPORT_SYNC_ALARM = 'tabulabili-report-sync';
 const CONFIG_SYNC_DEBOUNCE_MS = 1200;
 const REPORT_BULK_BATCH_LIMIT = 50;
-const REPORT_BULK_EVENT_LIMIT = 2000;
+const REPORT_BULK_EVENT_LIMIT = 500;
+const ANALYSIS_UPDATE_DEBOUNCE_MS = 1000;
 
 let configSyncTimer = null;
 let applyingRemoteConfigUntil = 0;
 let reportQueueMigration = null;
+let syncClientIdCache = '';
+let syncConnectionCache = null;
+let analysisSettingsCache = null;
+let analysisMigrationDone = false;
+let analysisMigration = null;
+let modeCache = 'pure';
+let fingerprintCache = '';
+let sessionRulesSignature = '';
+let disabledRulesetsSignature = '';
+let pendingAnalysisUpdate = null;
+let analysisUpdateTimer = null;
 
 function getLastRuntimeError() {
   return extensionApi.runtime.lastError
@@ -54,8 +66,22 @@ function storageSet(values) {
   });
 }
 
-async function notifyAnalysisUpdated(extra = {}) {
-  await storageSet({
+function mergePendingAnalysisUpdate(extra) {
+  const next = {
+    ...(pendingAnalysisUpdate || {}),
+    ...extra
+  };
+  if (pendingAnalysisUpdate && Number.isFinite(Number(pendingAnalysisUpdate.count)) && Number.isFinite(Number(extra.count))) {
+    next.count = Number(pendingAnalysisUpdate.count) + Number(extra.count);
+  }
+  pendingAnalysisUpdate = next;
+}
+
+function flushAnalysisUpdated() {
+  if (!pendingAnalysisUpdate) return Promise.resolve();
+  const extra = pendingAnalysisUpdate;
+  pendingAnalysisUpdate = null;
+  return storageSet({
     [analysisStore.UPDATED_AT_KEY]: {
       at: new Date().toISOString(),
       ...extra
@@ -63,38 +89,67 @@ async function notifyAnalysisUpdated(extra = {}) {
   });
 }
 
+async function notifyAnalysisUpdated(extra = {}) {
+  mergePendingAnalysisUpdate(extra);
+  if (analysisUpdateTimer) return;
+
+  analysisUpdateTimer = setTimeout(() => {
+    analysisUpdateTimer = null;
+    flushAnalysisUpdated().catch((error) => {
+      console.warn('[TabulaBili] Failed to notify analysis update:', error);
+    });
+  }, ANALYSIS_UPDATE_DEBOUNCE_MS);
+}
+
 async function getAnalysisSettingsState() {
+  if (analysisSettingsCache) return analysisSettingsCache;
+
   const result = await storageGet([
     'bili_analysis_enabled',
     analysisStore.SETTINGS_KEY
   ]);
-  return {
+  analysisSettingsCache = {
     enabled: result.bili_analysis_enabled === true,
     settings: analysisStore.normalizeSettings(result[analysisStore.SETTINGS_KEY])
   };
+  return analysisSettingsCache;
 }
 
 async function ensureAnalysisMigrated() {
-  const result = await storageGet([
-    analysisStore.INDEXEDDB_MIGRATED_KEY,
-    analysisStore.SAMPLES_KEY,
-    analysisStore.SETTINGS_KEY
-  ]);
-  if (result[analysisStore.INDEXEDDB_MIGRATED_KEY] === true) {
+  if (analysisMigrationDone) {
     return { migrated: false };
   }
+  if (analysisMigration) return analysisMigration;
 
-  const legacySamples = analysisStore.normalizeSamples(result[analysisStore.SAMPLES_KEY]);
-  const settings = analysisStore.normalizeSettings(result[analysisStore.SETTINGS_KEY]);
-  if (legacySamples.length) {
-    await analysisStore.replaceSamples(legacySamples, settings);
-  }
-  await storageSet({
-    [analysisStore.INDEXEDDB_MIGRATED_KEY]: true,
-    [analysisStore.SAMPLES_KEY]: []
+  analysisMigration = (async () => {
+    const result = await storageGet([
+      analysisStore.INDEXEDDB_MIGRATED_KEY,
+      analysisStore.SAMPLES_KEY,
+      analysisStore.SETTINGS_KEY
+    ]);
+    if (result[analysisStore.INDEXEDDB_MIGRATED_KEY] === true) {
+      analysisMigrationDone = true;
+      return { migrated: false };
+    }
+
+    const legacySamples = analysisStore.normalizeSamples(result[analysisStore.SAMPLES_KEY]);
+    const settings = analysisStore.normalizeSettings(result[analysisStore.SETTINGS_KEY]);
+    if (legacySamples.length) {
+      await analysisStore.replaceSamples(legacySamples, settings);
+    }
+    await storageSet({
+      [analysisStore.INDEXEDDB_MIGRATED_KEY]: true,
+      [analysisStore.SAMPLES_KEY]: []
+    });
+    analysisMigrationDone = true;
+    await notifyAnalysisUpdated({ reason: 'migrated', count: legacySamples.length });
+    return { migrated: true, count: legacySamples.length };
+  })().catch((error) => {
+    analysisMigration = null;
+    throw error;
   });
-  await notifyAnalysisUpdated({ reason: 'migrated', count: legacySamples.length });
-  return { migrated: true, count: legacySamples.length };
+
+  return analysisMigration;
 }
 
 function withReportKind(samples, eventKind) {
@@ -217,25 +272,31 @@ async function ensureReportQueueMigrated() {
 }
 
 async function ensureSyncClientId() {
+  if (syncClientIdCache) return syncClientIdCache;
+
   const result = await storageGet([syncStore.CLIENT_ID_KEY]);
   const clientId = syncStore.getStableClientId(result[syncStore.CLIENT_ID_KEY]);
   if (clientId !== result[syncStore.CLIENT_ID_KEY]) {
     await storageSet({ [syncStore.CLIENT_ID_KEY]: clientId });
   }
+  syncClientIdCache = clientId;
   return clientId;
 }
 
 async function getSyncConnection() {
+  if (syncConnectionCache) return { ...syncConnectionCache };
+
   const result = await storageGet([
     syncStore.ENDPOINT_KEY,
     syncStore.SECRET_KEY,
     syncStore.ENABLED_KEY
   ]);
-  return {
+  syncConnectionCache = {
     endpoint: syncStore.normalizeEndpoint(result[syncStore.ENDPOINT_KEY]),
     secret: typeof result[syncStore.SECRET_KEY] === 'string' ? result[syncStore.SECRET_KEY] : '',
     enabled: result[syncStore.ENABLED_KEY] === true
   };
+  return { ...syncConnectionCache };
 }
 
 async function syncFetch(path, options = {}, connection = null) {
@@ -380,9 +441,7 @@ async function postBulkReportBatches(batches, connection) {
 }
 
 async function deleteReportBatches(batches) {
-  for (const batch of batches) {
-    await syncStore.deleteReportBatch(batch.batchId);
-  }
+  await syncStore.deleteReportBatches(batches.map((batch) => batch.batchId));
 }
 
 async function flushReportQueue(force = false) {
@@ -534,25 +593,45 @@ function buildFeedRuleCondition(tabId = null, options = {}) {
   return condition;
 }
 
-async function buildCleanRequestHeaders(mode) {
-  const { bili_fingerprint: fingerprint = '' } = await storageGet(['bili_fingerprint']);
-  return mode === 'pure' || !fingerprint
+function buildCleanRequestHeaders(mode) {
+  return mode === 'pure' || !fingerprintCache
     ? [{ header: 'cookie', operation: 'remove' }]
-    : [{ header: 'cookie', operation: 'set', value: fingerprint }];
+    : [{ header: 'cookie', operation: 'set', value: fingerprintCache }];
+}
+
+function getHeaderSignature(mode) {
+  return mode === 'pure' || !fingerprintCache
+    ? 'remove-cookie'
+    : `set-cookie:${fingerprintCache}`;
+}
+
+async function applySessionRules(signature, options) {
+  if (sessionRulesSignature === signature) return;
+  await updateSessionRules(options);
+  sessionRulesSignature = signature;
+}
+
+async function disableStaticRuleset() {
+  const signature = 'rules-disabled';
+  if (disabledRulesetsSignature === signature) return;
+  await updateEnabledRulesets({ disableRulesetIds: ['rules'] });
+  disabledRulesetsSignature = signature;
 }
 
 async function compileDynamicNetworkRules(mode, tabId = null) {
   const ruleIdsToRemove = [GLOBAL_FEED_RULE_ID];
 
   if (mode === 'origin') {
-    await updateSessionRules({ removeRuleIds: ruleIdsToRemove });
+    await applySessionRules('origin:none', { removeRuleIds: [GLOBAL_FEED_RULE_ID, FUSION_FEED_RULE_ID] });
     return;
   }
 
-  const requestHeaders = await buildCleanRequestHeaders(mode);
+  const requestHeaders = buildCleanRequestHeaders(mode);
+  const tabSignature = Number.isInteger(tabId) ? String(tabId) : '*';
+  const signature = `dynamic:${mode}:${tabSignature}:${getHeaderSignature(mode)}`;
 
-  await updateSessionRules({
-    removeRuleIds: ruleIdsToRemove,
+  await applySessionRules(signature, {
+    removeRuleIds: [...ruleIdsToRemove, FUSION_FEED_RULE_ID],
     addRules: [
       {
         id: GLOBAL_FEED_RULE_ID,
@@ -568,9 +647,10 @@ async function compileDynamicNetworkRules(mode, tabId = null) {
 }
 
 async function compileFusionNetworkRule() {
-  const requestHeaders = await buildCleanRequestHeaders('fusion');
+  const requestHeaders = buildCleanRequestHeaders('fusion');
+  const signature = `fusion:${getHeaderSignature('fusion')}`;
 
-  await updateSessionRules({
+  await applySessionRules(signature, {
     removeRuleIds: [GLOBAL_FEED_RULE_ID, FUSION_FEED_RULE_ID],
     addRules: [
       {
@@ -587,26 +667,26 @@ async function compileFusionNetworkRule() {
 }
 
 async function syncGlobalModeConfiguration(mode) {
-  await updateEnabledRulesets({ disableRulesetIds: ['rules'] });
+  await disableStaticRuleset();
 
   if (mode === 'pure' || mode === 'refresh') {
-    await updateSessionRules({ removeRuleIds: [FUSION_FEED_RULE_ID] });
     await compileDynamicNetworkRules(mode);
     return;
   }
 
   if (mode === 'fusion') {
-    await updateSessionRules({ removeRuleIds: [GLOBAL_FEED_RULE_ID] });
     await compileFusionNetworkRule();
     return;
   }
 
-  await updateSessionRules({ removeRuleIds: [GLOBAL_FEED_RULE_ID, FUSION_FEED_RULE_ID] });
+  await applySessionRules('none', { removeRuleIds: [GLOBAL_FEED_RULE_ID, FUSION_FEED_RULE_ID] });
 }
 
 async function syncStoredModeConfiguration() {
-  const { bili_mode: storedMode } = await storageGet(['bili_mode']);
+  const { bili_mode: storedMode, bili_fingerprint: fingerprint = '' } = await storageGet(['bili_mode', 'bili_fingerprint']);
   const mode = storedMode || 'pure';
+  modeCache = mode;
+  fingerprintCache = typeof fingerprint === 'string' ? fingerprint : '';
 
   if (!storedMode) {
     await storageSet({ bili_mode: mode });
@@ -615,8 +695,36 @@ async function syncStoredModeConfiguration() {
   await syncGlobalModeConfiguration(mode);
 }
 
+function updateCachedStateFromChanges(changes) {
+  if (changes.bili_mode) {
+    modeCache = changes.bili_mode.newValue || 'pure';
+  }
+  if (changes.bili_fingerprint) {
+    fingerprintCache = typeof changes.bili_fingerprint.newValue === 'string'
+      ? changes.bili_fingerprint.newValue
+      : '';
+  }
+  if (
+    changes[syncStore.ENDPOINT_KEY]
+    || changes[syncStore.SECRET_KEY]
+    || changes[syncStore.ENABLED_KEY]
+  ) {
+    syncConnectionCache = null;
+  }
+  if (changes[syncStore.CLIENT_ID_KEY]) {
+    syncClientIdCache = '';
+  }
+  if (changes.bili_analysis_enabled || changes[analysisStore.SETTINGS_KEY]) {
+    analysisSettingsCache = null;
+  }
+  if (changes[analysisStore.INDEXEDDB_MIGRATED_KEY]) {
+    analysisMigrationDone = changes[analysisStore.INDEXEDDB_MIGRATED_KEY].newValue === true;
+  }
+}
+
 extensionApi.storage.onChanged.addListener((changes, areaName) => {
   if (areaName !== 'local' || (!changes.bili_mode && !changes.bili_fingerprint)) return;
+  updateCachedStateFromChanges(changes);
 
   syncStoredModeConfiguration().catch((error) => {
     console.warn('[TabulaBili] Failed to sync mode:', error);
@@ -658,6 +766,7 @@ if (extensionApi.alarms && extensionApi.alarms.onAlarm) {
 
 extensionApi.storage.onChanged.addListener((changes, areaName) => {
   if (areaName !== 'local') return;
+  updateCachedStateFromChanges(changes);
 
   if (changes[syncStore.REPORT_FREQUENCY_KEY]) {
     scheduleSyncAlarms().catch((error) => {
@@ -683,7 +792,7 @@ extensionApi.storage.onChanged.addListener((changes, areaName) => {
 const tabRequestCounters = {};
 
 async function evaluateMixedRequest(sender) {
-  const { bili_mode: mode = 'pure' } = await storageGet(['bili_mode']);
+  const mode = modeCache || 'pure';
 
   if (mode === 'pure') {
     await compileDynamicNetworkRules('pure');
@@ -691,7 +800,7 @@ async function evaluateMixedRequest(sender) {
   }
 
   if (mode === 'origin') {
-    await updateSessionRules({ removeRuleIds: [GLOBAL_FEED_RULE_ID, FUSION_FEED_RULE_ID] });
+    await applySessionRules('none', { removeRuleIds: [GLOBAL_FEED_RULE_ID, FUSION_FEED_RULE_ID] });
     return { active: false };
   }
 
@@ -703,7 +812,7 @@ async function evaluateMixedRequest(sender) {
     if (active) {
       await compileDynamicNetworkRules('mixed', tabId);
     } else {
-      await updateSessionRules({ removeRuleIds: [GLOBAL_FEED_RULE_ID] });
+      await applySessionRules(`mixed-origin:${tabId}`, { removeRuleIds: [GLOBAL_FEED_RULE_ID, FUSION_FEED_RULE_ID] });
     }
 
     return { active };
@@ -881,6 +990,10 @@ extensionApi.tabs.onRemoved.addListener((tabId) => {
   if (tabRequestCounters[tabId]) {
     delete tabRequestCounters[tabId];
   }
+});
+
+syncStoredModeConfiguration().catch((error) => {
+  console.warn('[TabulaBili] Failed to start mode background:', error);
 });
 
 initializeSyncBackground().catch((error) => {

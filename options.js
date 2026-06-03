@@ -488,6 +488,27 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
+  function renderAnalysisSummarySafely() {
+    renderAnalysisSummary().catch((error) => {
+      console.warn('[TabulaBili] Failed to render analysis summary:', error);
+      setAnalysisMessage('统计概览加载失败，请刷新后重试。', true);
+    });
+  }
+
+  function renderUpStatsSafely() {
+    renderUpStats().catch((error) => {
+      console.warn('[TabulaBili] Failed to render UP stats:', error);
+      setAnalysisMessage('UP 统计加载失败，请刷新后重试。', true);
+    });
+  }
+
+  function renderSampleStatsSafely() {
+    renderSampleStats().catch((error) => {
+      console.warn('[TabulaBili] Failed to render sample stats:', error);
+      setAnalysisMessage('样本统计加载失败，请刷新后重试。', true);
+    });
+  }
+
   async function renderAnalysisSummary() {
     const summary = await analysisStore.getSummary();
     analysisTotalSamples.textContent = String(summary.total);
@@ -836,47 +857,47 @@ document.addEventListener('DOMContentLoaded', async () => {
     analysisSampleState.q = analysisSearchInput.value.trim();
     analysisSampleState.page = 1;
     clearTimeout(analysisSampleSearchTimer);
-    analysisSampleSearchTimer = setTimeout(renderAnalysisSafely, 220);
+    analysisSampleSearchTimer = setTimeout(renderSampleStatsSafely, 220);
   });
   analysisFeedbackFilter.addEventListener('change', () => {
     analysisSampleState.feedback = analysisFeedbackFilter.value;
     analysisSampleState.page = 1;
-    renderAnalysisSafely();
+    renderSampleStatsSafely();
   });
   analysisPageSizeInput.addEventListener('change', () => {
     analysisSampleState.pageSize = Number(analysisPageSizeInput.value || 25);
     analysisSampleState.page = 1;
-    renderAnalysisSafely();
+    renderSampleStatsSafely();
   });
   analysisPrevPageBtn.addEventListener('click', () => {
     analysisSampleState.page = Math.max(1, analysisSampleState.page - 1);
-    renderAnalysisSafely();
+    renderSampleStatsSafely();
   });
   analysisNextPageBtn.addEventListener('click', () => {
     const totalPages = Math.max(1, Math.ceil(analysisSampleState.total / analysisSampleState.pageSize));
     analysisSampleState.page = Math.min(totalPages, analysisSampleState.page + 1);
-    renderAnalysisSafely();
+    renderSampleStatsSafely();
   });
 
   analysisUpSearchInput.addEventListener('input', () => {
     analysisUpState.q = analysisUpSearchInput.value.trim();
     analysisUpState.page = 1;
     clearTimeout(analysisUpSearchTimer);
-    analysisUpSearchTimer = setTimeout(renderAnalysisSafely, 220);
+    analysisUpSearchTimer = setTimeout(renderUpStatsSafely, 220);
   });
   analysisUpPageSizeInput.addEventListener('change', () => {
     analysisUpState.pageSize = Number(analysisUpPageSizeInput.value || 25);
     analysisUpState.page = 1;
-    renderAnalysisSafely();
+    renderUpStatsSafely();
   });
   analysisUpPrevBtn.addEventListener('click', () => {
     analysisUpState.page = Math.max(1, analysisUpState.page - 1);
-    renderAnalysisSafely();
+    renderUpStatsSafely();
   });
   analysisUpNextBtn.addEventListener('click', () => {
     const totalPages = Math.max(1, Math.ceil(analysisUpState.total / analysisUpState.pageSize));
     analysisUpState.page = Math.min(totalPages, analysisUpState.page + 1);
-    renderAnalysisSafely();
+    renderUpStatsSafely();
   });
 
   activateOptionsTab(getTabFromHash());
@@ -1100,6 +1121,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (areaName !== 'local') return;
 
     let shouldRenderAnalysis = false;
+    let shouldRenderAnalysisSummary = false;
     if (changes.bili_analysis_enabled) {
       analysisEnabled = changes.bili_analysis_enabled.newValue === true;
       shouldRenderAnalysis = true;
@@ -1109,12 +1131,19 @@ document.addEventListener('DOMContentLoaded', async () => {
       shouldRenderAnalysis = true;
     }
     if (changes[analysisStore.UPDATED_AT_KEY]) {
-      shouldRenderAnalysis = true;
+      const reason = changes[analysisStore.UPDATED_AT_KEY].newValue
+        && changes[analysisStore.UPDATED_AT_KEY].newValue.reason;
+      if (reason === 'capture') {
+        shouldRenderAnalysisSummary = true;
+      } else {
+        shouldRenderAnalysis = true;
+      }
     }
 
     if (shouldRenderAnalysis) renderAnalysis().catch((error) => {
       console.warn('[TabulaBili] Failed to render analysis data:', error);
     });
+    else if (shouldRenderAnalysisSummary) renderAnalysisSummarySafely();
 
     let shouldRenderSync = false;
     if (changes[syncStore.ENDPOINT_KEY]) {

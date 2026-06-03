@@ -9,6 +9,7 @@ const ANALYTICS_FILTERS = [
 ];
 
 const NEGATIVE_FEEDBACK = new Set(['dislike', 'blocked']);
+const TOP_ANALYTICS_LIMIT = 20;
 
 const SAMPLE_SORTS = new Set([
   'lastSeenAt',
@@ -409,6 +410,189 @@ function getDailyMetricDelta(event) {
   };
 }
 
+function getDailyMetricKey(delta) {
+  return [
+    delta.date,
+    delta.clientId,
+    delta.mode,
+    delta.source,
+    delta.category
+  ].join('\u0001');
+}
+
+function addDailyMetricDelta(bucket, delta) {
+  bucket.impressions += delta.impressions;
+  bucket.clicks += delta.clicks;
+  bucket.feedbacks += delta.feedbacks;
+  bucket.negativeFeedbacks += delta.negativeFeedbacks;
+}
+
+function addDailyMetricEvent(map, event) {
+  const delta = getDailyMetricDelta(event);
+  if (!delta) return;
+  const key = getDailyMetricKey(delta);
+  if (!map.has(key)) {
+    map.set(key, {
+      date: delta.date,
+      clientId: delta.clientId,
+      mode: delta.mode,
+      source: delta.source,
+      category: delta.category,
+      impressions: 0,
+      clicks: 0,
+      feedbacks: 0,
+      negativeFeedbacks: 0
+    });
+  }
+  addDailyMetricDelta(map.get(key), delta);
+}
+
+function toNumber(value) {
+  const number = Number(value || 0);
+  return Number.isFinite(number) ? number : 0;
+}
+
+function finalizeSqlMetricRow(row = {}) {
+  const impressions = toNumber(row.impressions);
+  const clicks = toNumber(row.clicks);
+  const feedbacks = toNumber(row.feedbacks);
+  const negativeFeedbacks = toNumber(row.negativeFeedbacks);
+  const positionCount = toNumber(row.positionCount);
+
+  return {
+    key: String(row.key || 'unknown'),
+    impressions,
+    clicks,
+    feedbacks,
+    negativeFeedbacks,
+    sampleCount: toNumber(row.sampleCount),
+    ctr: ratio(clicks, impressions),
+    feedbackRate: ratio(feedbacks, impressions),
+    negativeFeedbackRate: ratio(negativeFeedbacks, impressions),
+    avgPosition: ratio(toNumber(row.positionSum), positionCount),
+    count: impressions
+  };
+}
+
+function finalizeSqlTrendRow(row = {}) {
+  const impressions = toNumber(row.impressions);
+  const clicks = toNumber(row.clicks);
+  const feedbacks = toNumber(row.feedbacks);
+  const negativeFeedbacks = toNumber(row.negativeFeedbacks);
+
+  return {
+    date: String(row.date || ''),
+    impressions,
+    clicks,
+    feedbacks,
+    negativeFeedbacks,
+    ctr: ratio(clicks, impressions),
+    feedbackRate: ratio(feedbacks, impressions),
+    negativeFeedbackRate: ratio(negativeFeedbacks, impressions)
+  };
+}
+
+function finalizeSqlTopUpRow(row = {}) {
+  const metric = finalizeSqlMetricRow(row);
+  return {
+    ...metric,
+    upName: String(row.upName || metric.key),
+    seenCount: metric.impressions,
+    clickCount: metric.clicks,
+    feedbackCount: metric.feedbacks,
+    negativeFeedbackCount: metric.negativeFeedbacks
+  };
+}
+
+function finalizeSqlTopSampleRow(row = {}) {
+  const metric = finalizeSqlMetricRow(row);
+  const repeatImpressionCount = Math.max(0, metric.impressions - 1);
+
+  return {
+    ...metric,
+    sampleId: String(row.sampleId || row.key || ''),
+    bvid: String(row.bvid || ''),
+    title: String(row.title || ''),
+    upName: String(row.upName || ''),
+    upMid: String(row.upMid || ''),
+    category: String(row.category || ''),
+    seenCount: metric.impressions,
+    clickCount: metric.clicks,
+    feedbackCount: metric.feedbacks,
+    negativeFeedbackCount: metric.negativeFeedbacks,
+    repeatImpressionCount
+  };
+}
+
+function finalizeSqlFeedbackRows(rows) {
+  return rows.map((row) => ({
+    key: String(row.key || 'unset'),
+    count: toNumber(row.count)
+  }));
+}
+
+function buildReportAnalyticsFromSqlRows({
+  range,
+  metricsRow,
+  repeatRow,
+  trends,
+  dimensions,
+  top
+}) {
+  const impressionCount = toNumber(metricsRow && metricsRow.impressionCount);
+  const clickCount = toNumber(metricsRow && metricsRow.clickCount);
+  const feedbackCount = toNumber(metricsRow && metricsRow.feedbackCount);
+  const negativeFeedbackCount = toNumber(metricsRow && metricsRow.negativeFeedbackCount);
+  const repeatImpressionCount = toNumber(repeatRow && repeatRow.repeatImpressionCount);
+  const metrics = {
+    batchCount: toNumber(metricsRow && metricsRow.batchCount),
+    eventCount: toNumber(metricsRow && metricsRow.eventCount),
+    sampleCount: toNumber(metricsRow && metricsRow.sampleCount),
+    distinctSampleCount: toNumber(metricsRow && metricsRow.sampleCount),
+    distinctUpCount: toNumber(metricsRow && metricsRow.distinctUpCount),
+    impressionCount,
+    clickCount,
+    feedbackCount,
+    negativeFeedbackCount,
+    ctr: ratio(clickCount, impressionCount),
+    feedbackRate: ratio(feedbackCount, impressionCount),
+    negativeFeedbackRate: ratio(negativeFeedbackCount, impressionCount),
+    repeatSampleCount: toNumber(repeatRow && repeatRow.repeatSampleCount),
+    repeatImpressionCount,
+    repeatImpressionRate: ratio(repeatImpressionCount, impressionCount)
+  };
+  const normalizedDimensions = {
+    modes: (dimensions.modes || []).map(finalizeSqlMetricRow),
+    sources: (dimensions.sources || []).map(finalizeSqlMetricRow),
+    categories: (dimensions.categories || []).map(finalizeSqlMetricRow),
+    positions: (dimensions.positions || []).map(finalizeSqlMetricRow),
+    feedback: finalizeSqlFeedbackRows(dimensions.feedback || [])
+  };
+  const normalizedTop = {
+    ups: (top.ups || []).map(finalizeSqlTopUpRow),
+    samples: (top.samples || []).map(finalizeSqlTopSampleRow),
+    repeatedSamples: (top.repeatedSamples || []).map(finalizeSqlTopSampleRow)
+  };
+
+  return {
+    range: {
+      days: range.days,
+      sinceIso: range.sinceIso,
+      tzOffsetMinutes: range.tzOffsetMinutes,
+      filters: range.filters
+    },
+    metrics,
+    trends: (trends || []).map(finalizeSqlTrendRow),
+    dimensions: normalizedDimensions,
+    top: normalizedTop,
+    topUps: normalizedTop.ups,
+    categories: normalizedDimensions.categories,
+    modes: normalizedDimensions.modes,
+    sources: normalizedDimensions.sources,
+    feedback: normalizedDimensions.feedback
+  };
+}
+
 function createMetricBucket(key) {
   return {
     key,
@@ -674,6 +858,9 @@ function buildReportAnalytics({ events, range }) {
 }
 
 export {
+  TOP_ANALYTICS_LIMIT,
+  addDailyMetricEvent,
+  buildReportAnalyticsFromSqlRows,
   buildReportAnalytics,
   eventMatchesReportEventOptions,
   eventMatchesAnalyticsOptions,

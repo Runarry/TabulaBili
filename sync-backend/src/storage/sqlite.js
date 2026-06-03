@@ -1,19 +1,17 @@
 import Database from 'better-sqlite3';
 import { getSampleId, mergeAggregate, toEventRow, toSampleRow } from '../report-aggregate.js';
 import {
-  buildReportAnalytics,
-  getAnalyticsEventWhere,
-  getDailyMetricDelta,
+  addDailyMetricEvent,
   getReportEventWhere,
   getSampleOrderBy,
   getSampleWhere,
-  normalizeAnalyticsOptions,
   normalizeEventListOptions,
   normalizeLimit,
   normalizeOffset,
   normalizeSampleListOptions,
   normalizeStoredEvent
 } from './helpers.js';
+import { buildAnalyticsQuerySpecs, executeAnalyticsQueries } from './sql-analytics.js';
 
 class SqliteStorage {
   constructor(filename) {
@@ -115,7 +113,11 @@ class SqliteStorage {
       create index if not exists idx_events_source_captured_at on events(source, captured_at);
       create index if not exists idx_events_category_captured_at on events(category, captured_at);
       create index if not exists idx_events_client_captured_at on events(client_id, captured_at);
+      create index if not exists idx_events_feedback_captured_at on events(feedback, captured_at);
       create index if not exists idx_events_sample_captured_at on events(sample_id, captured_at);
+      create index if not exists idx_events_sample_kind_captured_at on events(sample_id, event_kind, captured_at);
+      create index if not exists idx_events_up_mid_captured_at on events(up_mid, captured_at);
+      create index if not exists idx_events_up_name_captured_at on events(up_name, captured_at);
       create index if not exists idx_samples_last_seen_at on samples(last_seen_at desc);
       create index if not exists idx_samples_first_seen_at on samples(first_seen_at);
       create index if not exists idx_samples_up_mid on samples(up_mid);
@@ -129,7 +131,8 @@ class SqliteStorage {
       [1, 'base_tables'],
       [2, 'structured_event_columns'],
       [3, 'sample_timestamps'],
-      [4, 'daily_metrics']
+      [4, 'daily_metrics'],
+      [5, 'analytics_indexes']
     ]);
   }
 
@@ -223,6 +226,7 @@ class SqliteStorage {
           feedbacks = feedbacks + excluded.feedbacks,
           negative_feedbacks = negative_feedbacks + excluded.negative_feedbacks
       `);
+      const dailyMetrics = new Map();
 
       for (const event of batch.events) {
         const sampleId = getSampleId(event);
@@ -251,20 +255,7 @@ class SqliteStorage {
           duplicateEventCount += 1;
           continue;
         }
-        const delta = getDailyMetricDelta(eventRow);
-        if (delta) {
-          upsertDailyMetric.run(
-            delta.date,
-            delta.clientId,
-            delta.mode,
-            delta.source,
-            delta.category,
-            delta.impressions,
-            delta.clicks,
-            delta.feedbacks,
-            delta.negativeFeedbacks
-          );
-        }
+        addDailyMetricEvent(dailyMetrics, eventRow);
 
         if (!sampleId) continue;
         const aggregate = mergeAggregate(existingAggregate, event);
@@ -284,6 +275,20 @@ class SqliteStorage {
           row.lastClickedAt,
           row.feedbackUpdatedAt,
           row.json
+        );
+      }
+
+      for (const delta of dailyMetrics.values()) {
+        upsertDailyMetric.run(
+          delta.date,
+          delta.clientId,
+          delta.mode,
+          delta.source,
+          delta.category,
+          delta.impressions,
+          delta.clicks,
+          delta.feedbacks,
+          delta.negativeFeedbacks
         );
       }
 
@@ -343,16 +348,11 @@ class SqliteStorage {
   }
 
   async getReportAnalytics(options = {}) {
-    const query = normalizeAnalyticsOptions(options);
-    const { whereSql, args } = getAnalyticsEventWhere(query);
-    const events = this.db.prepare(`
-      select event_id as eventId, batch_id as batchId, client_id as clientId, sample_id as sampleId,
-        captured_at as capturedAt, received_at as receivedAt, event_kind as eventKind, mode, source,
-        category, feedback, position, bvid, up_name as upName, up_mid as upMid, raw_json as json
-      from events ${whereSql}
-      order by captured_at asc
-    `).all(...args);
-    return buildReportAnalytics({ events, range: query });
+    const specs = buildAnalyticsQuerySpecs(options);
+    return executeAnalyticsQueries(specs, {
+      first: ({ sql, args }) => this.db.prepare(sql).get(...args),
+      all: ({ sql, args }) => this.db.prepare(sql).all(...args)
+    });
   }
 
   async cleanupReports(options = {}) {

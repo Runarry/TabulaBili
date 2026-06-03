@@ -331,6 +331,22 @@ globalThis.TabulaBiliSync = (() => {
     return { deleted: true };
   }
 
+  async function deleteReportBatches(batchIds) {
+    const ids = (Array.isArray(batchIds) ? batchIds : [])
+      .map((batchId) => String(batchId || ''))
+      .filter(Boolean);
+    if (!ids.length) return { deleted: 0 };
+
+    const db = await openDb();
+    const tx = db.transaction([REPORT_QUEUE_STORE], 'readwrite');
+    const store = tx.objectStore(REPORT_QUEUE_STORE);
+    for (const batchId of ids) {
+      store.delete(batchId);
+    }
+    await transactionDone(tx);
+    return { deleted: ids.length };
+  }
+
   function deleteOldestQueuedBatches(store, count) {
     if (count <= 0) return Promise.resolve(0);
 
@@ -417,6 +433,7 @@ globalThis.TabulaBiliSync = (() => {
     buildConfigEnvelope,
     buildReportBatch,
     deleteReportBatch,
+    deleteReportBatches,
     enqueueReportBatch,
     getReportQueueCount,
     getStableClientId,
