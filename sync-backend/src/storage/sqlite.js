@@ -317,22 +317,30 @@ class SqliteStorage {
   async listReportBatches(options = {}) {
     const limit = normalizeLimit(options.limit, 200);
     const offset = normalizeOffset(options.offset);
+    const includeTotal = options.includeTotal !== false;
+    const fetchLimit = limit + (includeTotal ? 0 : 1);
     const rows = this.db.prepare(`
       select batch_id as batchId, client_id as clientId, captured_at as capturedAt, received_at as receivedAt,
         event_count as eventCount, duplicate_event_count as duplicateEventCount
       from batches order by received_at desc limit ? offset ?
-    `).all(limit, offset);
+    `).all(fetchLimit, offset);
+    const items = rows.slice(0, limit);
+    if (!includeTotal) return { items, hasMore: rows.length > limit };
     const total = this.db.prepare('select count(*) as count from batches').get().count;
-    return { items: rows, total };
+    return { items, total };
   }
 
   async listReportSamples(options = {}) {
     const query = normalizeSampleListOptions(options);
+    const includeTotal = options.includeTotal !== false;
+    const fetchLimit = query.limit + (includeTotal ? 0 : 1);
     const { whereSql, args } = getSampleWhere(query);
     const orderBy = getSampleOrderBy(query.sort);
+    const rows = this.db.prepare(`select json from samples ${whereSql} order by ${orderBy} limit ? offset ?`).all(...args, fetchLimit, query.offset);
+    const items = rows.slice(0, query.limit).map((row) => JSON.parse(row.json));
+    if (!includeTotal) return { items, hasMore: rows.length > query.limit };
     const total = this.db.prepare(`select count(*) as count from samples ${whereSql}`).get(...args).count;
-    const rows = this.db.prepare(`select json from samples ${whereSql} order by ${orderBy} limit ? offset ?`).all(...args, query.limit, query.offset);
-    return { items: rows.map((row) => JSON.parse(row.json)), total };
+    return { items, total };
   }
 
   async listReportEvents(options = {}) {

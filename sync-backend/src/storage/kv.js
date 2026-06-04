@@ -95,21 +95,25 @@ class KvStorage {
   async listReportBatches(options = {}) {
     const limit = Math.min(200, Math.max(1, options.limit || 50));
     const offset = Math.max(0, options.offset || 0);
-    const ids = (await getJson(this.kv, INDEX_BATCHES, [])).slice(offset, offset + limit);
+    const includeTotal = options.includeTotal !== false;
+    const allIds = await getJson(this.kv, INDEX_BATCHES, []);
+    const ids = allIds.slice(offset, offset + limit + (includeTotal ? 0 : 1));
     const items = [];
-    for (const id of ids) {
+    for (const id of ids.slice(0, limit)) {
       const batch = await getJson(this.kv, `batch:${id}`, null);
       if (batch) {
         const { raw, ...summary } = batch;
         items.push(summary);
       }
     }
-    return { items, total: (await getJson(this.kv, INDEX_BATCHES, [])).length };
+    if (!includeTotal) return { items, hasMore: ids.length > limit };
+    return { items, total: allIds.length };
   }
 
   async listReportSamples(options = {}) {
     const limit = Math.min(10000, Math.max(1, options.limit || 50));
     const offset = Math.max(0, options.offset || 0);
+    const includeTotal = options.includeTotal !== false;
     const q = String(options.q || '').toLowerCase();
     const ids = await getJson(this.kv, INDEX_SAMPLES, []);
     const items = [];
@@ -118,8 +122,11 @@ class KvStorage {
       if (!sample) continue;
       if (q && ![sample.id, sample.bvid, sample.title, sample.upName].some((value) => String(value || '').toLowerCase().includes(q))) continue;
       items.push(sample);
+      if (!includeTotal && items.length > offset + limit) break;
     }
-    return { items: items.slice(offset, offset + limit), total: items.length };
+    const rows = items.slice(offset, offset + limit + (includeTotal ? 0 : 1));
+    if (!includeTotal) return { items: rows.slice(0, limit), hasMore: rows.length > limit };
+    return { items: rows, total: items.length };
   }
 }
 

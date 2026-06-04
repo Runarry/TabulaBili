@@ -32,14 +32,22 @@ function makeBatch(batchId, eventId, extra = {}) {
 class CountingStorage extends MemoryStorage {
   constructor() {
     super();
+    this.configCalls = 0;
     this.summaryCalls = 0;
     this.analyticsCalls = 0;
     this.saveConfigCalls = 0;
+    this.batchListCalls = [];
+    this.sampleListCalls = [];
   }
 
   async saveConfig(config) {
     this.saveConfigCalls += 1;
     return super.saveConfig(config);
+  }
+
+  async getConfig() {
+    this.configCalls += 1;
+    return super.getConfig();
   }
 
   async getReportSummary() {
@@ -50,6 +58,16 @@ class CountingStorage extends MemoryStorage {
   async getReportAnalytics(options = {}) {
     this.analyticsCalls += 1;
     return super.getReportAnalytics(options);
+  }
+
+  async listReportBatches(options = {}) {
+    this.batchListCalls.push(options);
+    return super.listReportBatches(options);
+  }
+
+  async listReportSamples(options = {}) {
+    this.sampleListCalls.push(options);
+    return super.listReportSamples(options);
   }
 }
 
@@ -144,12 +162,18 @@ test('admin routes render data and analytics pages', async () => {
   assert.equal(data.status, 200);
   const dataHtml = await data.text();
   assert.match(dataHtml, /聚合样本/);
+  assert.match(dataHtml, /查看配置/);
+  assert.match(dataHtml, /加载最近批次/);
+  assert.match(dataHtml, /加载聚合样本/);
+  assert.match(dataHtml, /return loadSummary\(\)/);
   assert.doesNotMatch(dataHtml, /auth=/);
 
   const analytics = await app.fetch(new Request('http://local/analytics'));
   assert.equal(analytics.status, 200);
   const analyticsHtml = await analytics.text();
   assert.match(analyticsHtml, /分析概览/);
+  assert.match(analyticsHtml, /生成分析/);
+  assert.match(analyticsHtml, /点击“生成分析”后读取实时分析数据/);
   assert.match(analyticsHtml, /维度对比/);
   assert.match(analyticsHtml, /重复推荐视频/);
   assert.doesNotMatch(analyticsHtml, /auth=/);
@@ -240,14 +264,62 @@ test('bulk report endpoint validates payload before saving', async () => {
   assert.equal(summary.eventCount, 0);
 });
 
-test('report summary and analytics cache are invalidated after writes', async () => {
+test('report list endpoints can skip totals for on-demand admin reads', async () => {
   const storage = new CountingStorage();
   const app = createApp({ secret: 'secret', storage });
   const headers = { authorization: 'Bearer secret', 'content-type': 'application/json' };
 
+  await app.fetch(new Request('http://local/api/reports/bulk', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      batches: [
+        makeBatch('skip-total-b1', 'skip-total-e1', { sampleId: 'BV_SKIP_1' }),
+        makeBatch('skip-total-b2', 'skip-total-e2', { sampleId: 'BV_SKIP_2' })
+      ]
+    })
+  }));
+
+  const batchesResponse = await app.fetch(new Request('http://local/api/reports/batches?limit=1&includeTotal=0', { headers }));
+  const batches = await batchesResponse.json();
+  assert.equal(batches.items.length, 1);
+  assert.equal(batches.hasMore, true);
+  assert.equal(Object.hasOwn(batches, 'total'), false);
+  assert.equal(storage.batchListCalls.at(-1).includeTotal, false);
+
+  const samplesResponse = await app.fetch(new Request('http://local/api/reports/samples?limit=1&includeTotal=0', { headers }));
+  const samples = await samplesResponse.json();
+  assert.equal(samples.items.length, 1);
+  assert.equal(samples.hasMore, true);
+  assert.equal(Object.hasOwn(samples, 'total'), false);
+  assert.equal(storage.sampleListCalls.at(-1).includeTotal, false);
+
+  const defaultResponse = await app.fetch(new Request('http://local/api/reports/batches?limit=1', { headers }));
+  const defaultBody = await defaultResponse.json();
+  assert.equal(defaultBody.total, 2);
+  assert.equal(storage.batchListCalls.at(-1).includeTotal, true);
+});
+
+test('read endpoints use short ttl cache and are invalidated after writes', async () => {
+  const storage = new CountingStorage();
+  const app = createApp({ secret: 'secret', storage });
+  const headers = { authorization: 'Bearer secret', 'content-type': 'application/json' };
+
+  await app.fetch(new Request('http://local/api/config', { headers }));
+  await app.fetch(new Request('http://local/api/config', { headers }));
+  assert.equal(storage.configCalls, 1);
+
   await app.fetch(new Request('http://local/api/reports/summary', { headers }));
   await app.fetch(new Request('http://local/api/reports/summary', { headers }));
   assert.equal(storage.summaryCalls, 1);
+
+  await app.fetch(new Request('http://local/api/reports/batches?limit=1&includeTotal=0', { headers }));
+  await app.fetch(new Request('http://local/api/reports/batches?includeTotal=0&limit=1', { headers }));
+  assert.equal(storage.batchListCalls.length, 1);
+
+  await app.fetch(new Request('http://local/api/reports/samples?limit=1&includeTotal=0', { headers }));
+  await app.fetch(new Request('http://local/api/reports/samples?includeTotal=0&limit=1', { headers }));
+  assert.equal(storage.sampleListCalls.length, 1);
 
   await app.fetch(new Request('http://local/api/reports/analytics?days=90&tzOffsetMinutes=0', { headers }));
   await app.fetch(new Request('http://local/api/reports/analytics?tzOffsetMinutes=0&days=90', { headers }));
@@ -261,8 +333,12 @@ test('report summary and analytics cache are invalidated after writes', async ()
   assert.equal(response.status, 200);
 
   await app.fetch(new Request('http://local/api/reports/summary', { headers }));
+  await app.fetch(new Request('http://local/api/reports/batches?limit=1&includeTotal=0', { headers }));
+  await app.fetch(new Request('http://local/api/reports/samples?limit=1&includeTotal=0', { headers }));
   await app.fetch(new Request('http://local/api/reports/analytics?days=90&tzOffsetMinutes=0', { headers }));
   assert.equal(storage.summaryCalls, 2);
+  assert.equal(storage.batchListCalls.length, 2);
+  assert.equal(storage.sampleListCalls.length, 2);
   assert.equal(storage.analyticsCalls, 2);
 });
 

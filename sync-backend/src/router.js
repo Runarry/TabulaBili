@@ -4,7 +4,8 @@ import { normalizeReportPayload } from './report-aggregate.js';
 
 const MAX_BULK_REPORT_BATCHES = 50;
 const MAX_BULK_REPORT_EVENTS = 2000;
-const REPORT_CACHE_TTL_MS = 15 * 1000;
+const READ_CACHE_TTL_MS = 30 * 1000;
+const READ_CACHE_MAX_ENTRIES = 100;
 
 function json(value, status = 200) {
   return new Response(JSON.stringify(value), {
@@ -52,6 +53,7 @@ function getReportSampleOptions(url) {
   return {
     limit: Number(url.searchParams.get('limit') || 50),
     offset: Number(url.searchParams.get('offset') || 0),
+    includeTotal: shouldIncludeTotal(url),
     q: url.searchParams.get('q') || '',
     feedback: url.searchParams.get('feedback') || 'all',
     sort: url.searchParams.get('sort') || 'lastSeenAt',
@@ -67,6 +69,10 @@ function getReportSampleOptions(url) {
     until: url.searchParams.get('until') || '',
     hasFeedback: url.searchParams.get('hasFeedback') || ''
   };
+}
+
+function shouldIncludeTotal(url) {
+  return url.searchParams.get('includeTotal') !== '0';
 }
 
 function getReportEventOptions(url, sampleId) {
@@ -177,7 +183,7 @@ async function saveBulkReportBatches(storage, payloads, eventCount) {
 function createApp(options) {
   const storage = options.storage;
   const secret = options.secret;
-  const reportCache = new Map();
+  const readCache = new Map();
   if (!storage) throw new Error('storage is required');
   if (!secret) throw new Error('SYNC_SECRET is required');
 
@@ -185,31 +191,43 @@ function createApp(options) {
     return getBearer(request, url) === secret;
   }
 
-  function getReportCache(key) {
-    const cached = reportCache.get(key);
+  function getReadCache(key) {
+    const cached = readCache.get(key);
     if (!cached || cached.expiresAt <= Date.now()) {
-      reportCache.delete(key);
+      readCache.delete(key);
       return null;
     }
     return cached.value;
   }
 
-  function setReportCache(key, value) {
-    reportCache.set(key, {
+  function setReadCache(key, value) {
+    if (!readCache.has(key) && readCache.size >= READ_CACHE_MAX_ENTRIES) {
+      const oldestKey = readCache.keys().next().value;
+      if (oldestKey) readCache.delete(oldestKey);
+    }
+    readCache.set(key, {
       value,
-      expiresAt: Date.now() + REPORT_CACHE_TTL_MS
+      expiresAt: Date.now() + READ_CACHE_TTL_MS
     });
     return value;
   }
 
-  function invalidateReportCache() {
-    reportCache.clear();
+  function invalidateReadCache() {
+    readCache.clear();
   }
 
-  function getAnalyticsCacheKey(url) {
+  function getReadCacheKey(prefix, url) {
     const params = new URLSearchParams(url.searchParams);
+    params.delete('auth');
     params.sort();
-    return `analytics:${params.toString()}`;
+    const query = params.toString();
+    return query ? `${prefix}:${query}` : prefix;
+  }
+
+  async function cachedJson(key, createValue) {
+    const cached = getReadCache(key);
+    if (cached) return json(cached);
+    return json(setReadCache(key, await createValue()));
   }
 
   return {
@@ -238,20 +256,23 @@ function createApp(options) {
         const merged = mergeConfig(current, body && body.config ? body.config : body);
         if (!current || !sameConfigEnvelope(current, merged)) {
           await storage.saveConfig(merged);
+          invalidateReadCache();
         }
         return json({ config: normalizeEnvelope(merged), materialized: materializeConfig(merged) });
       }
 
       if (url.pathname === '/api/config' && request.method === 'GET') {
-        const config = normalizeEnvelope(await storage.getConfig());
-        return json({ config, materialized: materializeConfig(config) });
+        return cachedJson(getReadCacheKey('config', url), async () => {
+          const config = normalizeEnvelope(await storage.getConfig());
+          return { config, materialized: materializeConfig(config) };
+        });
       }
 
       if (url.pathname === '/api/reports' && request.method === 'POST') {
         const validated = validateReportPayload(await readJson(request));
         if (validated.error) return json({ error: validated.error }, 400);
         const result = await storage.saveReportBatch(validated.payload);
-        invalidateReportCache();
+        invalidateReadCache();
         return json({ ok: true, ...result });
       }
 
@@ -259,13 +280,12 @@ function createApp(options) {
         const validated = validateBulkReportPayload(await readJson(request));
         if (validated.error) return json({ error: validated.error }, 400);
         const result = await saveBulkReportBatches(storage, validated.payloads, validated.eventCount);
-        invalidateReportCache();
+        invalidateReadCache();
         return json(result);
       }
 
       if (url.pathname === '/api/reports/summary' && request.method === 'GET') {
-        const cacheKey = 'summary';
-        return json(getReportCache(cacheKey) || setReportCache(cacheKey, await storage.getReportSummary()));
+        return cachedJson(getReadCacheKey('summary', url), () => storage.getReportSummary());
       }
 
       if (url.pathname === '/api/reports/cleanup' && request.method === 'POST') {
@@ -274,23 +294,26 @@ function createApp(options) {
         if (!isValidDate(cleanupOptions.before)) return json({ error: 'invalid_before' }, 400);
         cleanupOptions.before = new Date(cleanupOptions.before).toISOString();
         const result = await storage.cleanupReports(cleanupOptions);
-        if (!cleanupOptions.dryRun) invalidateReportCache();
+        if (!cleanupOptions.dryRun) invalidateReadCache();
         return json(result);
       }
 
       if (url.pathname === '/api/reports/batches' && request.method === 'GET') {
-        return json(await storage.listReportBatches({
+        return cachedJson(getReadCacheKey('batches', url), () => storage.listReportBatches({
           limit: Number(url.searchParams.get('limit') || 50),
-          offset: Number(url.searchParams.get('offset') || 0)
+          offset: Number(url.searchParams.get('offset') || 0),
+          includeTotal: shouldIncludeTotal(url)
         }));
       }
 
       if (url.pathname === '/api/reports/samples' && request.method === 'GET') {
-        const result = await storage.listReportSamples(getReportSampleOptions(url));
+        const options = getReportSampleOptions(url);
+        if (url.searchParams.get('export') === '1') options.includeTotal = false;
         if (url.searchParams.get('export') === '1') {
+          const result = await storage.listReportSamples(options);
           return text(JSON.stringify(result.items, null, 2), 200, 'application/json; charset=utf-8');
         }
-        return json(result);
+        return cachedJson(getReadCacheKey('samples', url), () => storage.listReportSamples(options));
       }
 
       const sampleEventsMatch = url.pathname.match(/^\/api\/reports\/samples\/([^/]+)\/events$/);
@@ -299,14 +322,12 @@ function createApp(options) {
           ? decodeURIComponent(sampleEventsMatch[1])
           : (url.searchParams.get('sampleId') || '');
         if (!sampleId) return json({ error: 'invalid_sample' }, 400);
-        return json(await storage.listReportEvents(getReportEventOptions(url, sampleId)));
+        return cachedJson(getReadCacheKey(`events:${url.pathname}`, url), () =>
+          storage.listReportEvents(getReportEventOptions(url, sampleId)));
       }
 
       if (url.pathname === '/api/reports/analytics' && request.method === 'GET') {
-        const cacheKey = getAnalyticsCacheKey(url);
-        const cached = getReportCache(cacheKey);
-        if (cached) return json(cached);
-        return json(setReportCache(cacheKey, await storage.getReportAnalytics({
+        return cachedJson(getReadCacheKey('analytics', url), () => storage.getReportAnalytics({
           days: Number(url.searchParams.get('days') || 30),
           tzOffsetMinutes: Number(url.searchParams.get('tzOffsetMinutes') || 0),
           clientId: url.searchParams.get('clientId') || '',
@@ -314,7 +335,7 @@ function createApp(options) {
           source: url.searchParams.get('source') || '',
           category: url.searchParams.get('category') || '',
           feedback: url.searchParams.get('feedback') || ''
-        })));
+        }));
       }
 
       return json({ error: 'not_found' }, 404);

@@ -553,32 +553,40 @@ class D1Storage {
     const db = this.getReadDb();
     const limit = normalizeLimit(options.limit, 200);
     const offset = normalizeOffset(options.offset);
+    const includeTotal = options.includeTotal !== false;
+    const fetchLimit = limit + (includeTotal ? 0 : 1);
     try {
-      const items = await allRows(db.prepare(`
+      const rows = await allRows(db.prepare(`
         select batch_id as batchId, client_id as clientId, captured_at as capturedAt, received_at as receivedAt,
           event_count as eventCount, duplicate_event_count as duplicateEventCount
         from batches order by received_at desc limit ? offset ?
-      `).bind(limit, offset));
+      `).bind(fetchLimit, offset));
+      const items = rows.slice(0, limit);
+      if (!includeTotal) return { items, hasMore: rows.length > limit };
       const total = await firstRow(db.prepare('select count(*) as count from batches'));
       return { items, total: total.count };
     } catch (error) {
       if (!isMissingTableError(error, ['batches'])) throw error;
-      return { items: [], total: 0 };
+      return includeTotal ? { items: [], total: 0 } : { items: [], hasMore: false };
     }
   }
 
   async listReportSamples(options = {}) {
     const db = this.getReadDb();
     const query = normalizeSampleListOptions(options);
+    const includeTotal = options.includeTotal !== false;
+    const fetchLimit = query.limit + (includeTotal ? 0 : 1);
     const { whereSql, args } = getSampleWhere(query);
     const orderBy = getSampleOrderBy(query.sort);
     try {
+      const rows = await allRows(db.prepare(`select json from samples ${whereSql} order by ${orderBy} limit ? offset ?`).bind(...args, fetchLimit, query.offset));
+      const items = rows.slice(0, query.limit).map((row) => JSON.parse(row.json));
+      if (!includeTotal) return { items, hasMore: rows.length > query.limit };
       const total = await firstRow(db.prepare(`select count(*) as count from samples ${whereSql}`).bind(...args));
-      const rows = await allRows(db.prepare(`select json from samples ${whereSql} order by ${orderBy} limit ? offset ?`).bind(...args, query.limit, query.offset));
-      return { items: rows.map((row) => JSON.parse(row.json)), total: total.count };
+      return { items, total: total.count };
     } catch (error) {
       if (!isMissingTableError(error, ['samples', 'events'])) throw error;
-      return { items: [], total: 0 };
+      return includeTotal ? { items: [], total: 0 } : { items: [], hasMore: false };
     }
   }
 

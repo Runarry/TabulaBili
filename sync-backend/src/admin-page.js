@@ -133,7 +133,10 @@ function adminPage(activePage = 'data') {
 function dataBody() {
   return `
     <section>
-      <h2>概览</h2>
+      <div class="toolbar">
+        <h2>概览</h2>
+        <button class="secondary" type="button" id="summaryRefreshBtn">刷新概览</button>
+      </div>
       <div class="grid">
         <div class="metric"><span>批次</span><strong id="batchCount">0</strong></div>
         <div class="metric"><span>事件</span><strong id="eventCount">0</strong></div>
@@ -144,18 +147,21 @@ function dataBody() {
     <section>
       <div class="toolbar">
         <h2>服务端配置</h2>
-        <button class="secondary" type="button" id="refreshBtn">刷新</button>
+        <button class="secondary" type="button" id="configLoadBtn">查看配置</button>
       </div>
+      <p class="muted" id="configStatus">未加载</p>
       <pre id="configView">{}</pre>
     </section>
     <section>
       <div class="toolbar">
         <h2>最近批次</h2>
         <select id="batchPageSize"><option value="20">20 条/页</option><option value="50">50 条/页</option><option value="100">100 条/页</option></select>
+        <button class="secondary" type="button" id="batchLoadBtn">加载最近批次</button>
       </div>
+      <p class="muted" id="batchStatus">未加载</p>
       <table>
         <thead><tr><th>时间</th><th>批次</th><th>设备</th><th>事件</th><th>重复</th></tr></thead>
-        <tbody id="batchRows"></tbody>
+        <tbody id="batchRows"><tr><td class="muted" colspan="5">未加载</td></tr></tbody>
       </table>
       <div class="pager">
         <button class="secondary" type="button" id="batchPrevBtn">上一页</button>
@@ -181,11 +187,14 @@ function dataBody() {
           <option value="clickCount">点击次数</option>
         </select>
         <select id="samplePageSize"><option value="25">25 条/页</option><option value="50">50 条/页</option><option value="100">100 条/页</option></select>
+        <button class="secondary" type="button" id="sampleLoadBtn">加载聚合样本</button>
+        <button class="secondary" type="button" id="sampleApplyBtn">应用筛选</button>
         <button class="secondary" type="button" id="exportBtn">导出 JSON</button>
       </div>
+      <p class="muted" id="sampleStatus">未加载</p>
       <table>
         <thead><tr><th>标题</th><th>UP 主</th><th>推荐</th><th>点击</th><th>标注</th><th>最近</th></tr></thead>
-        <tbody id="sampleRows"></tbody>
+        <tbody id="sampleRows"><tr><td class="muted" colspan="6">未加载</td></tr></tbody>
       </table>
       <div class="pager">
         <button class="secondary" type="button" id="samplePrevBtn">上一页</button>
@@ -220,9 +229,10 @@ function analyticsBody() {
           <option value="unset">unset</option>
         </select>
         <input id="clientFilter" placeholder="clientId">
-        <button class="secondary" type="button" id="refreshBtn">刷新</button>
+        <button class="secondary" type="button" id="analyticsRunBtn">生成分析</button>
         <button class="secondary" type="button" id="exportAnalyticsBtn">导出 JSON</button>
       </div>
+      <p class="muted" id="analyticsStatus">未加载</p>
       <div class="grid">
         <div class="metric"><span>视频</span><strong id="metricSamples">0</strong></div>
         <div class="metric"><span>UP</span><strong id="metricUps">0</strong></div>
@@ -292,71 +302,172 @@ function analyticsBody() {
 
 function dataScript() {
   return `
-    const batchState = { page: 1, pageSize: 20, total: 0 };
-    const sampleState = { page: 1, pageSize: 25, total: 0, q: '', feedback: 'all', sort: 'lastSeenAt' };
-    function totalPages(state) {
-      return Math.max(1, Math.ceil(state.total / state.pageSize));
+    const batchState = { page: 1, pageSize: 20, hasMore: false, loaded: false };
+    const sampleState = { page: 1, pageSize: 25, hasMore: false, loaded: false };
+    function setStatus(id, text, error = false) {
+      const node = $(id);
+      if (!node) return;
+      node.textContent = text;
+      node.className = error ? 'error' : 'muted';
+    }
+    function emptyRow(columns, text) {
+      return '<tr><td class="muted" colspan="' + columns + '">' + esc(text) + '</td></tr>';
     }
     async function refresh() {
+      return loadSummary();
+    }
+    async function loadSummary() {
       if (!state.secret) {
         setMessage('请输入服务密钥。');
         return;
       }
-      const batchOffset = (batchState.page - 1) * batchState.pageSize;
-      const sampleOffset = (sampleState.page - 1) * sampleState.pageSize;
-      const sampleQuery = '&q=' + encodeURIComponent(sampleState.q)
-        + '&feedback=' + encodeURIComponent(sampleState.feedback)
-        + '&sort=' + encodeURIComponent(sampleState.sort);
-      const [summary, config, batches, samples] = await Promise.all([
-        api('/api/reports/summary'),
-        api('/api/config'),
-        api('/api/reports/batches?limit=' + batchState.pageSize + '&offset=' + batchOffset),
-        api('/api/reports/samples?limit=' + sampleState.pageSize + '&offset=' + sampleOffset + sampleQuery)
-      ]);
+      setMessage('正在刷新概览。');
+      const summary = await api('/api/reports/summary');
       metric('batchCount', summary.batchCount);
       metric('eventCount', summary.eventCount);
       metric('duplicateCount', summary.duplicateEventCount);
       metric('sampleCount', summary.sampleCount);
-      $('configView').textContent = JSON.stringify(config.materialized, null, 2);
-      batchState.total = batches.total;
-      sampleState.total = samples.total;
-      $('batchRows').innerHTML = batches.items.map((item) =>
-        '<tr><td>' + esc(fmt(item.receivedAt)) + '</td><td>' + esc(item.batchId) + '</td><td>' + esc(item.clientId) + '</td><td>' + esc(item.eventCount) + '</td><td>' + esc(item.duplicateEventCount || 0) + '</td></tr>'
-      ).join('');
-      $('sampleRows').innerHTML = samples.items.map((item) =>
-        '<tr><td>' + esc(item.title || item.id) + '<div class="muted">' + esc(item.bvid || item.id || '') + '</div></td><td>' + esc(item.upName || '') + '</td><td>' + esc(item.seenCount || 0) + '</td><td>' + esc(item.clickCount || 0) + '</td><td>' + esc(item.feedback || 'unset') + '</td><td>' + esc(fmt(item.lastSeenAt)) + '</td></tr>'
-      ).join('');
-      $('batchPageInfo').textContent = '第 ' + batchState.page + ' / ' + totalPages(batchState) + ' 页';
-      $('samplePageInfo').textContent = '第 ' + sampleState.page + ' / ' + totalPages(sampleState) + ' 页';
-      $('batchPrevBtn').disabled = batchState.page <= 1;
-      $('batchNextBtn').disabled = batchState.page >= totalPages(batchState);
-      $('samplePrevBtn').disabled = sampleState.page <= 1;
-      $('sampleNextBtn').disabled = sampleState.page >= totalPages(sampleState);
-      setMessage('已刷新。');
+      setMessage('概览已刷新。');
     }
-    $('refreshBtn').addEventListener('click', () => refresh().catch((error) => setMessage(error.message, true)));
-    $('batchPageSize').addEventListener('change', () => { batchState.pageSize = Number($('batchPageSize').value); batchState.page = 1; refresh().catch((error) => setMessage(error.message, true)); });
-    $('batchPrevBtn').addEventListener('click', () => { batchState.page = Math.max(1, batchState.page - 1); refresh().catch((error) => setMessage(error.message, true)); });
-    $('batchNextBtn').addEventListener('click', () => { batchState.page = Math.min(totalPages(batchState), batchState.page + 1); refresh().catch((error) => setMessage(error.message, true)); });
-    let sampleSearchTimer = null;
-    $('queryInput').addEventListener('input', () => {
-      sampleState.q = $('queryInput').value.trim();
+    async function loadConfig() {
+      if (!state.secret) {
+        setMessage('请输入服务密钥。');
+        return;
+      }
+      setStatus('configStatus', '加载中');
+      try {
+        const config = await api('/api/config');
+        $('configView').textContent = JSON.stringify(config.materialized, null, 2);
+        setStatus('configStatus', '已加载');
+        setMessage('配置已加载。');
+      } catch (error) {
+        setStatus('configStatus', '加载失败：' + error.message, true);
+        throw error;
+      }
+    }
+    function renderBatchRows(items) {
+      $('batchRows').innerHTML = items.length
+        ? items.map((item) =>
+          '<tr><td>' + esc(fmt(item.receivedAt)) + '</td><td>' + esc(item.batchId) + '</td><td>' + esc(item.clientId) + '</td><td>' + esc(item.eventCount) + '</td><td>' + esc(item.duplicateEventCount || 0) + '</td></tr>'
+        ).join('')
+        : emptyRow(5, '无数据');
+    }
+    function updateBatchPager() {
+      $('batchPageInfo').textContent = batchState.loaded
+        ? '第 ' + batchState.page + ' 页' + (batchState.hasMore ? '' : ' / 最后一页')
+        : '第 1 页';
+      $('batchPrevBtn').disabled = !batchState.loaded || batchState.page <= 1;
+      $('batchNextBtn').disabled = !batchState.loaded || !batchState.hasMore;
+    }
+    async function loadBatches(resetPage = false) {
+      if (!state.secret) {
+        setMessage('请输入服务密钥。');
+        return;
+      }
+      batchState.pageSize = Number($('batchPageSize').value);
+      if (resetPage) batchState.page = 1;
+      const offset = (batchState.page - 1) * batchState.pageSize;
+      setStatus('batchStatus', '加载中');
+      try {
+        const batches = await api('/api/reports/batches?includeTotal=0&limit=' + batchState.pageSize + '&offset=' + offset);
+        batchState.loaded = true;
+        batchState.hasMore = batches.hasMore === true;
+        renderBatchRows(batches.items || []);
+        updateBatchPager();
+        setStatus('batchStatus', '已加载');
+        setMessage('最近批次已加载。');
+      } catch (error) {
+        setStatus('batchStatus', '加载失败：' + error.message, true);
+        throw error;
+      }
+    }
+    function sampleQuery() {
+      return '&q=' + encodeURIComponent($('queryInput').value.trim())
+        + '&feedback=' + encodeURIComponent($('feedbackFilter').value)
+        + '&sort=' + encodeURIComponent($('sampleSort').value);
+    }
+    function renderSampleRows(items) {
+      $('sampleRows').innerHTML = items.length
+        ? items.map((item) =>
+          '<tr><td>' + esc(item.title || item.id) + '<div class="muted">' + esc(item.bvid || item.id || '') + '</div></td><td>' + esc(item.upName || '') + '</td><td>' + esc(item.seenCount || 0) + '</td><td>' + esc(item.clickCount || 0) + '</td><td>' + esc(item.feedback || 'unset') + '</td><td>' + esc(fmt(item.lastSeenAt)) + '</td></tr>'
+        ).join('')
+        : emptyRow(6, '无数据');
+    }
+    function updateSamplePager() {
+      $('samplePageInfo').textContent = sampleState.loaded
+        ? '第 ' + sampleState.page + ' 页' + (sampleState.hasMore ? '' : ' / 最后一页')
+        : '第 1 页';
+      $('samplePrevBtn').disabled = !sampleState.loaded || sampleState.page <= 1;
+      $('sampleNextBtn').disabled = !sampleState.loaded || !sampleState.hasMore;
+    }
+    async function loadSamples(resetPage = false) {
+      if (!state.secret) {
+        setMessage('请输入服务密钥。');
+        return;
+      }
+      sampleState.pageSize = Number($('samplePageSize').value);
+      if (resetPage) sampleState.page = 1;
+      const offset = (sampleState.page - 1) * sampleState.pageSize;
+      setStatus('sampleStatus', '加载中');
+      try {
+        const samples = await api('/api/reports/samples?includeTotal=0&limit=' + sampleState.pageSize + '&offset=' + offset + sampleQuery());
+        sampleState.loaded = true;
+        sampleState.hasMore = samples.hasMore === true;
+        renderSampleRows(samples.items || []);
+        updateSamplePager();
+        setStatus('sampleStatus', '已加载');
+        setMessage('聚合样本已加载。');
+      } catch (error) {
+        setStatus('sampleStatus', '加载失败：' + error.message, true);
+        throw error;
+      }
+    }
+    function markBatchControlsChanged() {
+      batchState.page = 1;
+      if (batchState.loaded) setStatus('batchStatus', '每页数量已更改，点击“加载最近批次”更新。');
+      updateBatchPager();
+    }
+    function markSampleFiltersChanged() {
       sampleState.page = 1;
-      clearTimeout(sampleSearchTimer);
-      sampleSearchTimer = setTimeout(() => refresh().catch((error) => setMessage(error.message, true)), 220);
+      if (sampleState.loaded) setStatus('sampleStatus', '筛选已更改，点击“应用筛选”更新。');
+      updateSamplePager();
+    }
+    $('summaryRefreshBtn').addEventListener('click', () => loadSummary().catch((error) => setMessage(error.message, true)));
+    $('configLoadBtn').addEventListener('click', () => loadConfig().catch((error) => setMessage(error.message, true)));
+    $('batchLoadBtn').addEventListener('click', () => loadBatches(true).catch((error) => setMessage(error.message, true)));
+    $('batchPageSize').addEventListener('change', markBatchControlsChanged);
+    $('batchPrevBtn').addEventListener('click', () => {
+      if (!batchState.loaded || batchState.page <= 1) return;
+      batchState.page -= 1;
+      loadBatches(false).catch((error) => setMessage(error.message, true));
     });
-    $('feedbackFilter').addEventListener('change', () => { sampleState.feedback = $('feedbackFilter').value; sampleState.page = 1; refresh().catch((error) => setMessage(error.message, true)); });
-    $('sampleSort').addEventListener('change', () => { sampleState.sort = $('sampleSort').value; sampleState.page = 1; refresh().catch((error) => setMessage(error.message, true)); });
-    $('samplePageSize').addEventListener('change', () => { sampleState.pageSize = Number($('samplePageSize').value); sampleState.page = 1; refresh().catch((error) => setMessage(error.message, true)); });
-    $('samplePrevBtn').addEventListener('click', () => { sampleState.page = Math.max(1, sampleState.page - 1); refresh().catch((error) => setMessage(error.message, true)); });
-    $('sampleNextBtn').addEventListener('click', () => { sampleState.page = Math.min(totalPages(sampleState), sampleState.page + 1); refresh().catch((error) => setMessage(error.message, true)); });
+    $('batchNextBtn').addEventListener('click', () => {
+      if (!batchState.loaded || !batchState.hasMore) return;
+      batchState.page += 1;
+      loadBatches(false).catch((error) => setMessage(error.message, true));
+    });
+    $('sampleLoadBtn').addEventListener('click', () => loadSamples(true).catch((error) => setMessage(error.message, true)));
+    $('sampleApplyBtn').addEventListener('click', () => loadSamples(true).catch((error) => setMessage(error.message, true)));
+    $('queryInput').addEventListener('input', markSampleFiltersChanged);
+    $('feedbackFilter').addEventListener('change', markSampleFiltersChanged);
+    $('sampleSort').addEventListener('change', markSampleFiltersChanged);
+    $('samplePageSize').addEventListener('change', markSampleFiltersChanged);
+    $('samplePrevBtn').addEventListener('click', () => {
+      if (!sampleState.loaded || sampleState.page <= 1) return;
+      sampleState.page -= 1;
+      loadSamples(false).catch((error) => setMessage(error.message, true));
+    });
+    $('sampleNextBtn').addEventListener('click', () => {
+      if (!sampleState.loaded || !sampleState.hasMore) return;
+      sampleState.page += 1;
+      loadSamples(false).catch((error) => setMessage(error.message, true));
+    });
     $('exportBtn').addEventListener('click', () => {
-      const query = '&q=' + encodeURIComponent(sampleState.q)
-        + '&feedback=' + encodeURIComponent(sampleState.feedback)
-        + '&sort=' + encodeURIComponent(sampleState.sort);
-      download('/api/reports/samples?limit=10000&export=1' + query, 'tabulabili-samples.json')
+      download('/api/reports/samples?limit=10000&export=1' + sampleQuery(), 'tabulabili-samples.json')
         .catch((error) => setMessage(error.message, true));
-    });`;
+    });
+    updateBatchPager();
+    updateSamplePager();`;
 }
 
 function analyticsScript() {
@@ -396,15 +507,35 @@ function analyticsScript() {
       }
       return params.toString();
     }
+    let analyticsLoaded = false;
+    function setAnalyticsStatus(text, error = false) {
+      $('analyticsStatus').textContent = text;
+      $('analyticsStatus').className = error ? 'error' : 'muted';
+    }
     function refreshAnalytics() {
-      refresh().catch((error) => setMessage(error.message, true));
+      loadAnalytics().catch((error) => setMessage(error.message, true));
     }
     async function refresh() {
       if (!state.secret) {
         setMessage('请输入服务密钥。');
         return;
       }
-      const result = await api('/api/reports/analytics?' + analyticsParams());
+      setAnalyticsStatus('未加载');
+      setMessage('点击“生成分析”后读取实时分析数据。');
+    }
+    async function loadAnalytics() {
+      if (!state.secret) {
+        setMessage('请输入服务密钥。');
+        return;
+      }
+      setAnalyticsStatus('加载中');
+      let result;
+      try {
+        result = await api('/api/reports/analytics?' + analyticsParams());
+      } catch (error) {
+        setAnalyticsStatus('加载失败：' + error.message, true);
+        throw error;
+      }
       const dimensions = result.dimensions || {};
       const top = result.top || {};
       metric('metricSamples', result.metrics.sampleCount);
@@ -428,21 +559,24 @@ function analyticsScript() {
       $('repeatedRows').innerHTML = renderRows(top.repeatedSamples, 6, (row) =>
         '<tr><td>' + esc(row.title || row.bvid || row.sampleId) + '<div class="muted">' + esc(row.bvid || row.sampleId) + '</div></td><td>' + esc(row.upName || '') + '</td><td>' + esc(row.impressions) + '</td><td>' + esc(row.repeatImpressionCount) + '</td><td>' + esc(row.clicks) + '</td><td>' + esc(pct(row.ctr)) + '</td></tr>'
       );
-      setMessage('已刷新。');
+      analyticsLoaded = true;
+      setAnalyticsStatus('已加载');
+      setMessage('分析已生成。');
     }
-    $('refreshBtn').addEventListener('click', refreshAnalytics);
+    function markAnalyticsFiltersChanged() {
+      if (analyticsLoaded) setAnalyticsStatus('筛选已更改，点击“生成分析”更新。');
+    }
+    $('analyticsRunBtn').addEventListener('click', refreshAnalytics);
     $('exportAnalyticsBtn').addEventListener('click', () => {
       download('/api/reports/analytics?' + analyticsParams(), 'tabulabili-analytics.json')
         .catch((error) => setMessage(error.message, true));
     });
     ['daysInput', 'modeFilter', 'analyticsFeedbackFilter'].forEach((id) => {
-      $(id).addEventListener('change', refreshAnalytics);
+      $(id).addEventListener('change', markAnalyticsFiltersChanged);
     });
     ['sourceFilter', 'categoryFilter', 'clientFilter'].forEach((id) => {
-      $(id).addEventListener('change', refreshAnalytics);
-      $(id).addEventListener('keydown', (event) => {
-        if (event.key === 'Enter') refreshAnalytics();
-      });
+      $(id).addEventListener('change', markAnalyticsFiltersChanged);
+      $(id).addEventListener('input', markAnalyticsFiltersChanged);
     });`;
 }
 

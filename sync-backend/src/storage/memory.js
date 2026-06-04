@@ -79,17 +79,24 @@ class MemoryStorage {
   async listReportBatches(options = {}) {
     const limit = normalizeLimit(options.limit, 200);
     const offset = normalizeOffset(options.offset);
-    const items = [...this.batches.values()]
+    const includeTotal = options.includeTotal !== false;
+    const rows = [...this.batches.values()]
       .sort((a, b) => String(b.receivedAt).localeCompare(String(a.receivedAt)))
-      .slice(offset, offset + limit)
+      .slice(offset, offset + limit + (includeTotal ? 0 : 1))
       .map(({ raw, ...item }) => item);
+    const items = rows.slice(0, limit);
+    if (!includeTotal) return { items, hasMore: rows.length > limit };
     return { items, total: this.batches.size };
   }
 
   async listReportSamples(options = {}) {
     const query = normalizeSampleListOptions(options);
+    const includeTotal = options.includeTotal !== false;
     const filtered = sortSamples(filterSamples([...this.samples.values()], query, [...this.events.values()]), query.sort);
-    return { items: filtered.slice(query.offset, query.offset + query.limit), total: filtered.length };
+    const rows = filtered.slice(query.offset, query.offset + query.limit + (includeTotal ? 0 : 1));
+    const items = rows.slice(0, query.limit);
+    if (!includeTotal) return { items, hasMore: rows.length > query.limit };
+    return { items, total: filtered.length };
   }
 
   async listReportEvents(options = {}) {
