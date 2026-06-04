@@ -124,8 +124,14 @@ test('D1 storage initializes schema and supports report APIs', { skip: DatabaseS
     { version: 2, name: 'structured_event_columns' },
     { version: 3, name: 'sample_timestamps' },
     { version: 4, name: 'daily_metrics' },
-    { version: 5, name: 'analytics_indexes' }
+    { version: 5, name: 'analytics_indexes' },
+    { version: 6, name: 'drop_events_up_name_index' }
   ]);
+  const droppedIndex = fake.db.prepare(`
+    select name from sqlite_master
+    where type = 'index' and name = 'idx_d1_events_up_name_captured_at'
+  `).get();
+  assert.equal(droppedIndex ?? null, null);
 
   const dailyMetrics = fake.db.prepare(`
     select date, client_id, mode, source, category, impressions, clicks, feedbacks, negative_feedbacks

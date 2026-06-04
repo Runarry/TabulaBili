@@ -117,7 +117,6 @@ class SqliteStorage {
       create index if not exists idx_events_sample_captured_at on events(sample_id, captured_at);
       create index if not exists idx_events_sample_kind_captured_at on events(sample_id, event_kind, captured_at);
       create index if not exists idx_events_up_mid_captured_at on events(up_mid, captured_at);
-      create index if not exists idx_events_up_name_captured_at on events(up_name, captured_at);
       create index if not exists idx_samples_last_seen_at on samples(last_seen_at desc);
       create index if not exists idx_samples_first_seen_at on samples(first_seen_at);
       create index if not exists idx_samples_up_mid on samples(up_mid);
@@ -126,13 +125,15 @@ class SqliteStorage {
       create index if not exists idx_samples_click_count on samples(click_count desc);
       create index if not exists idx_samples_feedback on samples(feedback);
       create index if not exists idx_daily_metrics_date on daily_metrics(date desc);
+      drop index if exists idx_events_up_name_captured_at;
     `);
     this.recordMigrations([
       [1, 'base_tables'],
       [2, 'structured_event_columns'],
       [3, 'sample_timestamps'],
       [4, 'daily_metrics'],
-      [5, 'analytics_indexes']
+      [5, 'analytics_indexes'],
+      [6, 'drop_events_up_name_index']
     ]);
   }
 

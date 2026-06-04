@@ -104,6 +104,7 @@ D1 推荐在部署前执行 `migrations/0001_schema.sql`。运行时仍保留兼
 - `3 sample_timestamps`
 - `4 daily_metrics`
 - `5 analytics_indexes`
+- `6 drop_events_up_name_index`
 
 重复运行初始化是幂等的。新 D1 部署建议优先执行 migration，避免首次写入请求承担完整 schema 初始化成本。
 

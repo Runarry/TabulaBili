@@ -79,7 +79,6 @@ create index if not exists idx_d1_events_feedback_captured_at on events(feedback
 create index if not exists idx_d1_events_sample_captured_at on events(sample_id, captured_at);
 create index if not exists idx_d1_events_sample_kind_captured_at on events(sample_id, event_kind, captured_at);
 create index if not exists idx_d1_events_up_mid_captured_at on events(up_mid, captured_at);
-create index if not exists idx_d1_events_up_name_captured_at on events(up_name, captured_at);
 create index if not exists idx_d1_samples_last_seen_at on samples(last_seen_at desc);
 create index if not exists idx_d1_samples_first_seen_at on samples(first_seen_at);
 create index if not exists idx_d1_samples_up_mid on samples(up_mid);
@@ -94,4 +93,5 @@ insert or ignore into schema_migrations (version, name, applied_at) values
   (2, 'structured_event_columns', datetime('now')),
   (3, 'sample_timestamps', datetime('now')),
   (4, 'daily_metrics', datetime('now')),
-  (5, 'analytics_indexes', datetime('now'));
+  (5, 'analytics_indexes', datetime('now')),
+  (6, 'drop_events_up_name_index', datetime('now'));
