@@ -508,7 +508,9 @@ class D1Storage {
       this.createUpsertSampleStatement(sampleId, currentAggregates.get(sampleId), changedSampleReceivedAt.get(sampleId)));
     const metricStatements = [...dailyMetrics.values()].map((delta) =>
       this.createUpsertDailyMetricStatement(delta));
-    const batchUpdateStatements = activeBatchInfos.map((info) =>
+    const batchUpdateStatements = activeBatchInfos
+      .filter((info) => info.duplicateEventCount > 0)
+      .map((info) =>
       this.createUpdateBatchDuplicateStatement(info.batch.batchId, info.duplicateEventCount));
     await this.runStatements([...sampleStatements, ...metricStatements, ...batchUpdateStatements]);
 

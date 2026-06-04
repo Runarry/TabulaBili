@@ -20,6 +20,18 @@ function isNewer(left, right) {
   return toTime(left && left.updatedAt) >= toTime(right && right.updatedAt);
 }
 
+function stableStringify(value) {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function sameValue(left, right) {
+  return stableStringify(left) === stableStringify(right);
+}
+
 function normalizeField(entry, fallbackClientId = '') {
   if (!entry || typeof entry !== 'object' || !Object.hasOwn(entry, 'value')) return null;
   return {
@@ -86,6 +98,40 @@ function normalizeEnvelope(value) {
   };
 }
 
+function getFieldValues(fields) {
+  return Object.fromEntries(
+    CONFIG_FIELD_KEYS
+      .filter((key) => fields[key])
+      .map((key) => [key, fields[key].value])
+  );
+}
+
+function getComparableRules(rules) {
+  return rules
+    .map((rule) => ({
+      id: rule.id,
+      type: rule.type,
+      pattern: rule.pattern,
+      enabled: rule.enabled !== false,
+      createdAt: rule.createdAt,
+      deletedAt: rule.deletedAt,
+      source: rule.source
+    }))
+    .sort((left, right) => String(left.id).localeCompare(String(right.id)));
+}
+
+function getComparableConfig(value) {
+  const envelope = normalizeEnvelope(value);
+  return {
+    fields: getFieldValues(envelope.fields),
+    rules: getComparableRules(envelope.rules.items)
+  };
+}
+
+function sameConfigEnvelope(left, right) {
+  return sameValue(getComparableConfig(left), getComparableConfig(right));
+}
+
 function mergeConfig(currentValue, incomingValue, now = new Date().toISOString()) {
   const current = normalizeEnvelope(currentValue);
   const incoming = normalizeEnvelope(incomingValue);
@@ -95,14 +141,27 @@ function mergeConfig(currentValue, incomingValue, now = new Date().toISOString()
     const next = incoming.fields[key];
     if (!next) continue;
     const existing = fields[key];
-    if (!existing || isNewer(next, existing)) fields[key] = next;
+    if (!existing) {
+      fields[key] = next;
+      continue;
+    }
+    if (isNewer(next, existing) && !sameValue(next.value, existing.value)) fields[key] = next;
   }
 
   const rulesById = new Map();
   for (const rule of current.rules.items) rulesById.set(rule.id, rule);
   for (const rule of incoming.rules.items) {
     const existing = rulesById.get(rule.id);
-    if (!existing || isNewer(rule, existing)) rulesById.set(rule.id, rule);
+    if (!existing) {
+      rulesById.set(rule.id, rule);
+      continue;
+    }
+    if (isNewer(rule, existing) && !sameConfigEnvelope(
+      { fields: {}, rules: { items: [existing] } },
+      { fields: {}, rules: { items: [rule] } }
+    )) {
+      rulesById.set(rule.id, rule);
+    }
   }
 
   const naturalKeyToId = new Map();
@@ -127,9 +186,15 @@ function mergeConfig(currentValue, incomingValue, now = new Date().toISOString()
     }
   }
 
+  const next = {
+    fields,
+    rules: { items: mergedRules }
+  };
+  const changed = !sameConfigEnvelope(current, next);
+
   return {
     version: 1,
-    updatedAt: now,
+    updatedAt: changed ? now : current.updatedAt,
     fields,
     rules: { items: mergedRules }
   };
@@ -150,5 +215,6 @@ export {
   makeRuleNaturalKey,
   materializeConfig,
   mergeConfig,
-  normalizeEnvelope
+  normalizeEnvelope,
+  sameConfigEnvelope
 };

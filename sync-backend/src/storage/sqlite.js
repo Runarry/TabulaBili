@@ -292,7 +292,9 @@ class SqliteStorage {
         );
       }
 
-      this.db.prepare('update batches set duplicate_event_count = ? where batch_id = ?').run(duplicateEventCount, batch.batchId);
+      if (duplicateEventCount > 0) {
+        this.db.prepare('update batches set duplicate_event_count = ? where batch_id = ?').run(duplicateEventCount, batch.batchId);
+      }
       return duplicateEventCount;
     });
 

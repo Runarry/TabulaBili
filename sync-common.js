@@ -132,6 +132,7 @@ globalThis.TabulaBiliSync = (() => {
     const changeSet = new Set(changedKeys || []);
     const timestamp = nowIso();
     const fields = {};
+    let changed = false;
 
     for (const key of CONFIG_FIELD_KEYS) {
       const previousField = previousFields[key];
@@ -143,10 +144,11 @@ globalThis.TabulaBiliSync = (() => {
       if (!hasValue) continue;
 
       const value = key === REPORT_FREQUENCY_KEY ? normalizeFrequency(values[key]) : values[key];
-      if (previousField && !changeSet.has(key) && sameValue(previousField.value, value)) {
+      if (previousField && sameValue(previousField.value, value)) {
         fields[key] = previousField;
       } else {
         fields[key] = { value, updatedAt: timestamp, clientId };
+        changed = true;
       }
     }
 
@@ -155,11 +157,12 @@ globalThis.TabulaBiliSync = (() => {
     const ruleItems = rulesChanged
       ? mergeRuleEnvelopeItems(previousItems, normalizeRules(values && values.bili_block_rules), clientId, timestamp)
       : previousItems;
+    if (rulesChanged && !sameValue(previousItems, ruleItems)) changed = true;
 
     return {
       version: 1,
       clientId,
-      updatedAt: timestamp,
+      updatedAt: changed ? timestamp : (previous.updatedAt || timestamp),
       fields,
       rules: { items: ruleItems }
     };

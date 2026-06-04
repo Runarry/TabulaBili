@@ -47,6 +47,10 @@ function schemaPrepareCount(fake) {
   ).length;
 }
 
+function duplicateBatchUpdatePrepareCount(fake) {
+  return fake.preparedSql.filter((sql) => /update batches set duplicate_event_count/i.test(sql)).length;
+}
+
 function makeLargeBatches() {
   return Array.from({ length: 50 }, (_, batchIndex) => ({
     batchId: `d1-bulk-b${batchIndex}`,
@@ -87,6 +91,7 @@ test('D1 storage initializes schema and supports report APIs', { skip: DatabaseS
   }));
 
   assert.equal(response.status, 200);
+  assert.equal(duplicateBatchUpdatePrepareCount(fake), 0);
   const samplesResponse = await app.fetch(new Request('http://local/api/reports/samples?q=alpha&feedback=like', { headers }));
   const samples = await samplesResponse.json();
   assert.equal(samples.total, 1);
@@ -179,6 +184,7 @@ test('D1 storage initializes schema and supports report APIs', { skip: DatabaseS
     })
   }));
   assert.equal(repeatedResponse.status, 200);
+  assert.equal(duplicateBatchUpdatePrepareCount(fake), 0);
 
   const repeatedAnalyticsResponse = await app.fetch(new Request('http://local/api/reports/analytics?days=90&mode=pure&source=feed&tzOffsetMinutes=0', { headers }));
   const repeatedAnalytics = await repeatedAnalyticsResponse.json();
@@ -208,6 +214,7 @@ test('D1 storage initializes schema and supports report APIs', { skip: DatabaseS
   }));
   const duplicateEvent = await duplicateEventResponse.json();
   assert.equal(duplicateEvent.duplicateEventCount, 1);
+  assert.equal(duplicateBatchUpdatePrepareCount(fake), 1);
 
   const feedbackFilteredResponse = await app.fetch(new Request('http://local/api/reports/analytics?days=90&feedback=dislike&tzOffsetMinutes=0', { headers }));
   const feedbackFiltered = await feedbackFilteredResponse.json();

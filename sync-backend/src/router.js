@@ -1,5 +1,5 @@
 import { adminPage } from './admin-page.js';
-import { materializeConfig, mergeConfig, normalizeEnvelope } from './config-merge.js';
+import { materializeConfig, mergeConfig, normalizeEnvelope, sameConfigEnvelope } from './config-merge.js';
 import { normalizeReportPayload } from './report-aggregate.js';
 
 const MAX_BULK_REPORT_BATCHES = 50;
@@ -236,7 +236,9 @@ function createApp(options) {
         const body = await readJson(request);
         const current = await storage.getConfig();
         const merged = mergeConfig(current, body && body.config ? body.config : body);
-        await storage.saveConfig(merged);
+        if (!current || !sameConfigEnvelope(current, merged)) {
+          await storage.saveConfig(merged);
+        }
         return json({ config: normalizeEnvelope(merged), materialized: materializeConfig(merged) });
       }
 

@@ -34,6 +34,12 @@ class CountingStorage extends MemoryStorage {
     super();
     this.summaryCalls = 0;
     this.analyticsCalls = 0;
+    this.saveConfigCalls = 0;
+  }
+
+  async saveConfig(config) {
+    this.saveConfigCalls += 1;
+    return super.saveConfig(config);
   }
 
   async getReportSummary() {
@@ -81,6 +87,55 @@ test('config sync returns merged materialized config', async () => {
   assert.equal(response.status, 200);
   const body = await response.json();
   assert.equal(body.materialized.bili_mode, 'fusion');
+});
+
+test('config sync skips storage writes when config is unchanged', async () => {
+  const storage = new CountingStorage();
+  const app = createApp({ secret: 'secret', storage });
+  const headers = { authorization: 'Bearer secret', 'content-type': 'application/json' };
+  const config = {
+    fields: {
+      bili_mode: { value: 'fusion', updatedAt: '2026-01-01T00:00:00.000Z', clientId: 'c1' }
+    },
+    rules: {
+      items: [
+        { id: 'r1', type: 'up_name_exact', pattern: 'UP', enabled: true, createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z', clientId: 'c1' }
+      ]
+    }
+  };
+
+  const first = await app.fetch(new Request('http://local/api/config/sync', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ config })
+  }));
+  assert.equal(first.status, 200);
+  assert.equal(storage.saveConfigCalls, 1);
+
+  const second = await app.fetch(new Request('http://local/api/config/sync', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ config })
+  }));
+  assert.equal(second.status, 200);
+  assert.equal(storage.saveConfigCalls, 1);
+  assert.equal((await second.json()).materialized.bili_mode, 'fusion');
+
+  const changed = await app.fetch(new Request('http://local/api/config/sync', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      config: {
+        fields: {
+          bili_mode: { value: 'origin', updatedAt: '2026-01-02T00:00:00.000Z', clientId: 'c1' }
+        },
+        rules: config.rules
+      }
+    })
+  }));
+  assert.equal(changed.status, 200);
+  assert.equal(storage.saveConfigCalls, 2);
+  assert.equal((await changed.json()).materialized.bili_mode, 'origin');
 });
 
 test('admin routes render data and analytics pages', async () => {
