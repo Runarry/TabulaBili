@@ -252,14 +252,22 @@ function analyticsBody() {
       </table>
     </section>
     <section>
-      <h2>Top UP</h2>
+      <div class="toolbar">
+        <h2>Top UP</h2>
+        <button class="secondary" type="button" id="topRunBtn">加载 Top/重复推荐</button>
+      </div>
+      <p class="muted" id="topStatus">未加载</p>
       <table>
         <thead><tr><th>UP 主</th><th>样本</th><th>曝光</th><th>点击</th><th>CTR</th><th>负反馈率</th></tr></thead>
         <tbody id="topUpRows"></tbody>
       </table>
     </section>
     <section>
-      <h2>维度对比</h2>
+      <div class="toolbar">
+        <h2>维度对比</h2>
+        <button class="secondary" type="button" id="dimensionsRunBtn">加载维度对比</button>
+      </div>
+      <p class="muted" id="dimensionsStatus">未加载</p>
       <div class="table-grid">
         <div class="table-panel">
           <h3>模式</h3>
@@ -292,7 +300,10 @@ function analyticsBody() {
       </div>
     </section>
     <section>
-      <h2>重复推荐视频</h2>
+      <div class="toolbar">
+        <h2>重复推荐视频</h2>
+        <button class="secondary" type="button" id="repeatedRunBtn">加载 Top/重复推荐</button>
+      </div>
       <table>
         <thead><tr><th>视频</th><th>UP 主</th><th>曝光</th><th>重复</th><th>点击</th><th>CTR</th></tr></thead>
         <tbody id="repeatedRows"></tbody>
@@ -479,8 +490,8 @@ function analyticsScript() {
       const number = Number(value || 0);
       return Number.isFinite(number) && number > 0 ? number.toFixed(1) : '';
     }
-    function emptyRow(columns) {
-      return '<tr><td class="muted" colspan="' + columns + '">无数据</td></tr>';
+    function emptyRow(columns, text = '无数据') {
+      return '<tr><td class="muted" colspan="' + columns + '">' + esc(text) + '</td></tr>';
     }
     function renderRows(rows, columns, render) {
       return rows && rows.length ? rows.map(render).join('') : emptyRow(columns);
@@ -497,76 +508,111 @@ function analyticsScript() {
       ['feedback', 'analyticsFeedbackFilter'],
       ['clientId', 'clientFilter']
     ];
-    function analyticsParams() {
+    function analyticsParams(section) {
       const params = new URLSearchParams();
       params.set('days', $('daysInput').value || '30');
       params.set('tzOffsetMinutes', String(-new Date().getTimezoneOffset()));
+      if (section) params.set('section', section);
       for (const item of analyticsFilters) {
         const value = $(item[1]).value.trim();
         if (value) params.set(item[0], value);
       }
       return params.toString();
     }
-    let analyticsLoaded = false;
-    function setAnalyticsStatus(text, error = false) {
-      $('analyticsStatus').textContent = text;
-      $('analyticsStatus').className = error ? 'error' : 'muted';
-    }
-    function refreshAnalytics() {
-      loadAnalytics().catch((error) => setMessage(error.message, true));
+    const analyticsLoaded = { overview: false, dimensions: false, top: false };
+    function setAnalyticsStatus(id, text, error = false) {
+      const node = $(id);
+      if (!node) return;
+      node.textContent = text;
+      node.className = error ? 'error' : 'muted';
     }
     async function refresh() {
       if (!state.secret) {
         setMessage('请输入服务密钥。');
         return;
       }
-      setAnalyticsStatus('未加载');
+      setAnalyticsStatus('analyticsStatus', '未加载');
+      setAnalyticsStatus('dimensionsStatus', '未加载');
+      setAnalyticsStatus('topStatus', '未加载');
+      $('trendRows').innerHTML = emptyRow(5, '未加载');
+      $('topUpRows').innerHTML = emptyRow(6, '未加载');
+      $('modeRows').innerHTML = emptyRow(6, '未加载');
+      $('sourceRows').innerHTML = emptyRow(6, '未加载');
+      $('categoryRows').innerHTML = emptyRow(6, '未加载');
+      $('positionRows').innerHTML = emptyRow(6, '未加载');
+      $('repeatedRows').innerHTML = emptyRow(6, '未加载');
       setMessage('点击“生成分析”后读取实时分析数据。');
     }
-    async function loadAnalytics() {
+    function renderOverview(result) {
+      const metrics = result.metrics || {};
+      const hasRepeatRate = Object.hasOwn(metrics, 'repeatImpressionRate');
+      metric('metricSamples', metrics.sampleCount);
+      metric('metricUps', metrics.distinctUpCount);
+      metric('metricImpressions', metrics.impressionCount);
+      metric('metricClicks', metrics.clickCount);
+      metric('metricCtr', pct(metrics.ctr));
+      metric('metricFeedbackRate', pct(metrics.feedbackRate));
+      metric('metricNegativeRate', pct(metrics.negativeFeedbackRate));
+      metric('metricRepeatRate', hasRepeatRate ? pct(metrics.repeatImpressionRate) : '-');
+      $('trendRows').innerHTML = renderRows(result.trends, 5, (row) =>
+        '<tr><td>' + esc(row.date) + '</td><td>' + esc(row.impressions) + '</td><td>' + esc(row.clicks) + '</td><td>' + esc(pct(row.ctr)) + '</td><td>' + esc(row.feedbacks) + '</td></tr>'
+      );
+    }
+    function renderDimensions(result) {
+      const dimensions = result.dimensions || {};
+      $('modeRows').innerHTML = dimensionRows(dimensions.modes || result.modes || []);
+      $('sourceRows').innerHTML = dimensionRows(dimensions.sources || result.sources || []);
+      $('categoryRows').innerHTML = dimensionRows(dimensions.categories || result.categories || []);
+      $('positionRows').innerHTML = dimensionRows(dimensions.positions || result.positions || []);
+    }
+    function renderTop(result) {
+      const top = result.top || {};
+      $('topUpRows').innerHTML = renderRows(result.topUps || top.ups, 6, (row) =>
+        '<tr><td>' + esc(row.upName || row.key) + '</td><td>' + esc(row.sampleCount) + '</td><td>' + esc(row.seenCount) + '</td><td>' + esc(row.clickCount) + '</td><td>' + esc(pct(row.ctr)) + '</td><td>' + esc(pct(row.negativeFeedbackRate)) + '</td></tr>'
+      );
+      $('repeatedRows').innerHTML = renderRows(result.repeatedSamples || top.repeatedSamples, 6, (row) =>
+        '<tr><td>' + esc(row.title || row.bvid || row.sampleId) + '<div class="muted">' + esc(row.bvid || row.sampleId) + '</div></td><td>' + esc(row.upName || '') + '</td><td>' + esc(row.impressions) + '</td><td>' + esc(row.repeatImpressionCount) + '</td><td>' + esc(row.clicks) + '</td><td>' + esc(pct(row.ctr)) + '</td></tr>'
+      );
+    }
+    async function loadAnalyticsSection(section, statusId, render, loadedMessage) {
       if (!state.secret) {
         setMessage('请输入服务密钥。');
         return;
       }
-      setAnalyticsStatus('加载中');
+      setAnalyticsStatus(statusId, '加载中');
       let result;
       try {
-        result = await api('/api/reports/analytics?' + analyticsParams());
+        result = await api('/api/reports/analytics?' + analyticsParams(section));
       } catch (error) {
-        setAnalyticsStatus('加载失败：' + error.message, true);
+        setAnalyticsStatus(statusId, '加载失败：' + error.message, true);
         throw error;
       }
-      const dimensions = result.dimensions || {};
-      const top = result.top || {};
-      metric('metricSamples', result.metrics.sampleCount);
-      metric('metricUps', result.metrics.distinctUpCount);
-      metric('metricImpressions', result.metrics.impressionCount);
-      metric('metricClicks', result.metrics.clickCount);
-      metric('metricCtr', pct(result.metrics.ctr));
-      metric('metricFeedbackRate', pct(result.metrics.feedbackRate));
-      metric('metricNegativeRate', pct(result.metrics.negativeFeedbackRate));
-      metric('metricRepeatRate', pct(result.metrics.repeatImpressionRate));
-      $('trendRows').innerHTML = renderRows(result.trends, 5, (row) =>
-        '<tr><td>' + esc(row.date) + '</td><td>' + esc(row.impressions) + '</td><td>' + esc(row.clicks) + '</td><td>' + esc(pct(row.ctr)) + '</td><td>' + esc(row.feedbacks) + '</td></tr>'
-      );
-      $('topUpRows').innerHTML = renderRows(result.topUps || top.ups, 6, (row) =>
-        '<tr><td>' + esc(row.upName || row.key) + '</td><td>' + esc(row.sampleCount) + '</td><td>' + esc(row.seenCount) + '</td><td>' + esc(row.clickCount) + '</td><td>' + esc(pct(row.ctr)) + '</td><td>' + esc(pct(row.negativeFeedbackRate)) + '</td></tr>'
-      );
-      $('modeRows').innerHTML = dimensionRows(dimensions.modes || result.modes || []);
-      $('sourceRows').innerHTML = dimensionRows(dimensions.sources || result.sources || []);
-      $('categoryRows').innerHTML = dimensionRows(dimensions.categories || result.categories || []);
-      $('positionRows').innerHTML = dimensionRows(dimensions.positions || []);
-      $('repeatedRows').innerHTML = renderRows(top.repeatedSamples, 6, (row) =>
-        '<tr><td>' + esc(row.title || row.bvid || row.sampleId) + '<div class="muted">' + esc(row.bvid || row.sampleId) + '</div></td><td>' + esc(row.upName || '') + '</td><td>' + esc(row.impressions) + '</td><td>' + esc(row.repeatImpressionCount) + '</td><td>' + esc(row.clicks) + '</td><td>' + esc(pct(row.ctr)) + '</td></tr>'
-      );
-      analyticsLoaded = true;
-      setAnalyticsStatus('已加载');
-      setMessage('分析已生成。');
+      render(result);
+      analyticsLoaded[section] = true;
+      setAnalyticsStatus(statusId, '已加载');
+      setMessage(loadedMessage);
     }
     function markAnalyticsFiltersChanged() {
-      if (analyticsLoaded) setAnalyticsStatus('筛选已更改，点击“生成分析”更新。');
+      if (analyticsLoaded.overview) setAnalyticsStatus('analyticsStatus', '筛选已更改，点击“生成分析”更新。');
+      if (analyticsLoaded.dimensions) setAnalyticsStatus('dimensionsStatus', '筛选已更改，点击“加载维度对比”更新。');
+      if (analyticsLoaded.top) setAnalyticsStatus('topStatus', '筛选已更改，点击“加载 Top/重复推荐”更新。');
     }
-    $('analyticsRunBtn').addEventListener('click', refreshAnalytics);
+    $('analyticsRunBtn').addEventListener('click', () => {
+      loadAnalyticsSection('overview', 'analyticsStatus', renderOverview, '分析概览已生成。')
+        .catch((error) => setMessage(error.message, true));
+    });
+    $('dimensionsRunBtn').addEventListener('click', () => {
+      loadAnalyticsSection('dimensions', 'dimensionsStatus', renderDimensions, '维度对比已加载。')
+        .catch((error) => setMessage(error.message, true));
+    });
+    $('topRunBtn').addEventListener('click', () => {
+      loadAnalyticsSection('top', 'topStatus', renderTop, 'Top/重复推荐已加载。')
+        .catch((error) => setMessage(error.message, true));
+    });
+    $('repeatedRunBtn').addEventListener('click', () => {
+      loadAnalyticsSection('top', 'topStatus', renderTop, 'Top/重复推荐已加载。')
+        .catch((error) => setMessage(error.message, true));
+    });
     $('exportAnalyticsBtn').addEventListener('click', () => {
       download('/api/reports/analytics?' + analyticsParams(), 'tabulabili-analytics.json')
         .catch((error) => setMessage(error.message, true));

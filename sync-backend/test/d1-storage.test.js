@@ -125,7 +125,8 @@ test('D1 storage initializes schema and supports report APIs', { skip: DatabaseS
     { version: 3, name: 'sample_timestamps' },
     { version: 4, name: 'daily_metrics' },
     { version: 5, name: 'analytics_indexes' },
-    { version: 6, name: 'drop_events_up_name_index' }
+    { version: 6, name: 'drop_events_up_name_index' },
+    { version: 7, name: 'report_totals' }
   ]);
   const droppedIndex = fake.db.prepare(`
     select name from sqlite_master
@@ -321,6 +322,97 @@ test('D1 bulk storage handles documented maximum payload idempotently', { skip: 
   assert.equal(duplicate.duplicateEventCount, 2000);
 });
 
+test('D1 report totals migrate and stay accurate across writes and cleanup', { skip: DatabaseSync ? false : 'node:sqlite unavailable' }, async () => {
+  const fake = new FakeD1();
+  const storage = new D1Storage(fake);
+  const batch = {
+    batchId: 'totals-b1',
+    clientId: 'c1',
+    capturedAt: '2026-06-01T00:00:00.000Z',
+    events: [
+      { eventId: 'totals-e1', id: 'BV_TOTALS', bvid: 'BV_TOTALS', title: 'totals', capturedAt: '2026-06-01T00:00:00.000Z' },
+      { eventId: 'totals-e2', id: 'BV_TOTALS', bvid: 'BV_TOTALS', eventKind: 'click', capturedAt: '2026-06-01T00:01:00.000Z' }
+    ]
+  };
+
+  await storage.saveBulkReportBatches([batch]);
+  let totals = fake.db.prepare('select batch_count, event_count, duplicate_event_count, sample_count from report_totals where id = 1').get();
+  assert.deepEqual({ ...totals }, {
+    batch_count: 1,
+    event_count: 2,
+    duplicate_event_count: 0,
+    sample_count: 1
+  });
+
+  await storage.saveBulkReportBatches([batch]);
+  totals = fake.db.prepare('select batch_count, event_count, duplicate_event_count, sample_count from report_totals where id = 1').get();
+  assert.deepEqual({ ...totals }, {
+    batch_count: 1,
+    event_count: 2,
+    duplicate_event_count: 0,
+    sample_count: 1
+  });
+
+  await storage.saveBulkReportBatches([{
+    batchId: 'totals-b2',
+    clientId: 'c1',
+    capturedAt: '2026-06-01T00:02:00.000Z',
+    events: [
+      { eventId: 'totals-e1', id: 'BV_TOTALS', bvid: 'BV_TOTALS', capturedAt: '2026-06-01T00:02:00.000Z' },
+      { eventId: 'totals-e3', id: 'BV_TOTALS', bvid: 'BV_TOTALS', eventKind: 'feedback', feedback: 'like', capturedAt: '2026-06-01T00:03:00.000Z' }
+    ]
+  }]);
+  let summary = await storage.getReportSummary();
+  assert.deepEqual({ ...summary }, {
+    batchCount: 2,
+    eventCount: 3,
+    duplicateEventCount: 1,
+    sampleCount: 1
+  });
+
+  const dryRun = await storage.cleanupReports({ before: '2999-01-01T00:00:00.000Z', dryRun: true });
+  assert.equal(dryRun.matched.events, 3);
+  summary = await storage.getReportSummary();
+  assert.deepEqual({ ...summary }, {
+    batchCount: 2,
+    eventCount: 3,
+    duplicateEventCount: 1,
+    sampleCount: 1
+  });
+
+  const cleanup = await storage.cleanupReports({ before: '2999-01-01T00:00:00.000Z', dryRun: false });
+  assert.equal(cleanup.deleted.events, 3);
+  summary = await storage.getReportSummary();
+  assert.deepEqual({ ...summary }, {
+    batchCount: 0,
+    eventCount: 0,
+    duplicateEventCount: 0,
+    sampleCount: 0
+  });
+});
+
+test('D1 report summary falls back to counts when report_totals is missing', { skip: DatabaseSync ? false : 'node:sqlite unavailable' }, async () => {
+  const fake = new FakeD1();
+  const storage = new D1Storage(fake);
+  await storage.saveBulkReportBatches([{
+    batchId: 'totals-fallback-b1',
+    clientId: 'c1',
+    capturedAt: '2026-06-01T00:00:00.000Z',
+    events: [
+      { eventId: 'totals-fallback-e1', id: 'BV_TOTALS_FALLBACK', capturedAt: '2026-06-01T00:00:00.000Z' }
+    ]
+  }]);
+
+  fake.db.prepare('drop table report_totals').run();
+  const summary = await storage.getReportSummary();
+  assert.deepEqual({ ...summary }, {
+    batchCount: 1,
+    eventCount: 1,
+    duplicateEventCount: 0,
+    sampleCount: 1
+  });
+});
+
 test('analytics uses daily metrics trends when daily rollup is complete', async () => {
   const specs = buildAnalyticsQuerySpecs({ days: 30, tzOffsetMinutes: 0 });
   let eventTrendCalls = 0;
@@ -415,4 +507,97 @@ test('analytics falls back to event trends when daily rollup is incomplete', asy
   assert.deepEqual(analytics.trends.map((row) => ({ date: row.date, impressions: row.impressions, clicks: row.clicks })), [
     { date: '2026-06-01', impressions: 1, clicks: 1 }
   ]);
+});
+
+test('analytics overview section skips dimensions and top queries', async () => {
+  const specs = buildAnalyticsQuerySpecs({ days: 30, tzOffsetMinutes: 0, section: 'overview' });
+  const firstCalls = [];
+  const allCalls = [];
+  const runner = {
+    async first(spec) {
+      firstCalls.push(spec);
+      if (spec === specs.metrics) {
+        return {
+          batchCount: 1,
+          eventCount: 1,
+          sampleCount: 1,
+          distinctUpCount: 1,
+          impressionCount: 1,
+          clickCount: 0,
+          feedbackCount: 0,
+          negativeFeedbackCount: 0
+        };
+      }
+      if (spec === specs.dailyMetrics) return null;
+      throw new Error('unexpected first query');
+    },
+    async all(spec) {
+      allCalls.push(spec);
+      if (spec === specs.trends) return [];
+      throw new Error('unexpected all query');
+    }
+  };
+
+  const analytics = await executeAnalyticsQueries(specs, runner);
+  assert.equal(firstCalls.includes(specs.repeat), false);
+  assert.equal(allCalls.some((spec) => Object.values(specs.dimensions).includes(spec)), false);
+  assert.equal(allCalls.some((spec) => Object.values(specs.top).includes(spec)), false);
+  assert.equal(analytics.metrics.eventCount, 1);
+  assert.equal(Object.hasOwn(analytics.metrics, 'repeatImpressionRate'), false);
+  assert.deepEqual(analytics.trends, []);
+  assert.equal(Object.hasOwn(analytics, 'dimensions'), false);
+});
+
+test('analytics dimensions section skips top and overview queries', async () => {
+  const specs = buildAnalyticsQuerySpecs({ days: 30, section: 'dimensions' });
+  const allCalls = [];
+  const runner = {
+    async first() {
+      throw new Error('unexpected first query');
+    },
+    async all(spec) {
+      allCalls.push(spec);
+      if (Object.values(specs.dimensions).includes(spec)) return [];
+      throw new Error('unexpected all query');
+    }
+  };
+
+  const analytics = await executeAnalyticsQueries(specs, runner);
+  assert.equal(allCalls.length, 5);
+  assert.equal(allCalls.some((spec) => Object.values(specs.top).includes(spec)), false);
+  assert.equal(allCalls.includes(specs.trends), false);
+  assert.deepEqual(analytics.dimensions, {
+    modes: [],
+    sources: [],
+    categories: [],
+    positions: [],
+    feedback: []
+  });
+  assert.equal(Object.hasOwn(analytics, 'metrics'), false);
+});
+
+test('analytics top section skips dimensions and overview queries', async () => {
+  const specs = buildAnalyticsQuerySpecs({ days: 30, section: 'top' });
+  const allCalls = [];
+  const runner = {
+    async first() {
+      throw new Error('unexpected first query');
+    },
+    async all(spec) {
+      allCalls.push(spec);
+      if (Object.values(specs.top).includes(spec)) return [];
+      throw new Error('unexpected all query');
+    }
+  };
+
+  const analytics = await executeAnalyticsQueries(specs, runner);
+  assert.equal(allCalls.length, 3);
+  assert.equal(allCalls.some((spec) => Object.values(specs.dimensions).includes(spec)), false);
+  assert.equal(allCalls.includes(specs.trends), false);
+  assert.deepEqual(analytics.top, {
+    ups: [],
+    samples: [],
+    repeatedSamples: []
+  });
+  assert.equal(Object.hasOwn(analytics, 'metrics'), false);
 });

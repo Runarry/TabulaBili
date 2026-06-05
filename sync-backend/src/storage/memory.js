@@ -3,9 +3,11 @@ import {
   buildReportAnalytics,
   eventMatchesAnalyticsOptions,
   eventMatchesReportEventOptions,
+  filterReportAnalyticsSection,
   filterSamples,
   getDailyMetricDelta,
   normalizeAnalyticsOptions,
+  normalizeAnalyticsSection,
   normalizeEventListOptions,
   normalizeLimit,
   normalizeOffset,
@@ -110,11 +112,12 @@ class MemoryStorage {
 
   async getReportAnalytics(options = {}) {
     const query = normalizeAnalyticsOptions(options);
+    const section = normalizeAnalyticsSection(options.section);
     const events = [...this.events.values()].filter((event) => eventMatchesAnalyticsOptions(event, query));
-    return buildReportAnalytics({
+    return filterReportAnalyticsSection(buildReportAnalytics({
       events,
       range: query
-    });
+    }), section);
   }
 
   async cleanupReports(options = {}) {

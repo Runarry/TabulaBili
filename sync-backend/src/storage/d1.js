@@ -13,7 +13,7 @@ import {
 import { buildAnalyticsQuerySpecs, executeAnalyticsQueries } from './sql-analytics.js';
 
 const MAX_D1_BATCH_STATEMENTS = 100;
-const LATEST_SCHEMA_VERSION = 6;
+const LATEST_SCHEMA_VERSION = 7;
 
 async function allRows(statement) {
   const result = await statement.all();
@@ -135,6 +135,14 @@ class D1Storage {
         negative_feedbacks integer not null default 0,
         primary key (date, client_id, mode, source, category)
       )`,
+      `create table if not exists report_totals (
+        id integer primary key check (id = 1),
+        batch_count integer not null default 0,
+        event_count integer not null default 0,
+        duplicate_event_count integer not null default 0,
+        sample_count integer not null default 0,
+        updated_at text not null
+      )`,
     ];
     const indexStatements = [
       'create index if not exists idx_d1_batches_received_at on batches(received_at desc)',
@@ -186,13 +194,15 @@ class D1Storage {
       await this.db.prepare(sql).run();
     }
     await this.db.prepare('drop index if exists idx_d1_events_up_name_captured_at').run();
+    await this.refreshReportTotals();
     await this.recordMigrations([
       [1, 'base_tables'],
       [2, 'structured_event_columns'],
       [3, 'sample_timestamps'],
       [4, 'daily_metrics'],
       [5, 'analytics_indexes'],
-      [6, 'drop_events_up_name_index']
+      [6, 'drop_events_up_name_index'],
+      [7, 'report_totals']
     ]);
   }
 
@@ -227,6 +237,48 @@ class D1Storage {
         values (?, ?, ?)
       `).bind(version, name, appliedAt).run();
     }
+  }
+
+  async refreshReportTotals() {
+    await this.db.prepare(`
+      insert into report_totals (
+        id, batch_count, event_count, duplicate_event_count, sample_count, updated_at
+      )
+      values (
+        1,
+        (select count(*) from batches),
+        (select count(*) from events),
+        (select coalesce(sum(duplicate_event_count), 0) from batches),
+        (select count(*) from samples),
+        ?
+      )
+      on conflict(id) do update set
+        batch_count = excluded.batch_count,
+        event_count = excluded.event_count,
+        duplicate_event_count = excluded.duplicate_event_count,
+        sample_count = excluded.sample_count,
+        updated_at = excluded.updated_at
+    `).bind(new Date().toISOString()).run();
+  }
+
+  async incrementReportTotals(delta) {
+    const batchCount = Number(delta.batchCount || 0);
+    const eventCount = Number(delta.eventCount || 0);
+    const duplicateEventCount = Number(delta.duplicateEventCount || 0);
+    const sampleCount = Number(delta.sampleCount || 0);
+    if (!batchCount && !eventCount && !duplicateEventCount && !sampleCount) return;
+    await this.db.prepare(`
+      insert into report_totals (
+        id, batch_count, event_count, duplicate_event_count, sample_count, updated_at
+      )
+      values (1, ?, ?, ?, ?, ?)
+      on conflict(id) do update set
+        batch_count = report_totals.batch_count + excluded.batch_count,
+        event_count = report_totals.event_count + excluded.event_count,
+        duplicate_event_count = report_totals.duplicate_event_count + excluded.duplicate_event_count,
+        sample_count = report_totals.sample_count + excluded.sample_count,
+        updated_at = excluded.updated_at
+    `).bind(batchCount, eventCount, duplicateEventCount, sampleCount, new Date().toISOString()).run();
   }
 
   async getConfig() {
@@ -488,7 +540,9 @@ class D1Storage {
     const currentAggregates = new Map(existingAggregates);
     const changedSampleIds = new Set();
     const changedSampleReceivedAt = new Map();
+    const newSampleIds = new Set();
     const dailyMetrics = new Map();
+    let insertedEventCount = 0;
 
     for (let index = 0; index < eventEntries.length; index += 1) {
       const { info, event, eventRow, sampleId } = eventEntries[index];
@@ -496,9 +550,11 @@ class D1Storage {
         info.duplicateEventCount += 1;
         continue;
       }
+      insertedEventCount += 1;
       addDailyMetricEvent(dailyMetrics, eventRow);
 
       if (!sampleId) continue;
+      if (!existingAggregates.has(sampleId)) newSampleIds.add(sampleId);
       const aggregate = mergeAggregate(currentAggregates.get(sampleId) || null, event);
       currentAggregates.set(sampleId, aggregate);
       changedSampleIds.add(sampleId);
@@ -514,6 +570,12 @@ class D1Storage {
       .map((info) =>
       this.createUpdateBatchDuplicateStatement(info.batch.batchId, info.duplicateEventCount));
     await this.runStatements([...sampleStatements, ...metricStatements, ...batchUpdateStatements]);
+    await this.incrementReportTotals({
+      batchCount: activeBatchInfos.length,
+      eventCount: insertedEventCount,
+      duplicateEventCount: activeBatchInfos.reduce((sum, info) => sum + info.duplicateEventCount, 0),
+      sampleCount: newSampleIds.size
+    });
 
     for (const info of activeBatchInfos) {
       results[info.index] = {
@@ -534,6 +596,21 @@ class D1Storage {
 
   async getReportSummary() {
     const db = this.getReadDb();
+    try {
+      const totals = await firstRow(db.prepare(`
+        select
+          batch_count as batchCount,
+          event_count as eventCount,
+          duplicate_event_count as duplicateEventCount,
+          sample_count as sampleCount
+        from report_totals
+        where id = 1
+      `));
+      if (totals) return totals;
+    } catch (error) {
+      if (!isMissingTableError(error, ['report_totals'])) throw error;
+    }
+
     try {
       const row = await firstRow(db.prepare(`
         select
@@ -643,6 +720,7 @@ class D1Storage {
       delete from samples
       where not exists (select 1 from events where events.sample_id = samples.sample_id)
     `).run());
+    await this.refreshReportTotals();
     return { before, dryRun, matched, deleted: { events, batches, orphanSamples } };
   }
 

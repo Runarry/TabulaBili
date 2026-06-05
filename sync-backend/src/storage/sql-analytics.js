@@ -1,8 +1,10 @@
 import {
   TOP_ANALYTICS_LIMIT,
   buildReportAnalyticsFromSqlRows,
+  filterReportAnalyticsSection,
   getAnalyticsEventWhere,
-  normalizeAnalyticsOptions
+  normalizeAnalyticsOptions,
+  normalizeAnalyticsSection
 } from './helpers.js';
 
 function metricColumns() {
@@ -137,6 +139,7 @@ function sampleTopQuery(whereSql, args, options = {}) {
 
 function buildAnalyticsQuerySpecs(options = {}) {
   const query = normalizeAnalyticsOptions(options);
+  const section = normalizeAnalyticsSection(options.section);
   const { whereSql, args } = getAnalyticsEventWhere(query);
   const dailyWhere = canUseDailyMetrics(query) ? dailyMetricWhere(query) : null;
   const feedbackWhereSql = appendWhereCondition(whereSql, "event_kind = 'feedback'");
@@ -146,6 +149,7 @@ function buildAnalyticsQuerySpecs(options = {}) {
   const upKeySql = "coalesce(nullif(up_mid, ''), nullif(up_name, ''), 'unknown')";
 
   return {
+    section,
     range: query,
     dailyMetrics: dailyWhere ? dailyMetricsQuery(dailyWhere.whereSql, dailyWhere.args) : null,
     metrics: {
@@ -256,6 +260,11 @@ function hasCompleteDailyMetrics(metricsRow, dailyMetricsRow) {
 }
 
 async function executeAnalyticsQueries(specs, runner) {
+  const section = normalizeAnalyticsSection(specs.section);
+  if (section === 'overview') return executeOverviewAnalyticsQueries(specs, runner);
+  if (section === 'dimensions') return executeDimensionAnalyticsQueries(specs, runner);
+  if (section === 'top') return executeTopAnalyticsQueries(specs, runner);
+
   const [metricsRow, dailyMetricsRow] = await Promise.all([
     runner.first(specs.metrics),
     optionalFirst(specs.dailyMetrics, runner)
@@ -298,6 +307,65 @@ async function executeAnalyticsQueries(specs, runner) {
     dimensions: { modes, sources, categories, positions, feedback },
     top: { ups, samples, repeatedSamples }
   });
+}
+
+async function executeOverviewAnalyticsQueries(specs, runner) {
+  const [metricsRow, dailyMetricsRow] = await Promise.all([
+    runner.first(specs.metrics),
+    optionalFirst(specs.dailyMetrics, runner)
+  ]);
+  const useDailyTrends = specs.dailyTrends && hasCompleteDailyMetrics(metricsRow, dailyMetricsRow);
+  const trends = useDailyTrends
+    ? await optionalAll(specs.dailyTrends, runner).then((rows) => rows || runner.all(specs.trends))
+    : await runner.all(specs.trends);
+  const analytics = buildReportAnalyticsFromSqlRows({
+    range: specs.range,
+    metricsRow,
+    dailyMetricsRow,
+    repeatRow: null,
+    trends,
+    dimensions: {},
+    top: {}
+  });
+  return filterReportAnalyticsSection(analytics, 'overview');
+}
+
+async function executeDimensionAnalyticsQueries(specs, runner) {
+  const [modes, sources, categories, positions, feedback] = await Promise.all([
+    runner.all(specs.dimensions.modes),
+    runner.all(specs.dimensions.sources),
+    runner.all(specs.dimensions.categories),
+    runner.all(specs.dimensions.positions),
+    runner.all(specs.dimensions.feedback)
+  ]);
+  const analytics = buildReportAnalyticsFromSqlRows({
+    range: specs.range,
+    metricsRow: null,
+    dailyMetricsRow: null,
+    repeatRow: null,
+    trends: [],
+    dimensions: { modes, sources, categories, positions, feedback },
+    top: {}
+  });
+  return filterReportAnalyticsSection(analytics, 'dimensions');
+}
+
+async function executeTopAnalyticsQueries(specs, runner) {
+  const [ups, samples, repeatedSamples] = await Promise.all([
+    runner.all(specs.top.ups),
+    runner.all(specs.top.samples),
+    runner.all(specs.top.repeatedSamples)
+  ]);
+  const analytics = buildReportAnalyticsFromSqlRows({
+    range: specs.range,
+    metricsRow: null,
+    dailyMetricsRow: null,
+    repeatRow: null,
+    trends: [],
+    dimensions: {},
+    top: { ups, samples, repeatedSamples }
+  });
+  return filterReportAnalyticsSection(analytics, 'top');
 }
 
 export {

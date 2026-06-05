@@ -82,6 +82,14 @@ class SqliteStorage {
         negative_feedbacks integer not null default 0,
         primary key (date, client_id, mode, source, category)
       );
+      create table if not exists report_totals (
+        id integer primary key check (id = 1),
+        batch_count integer not null default 0,
+        event_count integer not null default 0,
+        duplicate_event_count integer not null default 0,
+        sample_count integer not null default 0,
+        updated_at text not null
+      );
     `);
     this.ensureColumns([
       ['batches', 'duplicate_event_count', 'integer not null default 0'],
@@ -133,8 +141,10 @@ class SqliteStorage {
       [3, 'sample_timestamps'],
       [4, 'daily_metrics'],
       [5, 'analytics_indexes'],
-      [6, 'drop_events_up_name_index']
+      [6, 'drop_events_up_name_index'],
+      [7, 'report_totals']
     ]);
+    this.refreshReportTotals();
   }
 
   ensureColumns(columns) {
@@ -156,6 +166,48 @@ class SqliteStorage {
     for (const [version, name] of migrations) {
       insert.run(version, name, appliedAt);
     }
+  }
+
+  refreshReportTotals() {
+    this.db.prepare(`
+      insert into report_totals (
+        id, batch_count, event_count, duplicate_event_count, sample_count, updated_at
+      )
+      values (
+        1,
+        (select count(*) from batches),
+        (select count(*) from events),
+        (select coalesce(sum(duplicate_event_count), 0) from batches),
+        (select count(*) from samples),
+        ?
+      )
+      on conflict(id) do update set
+        batch_count = excluded.batch_count,
+        event_count = excluded.event_count,
+        duplicate_event_count = excluded.duplicate_event_count,
+        sample_count = excluded.sample_count,
+        updated_at = excluded.updated_at
+    `).run(new Date().toISOString());
+  }
+
+  incrementReportTotals(delta) {
+    const batchCount = Number(delta.batchCount || 0);
+    const eventCount = Number(delta.eventCount || 0);
+    const duplicateEventCount = Number(delta.duplicateEventCount || 0);
+    const sampleCount = Number(delta.sampleCount || 0);
+    if (!batchCount && !eventCount && !duplicateEventCount && !sampleCount) return;
+    this.db.prepare(`
+      insert into report_totals (
+        id, batch_count, event_count, duplicate_event_count, sample_count, updated_at
+      )
+      values (1, ?, ?, ?, ?, ?)
+      on conflict(id) do update set
+        batch_count = report_totals.batch_count + excluded.batch_count,
+        event_count = report_totals.event_count + excluded.event_count,
+        duplicate_event_count = report_totals.duplicate_event_count + excluded.duplicate_event_count,
+        sample_count = report_totals.sample_count + excluded.sample_count,
+        updated_at = excluded.updated_at
+    `).run(batchCount, eventCount, duplicateEventCount, sampleCount, new Date().toISOString());
   }
 
   async getConfig() {
@@ -181,6 +233,8 @@ class SqliteStorage {
     const tx = this.db.transaction(() => {
       const receivedAt = new Date().toISOString();
       let duplicateEventCount = 0;
+      let insertedEventCount = 0;
+      const newSampleIds = new Set();
       this.db.prepare(`
         insert into batches (batch_id, client_id, captured_at, received_at, event_count, duplicate_event_count, raw_json)
         values (?, ?, ?, ?, ?, 0, ?)
@@ -256,6 +310,8 @@ class SqliteStorage {
           duplicateEventCount += 1;
           continue;
         }
+        insertedEventCount += 1;
+        if (sampleId && !existingSample) newSampleIds.add(sampleId);
         addDailyMetricEvent(dailyMetrics, eventRow);
 
         if (!sampleId) continue;
@@ -296,6 +352,12 @@ class SqliteStorage {
       if (duplicateEventCount > 0) {
         this.db.prepare('update batches set duplicate_event_count = ? where batch_id = ?').run(duplicateEventCount, batch.batchId);
       }
+      this.incrementReportTotals({
+        batchCount: 1,
+        eventCount: insertedEventCount,
+        duplicateEventCount,
+        sampleCount: newSampleIds.size
+      });
       return duplicateEventCount;
     });
 
@@ -304,6 +366,21 @@ class SqliteStorage {
   }
 
   async getReportSummary() {
+    try {
+      const totals = this.db.prepare(`
+        select
+          batch_count as batchCount,
+          event_count as eventCount,
+          duplicate_event_count as duplicateEventCount,
+          sample_count as sampleCount
+        from report_totals
+        where id = 1
+      `).get();
+      if (totals) return totals;
+    } catch (error) {
+      if (!String(error && error.message || error).toLowerCase().includes('no such table')) throw error;
+    }
+
     const row = this.db.prepare(`
       select
         (select count(*) from batches) as batchCount,
@@ -379,6 +456,7 @@ class SqliteStorage {
         delete from samples
         where not exists (select 1 from events where events.sample_id = samples.sample_id)
       `).run().changes;
+      this.refreshReportTotals();
       return { events, batches, orphanSamples };
     });
 

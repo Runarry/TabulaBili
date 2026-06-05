@@ -184,6 +184,7 @@ function createApp(options) {
   const storage = options.storage;
   const secret = options.secret;
   const readCache = new Map();
+  let configEnvelopeCache = null;
   if (!storage) throw new Error('storage is required');
   if (!secret) throw new Error('SYNC_SECRET is required');
 
@@ -230,6 +231,28 @@ function createApp(options) {
     return json(setReadCache(key, await createValue()));
   }
 
+  function getConfigEnvelopeCache() {
+    if (!configEnvelopeCache || configEnvelopeCache.expiresAt <= Date.now()) {
+      configEnvelopeCache = null;
+      return undefined;
+    }
+    return configEnvelopeCache.value;
+  }
+
+  function setConfigEnvelopeCache(value) {
+    configEnvelopeCache = {
+      value,
+      expiresAt: Date.now() + READ_CACHE_TTL_MS
+    };
+    return value;
+  }
+
+  async function getCachedConfigEnvelope() {
+    const cached = getConfigEnvelopeCache();
+    if (cached !== undefined) return cached;
+    return setConfigEnvelopeCache(await storage.getConfig());
+  }
+
   return {
     async fetch(request) {
       const url = new URL(request.url);
@@ -252,10 +275,11 @@ function createApp(options) {
 
       if (url.pathname === '/api/config/sync' && request.method === 'POST') {
         const body = await readJson(request);
-        const current = await storage.getConfig();
+        const current = await getCachedConfigEnvelope();
         const merged = mergeConfig(current, body && body.config ? body.config : body);
         if (!current || !sameConfigEnvelope(current, merged)) {
           await storage.saveConfig(merged);
+          setConfigEnvelopeCache(merged);
           invalidateReadCache();
         }
         return json({ config: normalizeEnvelope(merged), materialized: materializeConfig(merged) });
@@ -263,7 +287,7 @@ function createApp(options) {
 
       if (url.pathname === '/api/config' && request.method === 'GET') {
         return cachedJson(getReadCacheKey('config', url), async () => {
-          const config = normalizeEnvelope(await storage.getConfig());
+          const config = normalizeEnvelope(await getCachedConfigEnvelope());
           return { config, materialized: materializeConfig(config) };
         });
       }
@@ -334,7 +358,8 @@ function createApp(options) {
           mode: url.searchParams.get('mode') || '',
           source: url.searchParams.get('source') || '',
           category: url.searchParams.get('category') || '',
-          feedback: url.searchParams.get('feedback') || ''
+          feedback: url.searchParams.get('feedback') || '',
+          section: url.searchParams.get('section') || 'all'
         }));
       }
 

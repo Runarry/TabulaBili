@@ -129,6 +129,7 @@ test('config sync skips storage writes when config is unchanged', async () => {
   }));
   assert.equal(first.status, 200);
   assert.equal(storage.saveConfigCalls, 1);
+  assert.equal(storage.configCalls, 1);
 
   const second = await app.fetch(new Request('http://local/api/config/sync', {
     method: 'POST',
@@ -137,6 +138,7 @@ test('config sync skips storage writes when config is unchanged', async () => {
   }));
   assert.equal(second.status, 200);
   assert.equal(storage.saveConfigCalls, 1);
+  assert.equal(storage.configCalls, 1);
   assert.equal((await second.json()).materialized.bili_mode, 'fusion');
 
   const changed = await app.fetch(new Request('http://local/api/config/sync', {
@@ -153,7 +155,13 @@ test('config sync skips storage writes when config is unchanged', async () => {
   }));
   assert.equal(changed.status, 200);
   assert.equal(storage.saveConfigCalls, 2);
+  assert.equal(storage.configCalls, 1);
   assert.equal((await changed.json()).materialized.bili_mode, 'origin');
+
+  const configResponse = await app.fetch(new Request('http://local/api/config', { headers }));
+  assert.equal(configResponse.status, 200);
+  assert.equal((await configResponse.json()).materialized.bili_mode, 'origin');
+  assert.equal(storage.configCalls, 1);
 });
 
 test('admin routes render data and analytics pages', async () => {
@@ -173,9 +181,15 @@ test('admin routes render data and analytics pages', async () => {
   const analyticsHtml = await analytics.text();
   assert.match(analyticsHtml, /分析概览/);
   assert.match(analyticsHtml, /生成分析/);
+  assert.match(analyticsHtml, /加载维度对比/);
+  assert.match(analyticsHtml, /加载 Top\/重复推荐/);
   assert.match(analyticsHtml, /点击“生成分析”后读取实时分析数据/);
   assert.match(analyticsHtml, /维度对比/);
   assert.match(analyticsHtml, /重复推荐视频/);
+  assert.match(analyticsHtml, /params\.set\('section', section\)/);
+  assert.match(analyticsHtml, /loadAnalyticsSection\('overview'/);
+  assert.match(analyticsHtml, /loadAnalyticsSection\('dimensions'/);
+  assert.match(analyticsHtml, /loadAnalyticsSection\('top'/);
   assert.doesNotMatch(analyticsHtml, /auth=/);
 });
 

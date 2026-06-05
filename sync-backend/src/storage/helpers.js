@@ -10,6 +10,7 @@ const ANALYTICS_FILTERS = [
 
 const NEGATIVE_FEEDBACK = new Set(['dislike', 'blocked']);
 const TOP_ANALYTICS_LIMIT = 20;
+const ANALYTICS_SECTIONS = new Set(['overview', 'dimensions', 'top', 'all']);
 
 const SAMPLE_SORTS = new Set([
   'lastSeenAt',
@@ -277,6 +278,48 @@ function normalizeAnalyticsOptions(options = {}) {
     sinceIso: new Date(sinceMs).toISOString(),
     ...filters,
     filters
+  };
+}
+
+function normalizeAnalyticsSection(value) {
+  const section = String(value || 'all').trim().toLowerCase();
+  return ANALYTICS_SECTIONS.has(section) ? section : 'all';
+}
+
+function filterReportAnalyticsSection(analytics, sectionValue) {
+  const section = normalizeAnalyticsSection(sectionValue);
+  if (section === 'all') return analytics;
+  if (section === 'overview') {
+    const metrics = { ...(analytics.metrics || {}) };
+    delete metrics.repeatSampleCount;
+    delete metrics.repeatImpressionCount;
+    delete metrics.repeatImpressionRate;
+    return {
+      range: analytics.range,
+      metrics,
+      trends: analytics.trends || []
+    };
+  }
+  if (section === 'dimensions') {
+    const dimensions = analytics.dimensions || {};
+    return {
+      range: analytics.range,
+      dimensions,
+      modes: dimensions.modes || analytics.modes || [],
+      sources: dimensions.sources || analytics.sources || [],
+      categories: dimensions.categories || analytics.categories || [],
+      positions: dimensions.positions || [],
+      feedback: dimensions.feedback || analytics.feedback || []
+    };
+  }
+
+  const top = analytics.top || {};
+  return {
+    range: analytics.range,
+    top,
+    topUps: top.ups || analytics.topUps || [],
+    samples: top.samples || [],
+    repeatedSamples: top.repeatedSamples || []
   };
 }
 
@@ -870,6 +913,7 @@ export {
   buildReportAnalytics,
   eventMatchesReportEventOptions,
   eventMatchesAnalyticsOptions,
+  filterReportAnalyticsSection,
   filterSamples,
   getAnalyticsEventWhere,
   getDailyMetricDelta,
@@ -877,6 +921,7 @@ export {
   getSampleOrderBy,
   getSampleWhere,
   normalizeAnalyticsOptions,
+  normalizeAnalyticsSection,
   normalizeEventListOptions,
   normalizeLimit,
   normalizeOffset,
