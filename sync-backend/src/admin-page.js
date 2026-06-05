@@ -39,14 +39,19 @@ function adminPage(activePage = 'data') {
     .grow { flex: 1 1 220px; }
     .muted { color: #667085; }
     .error { color: #b42318; }
+    .header-actions { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+    .login-screen { max-width: 420px; margin: 48px auto; }
+    .login-panel { display: grid; gap: 12px; }
+    .login-panel input, .login-panel button { width: 100%; box-sizing: border-box; }
     .pager { display: flex; gap: 8px; align-items: center; justify-content: flex-end; margin-top: 10px; flex-wrap: wrap; }
     .table-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
     .table-panel h3 { margin: 0 0 8px; font-size: 15px; }
+    [hidden] { display: none !important; }
     @media (max-width: 760px) {
       .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .table-grid { grid-template-columns: 1fr; }
       header { display: block; }
-      .login { margin-top: 12px; }
+      .header-actions { margin-top: 12px; justify-content: flex-start; }
       .toolbar input, .toolbar select, .toolbar button { width: 100%; }
     }
   </style>
@@ -56,24 +61,41 @@ function adminPage(activePage = 'data') {
     <div>
       <h1>TabulaBili Sync</h1>
       <div class="muted">配置同步与推荐数据上报后台</div>
+    </div>
+    <div class="header-actions" id="appNav" hidden>
       <nav>
         <a class="${page === 'data' ? 'active' : ''}" href="/data">数据</a>
         <a class="${page === 'analytics' ? 'active' : ''}" href="/analytics">分析</a>
       </nav>
+      <button class="secondary" type="button" id="logoutBtn">退出</button>
     </div>
-    <form class="login" id="loginForm">
-      <input id="secretInput" type="password" placeholder="服务密钥" autocomplete="current-password">
-      <button type="submit">登录</button>
-    </form>
   </header>
   <main>
-    <p id="message" class="muted"></p>
-    ${body}
+    <section class="login-screen" id="loginScreen">
+      <form class="login-panel" id="loginForm">
+        <h2>登录后台</h2>
+        <input id="secretInput" type="password" placeholder="服务密钥" autocomplete="current-password">
+        <button type="submit">登录</button>
+        <p id="loginMessage" class="muted">请输入服务密钥。</p>
+      </form>
+    </section>
+    <div id="appShell" hidden>
+      <p id="message" class="muted"></p>
+      ${body}
+    </div>
   </main>
   <script>
-    const state = { secret: localStorage.getItem('tabulabili_sync_secret') || '' };
+    const AUTH_SESSION_KEY = 'tabulabili_sync_authenticated';
+    const state = {
+      secret: localStorage.getItem('tabulabili_sync_secret') || '',
+      authenticated: sessionStorage.getItem(AUTH_SESSION_KEY) === '1'
+    };
     const $ = (id) => document.getElementById(id);
     $('secretInput').value = state.secret;
+    function setLoginMessage(text, error = false) {
+      $('loginMessage').textContent = text;
+      $('loginMessage').className = error ? 'error' : 'muted';
+    }
     function setMessage(text, error = false) {
       $('message').textContent = text;
       $('message').className = error ? 'error' : 'muted';
@@ -112,19 +134,70 @@ function adminPage(activePage = 'data') {
       const node = $(id);
       if (node) node.textContent = String(value == null ? 0 : value);
     }
+    function isUnauthorizedError(error) {
+      return String(error && error.message || error).includes('unauthorized');
+    }
+    function showLogin(text = '请输入服务密钥。', error = false) {
+      state.authenticated = false;
+      sessionStorage.removeItem(AUTH_SESSION_KEY);
+      $('appNav').hidden = true;
+      $('appShell').hidden = true;
+      $('loginScreen').hidden = false;
+      setLoginMessage(text, error);
+      setTimeout(() => $('secretInput').focus(), 0);
+    }
+    function showApp() {
+      $('loginScreen').hidden = true;
+      $('appNav').hidden = false;
+      $('appShell').hidden = false;
+      setLoginMessage('');
+    }
     $('loginForm').addEventListener('submit', async (event) => {
       event.preventDefault();
-      state.secret = $('secretInput').value.trim();
-      localStorage.setItem('tabulabili_sync_secret', state.secret);
+      const secret = $('secretInput').value.trim();
+      if (!secret) {
+        showLogin('请输入服务密钥。', true);
+        return;
+      }
+      setLoginMessage('正在验证。');
       try {
-        await fetch('/api/auth/check', { method: 'POST', headers: { Authorization: 'Bearer ' + state.secret } });
-        await refresh();
+        const response = await fetch('/api/auth/check', { method: 'POST', headers: { Authorization: 'Bearer ' + secret } });
+        if (!response.ok) throw new Error(await response.text());
+        state.secret = secret;
+        state.authenticated = true;
+        localStorage.setItem('tabulabili_sync_secret', state.secret);
+        sessionStorage.setItem(AUTH_SESSION_KEY, '1');
+        showApp();
+        await refresh().catch((error) => setMessage(error.message, true));
       } catch (error) {
-        setMessage('登录失败：' + error.message, true);
+        localStorage.removeItem('tabulabili_sync_secret');
+        state.secret = '';
+        showLogin('登录失败：' + error.message, true);
       }
     });
+    $('logoutBtn').addEventListener('click', () => {
+      localStorage.removeItem('tabulabili_sync_secret');
+      state.secret = '';
+      showLogin('已退出。');
+    });
     ${script}
-    refresh().catch(() => setMessage('请输入服务密钥。'));
+    function initAdmin() {
+      if (!state.secret || !state.authenticated) {
+        showLogin('请输入服务密钥。');
+        return;
+      }
+      showApp();
+      refresh().catch((error) => {
+        if (isUnauthorizedError(error)) {
+          localStorage.removeItem('tabulabili_sync_secret');
+          state.secret = '';
+          showLogin('登录状态已失效，请重新登录。', true);
+          return;
+        }
+        setMessage(error.message, true);
+      });
+    }
+    initAdmin();
   </script>
 </body>
 </html>`;

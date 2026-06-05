@@ -174,6 +174,12 @@ test('admin routes render data and analytics pages', async () => {
   assert.match(dataHtml, /加载最近批次/);
   assert.match(dataHtml, /加载聚合样本/);
   assert.match(dataHtml, /return loadSummary\(\)/);
+  assert.match(dataHtml, /id="loginScreen"/);
+  assert.match(dataHtml, /id="appShell" hidden/);
+  assert.match(dataHtml, /id="appNav" hidden/);
+  assert.match(dataHtml, /const AUTH_SESSION_KEY = 'tabulabili_sync_authenticated'/);
+  assert.match(dataHtml, /initAdmin\(\)/);
+  assert.doesNotMatch(dataHtml, /refresh\(\)\.catch\(\(\) => setMessage\('请输入服务密钥。'\)\)/);
   assert.doesNotMatch(dataHtml, /auth=/);
 
   const analytics = await app.fetch(new Request('http://local/analytics'));
@@ -190,6 +196,8 @@ test('admin routes render data and analytics pages', async () => {
   assert.match(analyticsHtml, /loadAnalyticsSection\('overview'/);
   assert.match(analyticsHtml, /loadAnalyticsSection\('dimensions'/);
   assert.match(analyticsHtml, /loadAnalyticsSection\('top'/);
+  assert.match(analyticsHtml, /id="loginScreen"/);
+  assert.match(analyticsHtml, /id="appShell" hidden/);
   assert.doesNotMatch(analyticsHtml, /auth=/);
 });
 
