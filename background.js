@@ -69,6 +69,32 @@ function storageSet(values) {
   });
 }
 
+function alarmsGet(name) {
+  if (!extensionApi.alarms || !extensionApi.alarms.get) return Promise.resolve(null);
+  if (usePromiseApi) return extensionApi.alarms.get(name);
+
+  return new Promise((resolve, reject) => {
+    extensionApi.alarms.get(name, (alarm) => {
+      const error = getLastRuntimeError();
+      if (error) reject(error);
+      else resolve(alarm || null);
+    });
+  });
+}
+
+function alarmsCreate(name, alarmInfo) {
+  if (!extensionApi.alarms) return Promise.resolve();
+  return Promise.resolve(extensionApi.alarms.create(name, alarmInfo));
+}
+
+async function ensureAlarm(name, alarmInfo) {
+  const existing = await alarmsGet(name).catch(() => null);
+  const existingPeriod = Number(existing && existing.periodInMinutes);
+  const nextPeriod = Number(alarmInfo && alarmInfo.periodInMinutes);
+  if (existing && Number.isFinite(existingPeriod) && existingPeriod === nextPeriod) return;
+  await alarmsCreate(name, alarmInfo);
+}
+
 function mergePendingAnalysisUpdate(extra) {
   const next = {
     ...(pendingAnalysisUpdate || {}),
@@ -252,6 +278,42 @@ async function updateReportQueueStatus(queuedBatches = null) {
     }
   });
   return count;
+}
+
+function getStoredTime(value) {
+  if (typeof value !== 'string' || !value) return 0;
+  const time = new Date(value).getTime();
+  return Number.isFinite(time) ? time : 0;
+}
+
+async function claimAutomaticReportFlushSlot() {
+  const now = Date.now();
+  const result = await storageGet([
+    syncStore.REPORT_FREQUENCY_KEY,
+    syncStore.REPORT_LAST_FLUSH_AT_KEY
+  ]);
+  const frequency = syncStore.normalizeFrequency(result[syncStore.REPORT_FREQUENCY_KEY]);
+  const intervalMs = frequency * 60 * 1000;
+  const lastFlushAt = getStoredTime(result[syncStore.REPORT_LAST_FLUSH_AT_KEY]);
+  const nextFlushAt = lastFlushAt ? lastFlushAt + intervalMs : 0;
+
+  if (nextFlushAt && now < nextFlushAt) {
+    return {
+      allowed: false,
+      frequency,
+      lastFlushAt: new Date(lastFlushAt).toISOString(),
+      nextFlushAt: new Date(nextFlushAt).toISOString()
+    };
+  }
+
+  const checkedAt = new Date(now).toISOString();
+  await storageSet({ [syncStore.REPORT_LAST_FLUSH_AT_KEY]: checkedAt });
+  return {
+    allowed: true,
+    frequency,
+    lastFlushAt: lastFlushAt ? new Date(lastFlushAt).toISOString() : '',
+    nextFlushAt: new Date(now + intervalMs).toISOString()
+  };
 }
 
 async function ensureReportQueueMigrated() {
@@ -482,8 +544,22 @@ async function flushReportQueue(force = false) {
 
 async function flushReportQueueNow(force = false) {
   await ensureReportQueueMigrated();
-  const connection = await getSyncConnection();
   const queuedBatches = await updateReportQueueStatus();
+  if (!force) {
+    const throttle = await claimAutomaticReportFlushSlot();
+    if (!throttle.allowed) {
+      return {
+        skipped: true,
+        reason: 'throttled',
+        queuedBatches,
+        frequency: throttle.frequency,
+        nextFlushAt: throttle.nextFlushAt,
+        lastFlushAt: throttle.lastFlushAt
+      };
+    }
+  }
+
+  const connection = await getSyncConnection();
   if (!connection.enabled) {
     if (force) await setSyncStatus(false, '同步与上报未启用');
     return { skipped: true, reason: 'disabled', queuedBatches };
@@ -568,8 +644,8 @@ async function scheduleSyncAlarms() {
   if (!extensionApi.alarms) return;
   const result = await storageGet([syncStore.REPORT_FREQUENCY_KEY]);
   const frequency = syncStore.normalizeFrequency(result[syncStore.REPORT_FREQUENCY_KEY]);
-  extensionApi.alarms.create(CONFIG_SYNC_ALARM, { periodInMinutes: 60 });
-  extensionApi.alarms.create(REPORT_SYNC_ALARM, { periodInMinutes: frequency });
+  await ensureAlarm(CONFIG_SYNC_ALARM, { periodInMinutes: 60 });
+  await ensureAlarm(REPORT_SYNC_ALARM, { periodInMinutes: frequency });
 }
 
 async function initializeSyncBackground() {

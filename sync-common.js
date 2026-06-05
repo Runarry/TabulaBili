@@ -7,6 +7,7 @@ globalThis.TabulaBiliSync = (() => {
   const REPORT_QUEUE_KEY = 'tabulabili_report_queue_v1';
   const REPORT_QUEUE_STATUS_KEY = 'tabulabili_report_queue_status_v1';
   const REPORT_FREQUENCY_KEY = 'tabulabili_report_frequency_minutes';
+  const REPORT_LAST_FLUSH_AT_KEY = 'tabulabili_report_last_flush_at_v1';
   const LAST_STATUS_KEY = 'tabulabili_sync_last_status_v1';
   const RETRY_STATE_KEY = 'tabulabili_sync_retry_state_v1';
   const MAX_REPORT_BATCHES = 200;
@@ -427,6 +428,7 @@ globalThis.TabulaBiliSync = (() => {
     REPORT_QUEUE_KEY,
     REPORT_QUEUE_STATUS_KEY,
     REPORT_FREQUENCY_KEY,
+    REPORT_LAST_FLUSH_AT_KEY,
     LAST_STATUS_KEY,
     RETRY_STATE_KEY,
     DB_NAME,
