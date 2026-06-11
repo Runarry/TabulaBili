@@ -126,7 +126,8 @@ test('D1 storage initializes schema and supports report APIs', { skip: DatabaseS
     { version: 4, name: 'daily_metrics' },
     { version: 5, name: 'analytics_indexes' },
     { version: 6, name: 'drop_events_up_name_index' },
-    { version: 7, name: 'report_totals' }
+    { version: 7, name: 'report_totals' },
+    { version: 8, name: 'up_portrait_collector' }
   ]);
   const droppedIndex = fake.db.prepare(`
     select name from sqlite_master

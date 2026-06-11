@@ -10,6 +10,7 @@ mkdirSync(dirname(dbPath), { recursive: true });
 
 const app = createApp({
   secret: process.env.SYNC_SECRET,
+  env: process.env,
   storage: new SqliteStorage(dbPath)
 });
 

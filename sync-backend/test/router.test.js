@@ -199,6 +199,17 @@ test('admin routes render data and analytics pages', async () => {
   assert.match(analyticsHtml, /id="loginScreen"/);
   assert.match(analyticsHtml, /id="appShell" hidden/);
   assert.doesNotMatch(analyticsHtml, /auth=/);
+
+  const upProfiles = await app.fetch(new Request('http://local/up-profiles'));
+  assert.equal(upProfiles.status, 200);
+  const upHtml = await upProfiles.text();
+  assert.match(upHtml, /UP画像采集/);
+  assert.match(upHtml, /导入 UID/);
+  assert.match(upHtml, /运行一批采集/);
+  assert.match(upHtml, /LLM 分析/);
+  assert.match(upHtml, /id="loginScreen"/);
+  assert.match(upHtml, /id="appShell" hidden/);
+  assert.doesNotMatch(upHtml, /auth=/);
 });
 
 test('bulk report endpoint saves multiple batches idempotently and preserves batch ids', async () => {

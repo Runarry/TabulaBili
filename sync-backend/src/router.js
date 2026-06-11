@@ -1,6 +1,10 @@
 import { adminPage } from './admin-page.js';
+import { BilibiliClient } from './bilibili-client.js';
 import { materializeConfig, mergeConfig, normalizeEnvelope, sameConfigEnvelope } from './config-merge.js';
+import { createLlmProvider } from './llm-provider.js';
 import { normalizeReportPayload } from './report-aggregate.js';
+import { UpCollector, compactError, generateUpPortrait } from './up-collector.js';
+import { buildRulePortrait } from './up-portrait-rules.js';
 
 const MAX_BULK_REPORT_BATCHES = 50;
 const MAX_BULK_REPORT_EVENTS = 2000;
@@ -100,6 +104,60 @@ function getCleanupOptions(body) {
   };
 }
 
+function normalizeMidList(body) {
+  const source = body && typeof body === 'object' ? body : {};
+  const raw = Array.isArray(source.mids)
+    ? source.mids
+    : String(source.mids || source.mid || '')
+      .split(/[\s,，;；]+/);
+  return [...new Set(raw.map((item) => String(item || '').trim()).filter((item) => /^\d+$/.test(item)))];
+}
+
+function getCollectorOptions(body) {
+  const source = body && typeof body === 'object' ? body : {};
+  return {
+    maxTargets: source.maxTargets,
+    includeArchives: source.includeArchives,
+    includeKnownVideos: source.includeKnownVideos,
+    maxPages: source.maxPages,
+    existingMaxPages: source.existingMaxPages,
+    pageSize: source.pageSize,
+    maxVideos: source.maxVideos,
+    requestIntervalMs: source.requestIntervalMs,
+    successRefreshHours: source.successRefreshHours
+  };
+}
+
+function getUpListOptions(url) {
+  return {
+    limit: Number(url.searchParams.get('limit') || 50),
+    offset: Number(url.searchParams.get('offset') || 0),
+    includeTotal: shouldIncludeTotal(url),
+    q: url.searchParams.get('q') || '',
+    status: url.searchParams.get('status') || '',
+    sort: url.searchParams.get('sort') || ''
+  };
+}
+
+function apiErrorResponse(error) {
+  const info = compactError(error);
+  const type = info.type || error && error.name || 'error';
+  const message = info.message || String(error && error.message || error || 'error');
+  if (message === 'invalid_mid' || message === 'invalid_video') return { status: 400, body: { error: message } };
+  return {
+    status: 502,
+    body: {
+      error: type,
+      message,
+      code: info.code,
+      status: info.status,
+      retryable: info.retryable,
+      endpoint: info.endpoint,
+      hint: info.hint
+    }
+  };
+}
+
 function isValidDate(value) {
   return Number.isFinite(Date.parse(value || ''));
 }
@@ -183,10 +241,31 @@ async function saveBulkReportBatches(storage, payloads, eventCount) {
 function createApp(options) {
   const storage = options.storage;
   const secret = options.secret;
+  const env = options.env || {};
+  const fetcher = options.fetcher || options.fetch;
+  const collectorFactory = options.collectorFactory;
+  const llmProviderFactory = options.llmProviderFactory;
   const readCache = new Map();
   let configEnvelopeCache = null;
   if (!storage) throw new Error('storage is required');
   if (!secret) throw new Error('SYNC_SECRET is required');
+
+  function createCollector() {
+    if (collectorFactory) return collectorFactory({ storage });
+    return new UpCollector({
+      storage,
+      client: options.biliClient || new BilibiliClient({
+        fetcher,
+        timeoutMs: env.BILI_TIMEOUT_MS
+      })
+    });
+  }
+
+  function createPortraitProvider() {
+    if (options.llmProvider) return options.llmProvider;
+    if (llmProviderFactory) return llmProviderFactory({ storage });
+    return createLlmProvider({ env, fetcher });
+  }
 
   async function requireAuth(request, url) {
     return getBearer(request, url) === secret;
@@ -262,6 +341,9 @@ function createApp(options) {
       }
       if (url.pathname === '/analytics') {
         return text(adminPage('analytics'), 200, 'text/html; charset=utf-8');
+      }
+      if (url.pathname === '/up-profiles') {
+        return text(adminPage('up-profiles'), 200, 'text/html; charset=utf-8');
       }
       if (!url.pathname.startsWith('/api/')) return json({ error: 'not_found' }, 404);
       if (url.pathname === '/api/health' && request.method === 'GET') {
@@ -360,6 +442,105 @@ function createApp(options) {
           category: url.searchParams.get('category') || '',
           feedback: url.searchParams.get('feedback') || '',
           section: url.searchParams.get('section') || 'all'
+        }));
+      }
+
+      if (url.pathname === '/api/up-targets/import' && request.method === 'POST') {
+        const body = await readJson(request);
+        const mids = normalizeMidList(body);
+        if (!mids.length) return json({ error: 'invalid_mids' }, 400);
+        const result = await storage.importUpTargets(mids, {
+          source: body && (body.source || body.seedSource) || 'manual',
+          seedBvid: body && (body.seedBvid || body.bvid) || '',
+          note: body && body.note || '',
+          priority: body && body.priority || 0
+        });
+        invalidateReadCache();
+        return json({ ok: true, ...result });
+      }
+
+      if (url.pathname === '/api/up-targets' && request.method === 'GET') {
+        return cachedJson(getReadCacheKey('up-targets', url), () => storage.listUpTargets(getUpListOptions(url)));
+      }
+
+      const collectMatch = url.pathname.match(/^\/api\/up-targets\/(\d+)\/collect$/);
+      if (collectMatch && request.method === 'POST') {
+        const body = await readJson(request);
+        const mid = collectMatch[1];
+        await storage.importUpTargets([mid], { source: 'manual' });
+        try {
+          const result = await createCollector().collectMid(mid, {
+            ...getCollectorOptions(body),
+            createRun: true
+          });
+          invalidateReadCache();
+          return json(result);
+        } catch (error) {
+          invalidateReadCache();
+          const response = apiErrorResponse(error);
+          return json(response.body, response.status);
+        }
+      }
+
+      if (url.pathname === '/api/collector/run' && request.method === 'POST') {
+        const body = await readJson(request);
+        try {
+          const result = await createCollector().runBatch(getCollectorOptions(body));
+          invalidateReadCache();
+          return json(result);
+        } catch (error) {
+          invalidateReadCache();
+          const response = apiErrorResponse(error);
+          return json(response.body, response.status);
+        }
+      }
+
+      const portraitGenerateMatch = url.pathname.match(/^\/api\/up-profiles\/(\d+)\/portrait\/generate$/);
+      if (portraitGenerateMatch && request.method === 'POST') {
+        const mid = portraitGenerateMatch[1];
+        await storage.importUpTargets([mid], { source: 'manual' });
+        const result = await generateUpPortrait({
+          storage,
+          mid,
+          llmProvider: createPortraitProvider()
+        });
+        invalidateReadCache();
+        return json(result, result.ok ? 200 : 502);
+      }
+
+      const profileMatch = url.pathname.match(/^\/api\/up-profiles\/(\d+)$/);
+      if (profileMatch && request.method === 'GET') {
+        const mid = profileMatch[1];
+        return cachedJson(getReadCacheKey(`up-profile:${mid}`, url), async () => {
+          const profile = await storage.getUpProfile(mid);
+          const storedRule = profile && profile.portrait && profile.portrait.rulePortrait;
+          const hasStoredRule = storedRule && Object.keys(storedRule).length > 0;
+          const rulePortrait = hasStoredRule
+            ? storedRule
+            : buildRulePortrait({
+              profile: profile && profile.profile,
+              videos: (await storage.listUpVideos({ mid, limit: 100, includeTotal: false, sort: 'pubdate' })).items || []
+            });
+          return {
+            ...profile,
+            rulePortrait,
+            llmPortrait: profile && profile.portrait ? profile.portrait.llmPortrait : null
+          };
+        });
+      }
+
+      if (url.pathname === '/api/up-profiles' && request.method === 'GET') {
+        return cachedJson(getReadCacheKey('up-profiles', url), () => storage.listUpProfiles(getUpListOptions(url)));
+      }
+
+      if (url.pathname === '/api/up-videos' && request.method === 'GET') {
+        return cachedJson(getReadCacheKey('up-videos', url), () => storage.listUpVideos({
+          mid: url.searchParams.get('mid') || '',
+          q: url.searchParams.get('q') || '',
+          sort: url.searchParams.get('sort') || '',
+          limit: Number(url.searchParams.get('limit') || 50),
+          offset: Number(url.searchParams.get('offset') || 0),
+          includeTotal: shouldIncludeTotal(url)
         }));
       }
 

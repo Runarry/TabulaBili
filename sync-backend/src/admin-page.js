@@ -1,7 +1,7 @@
 function adminPage(activePage = 'data') {
-  const page = activePage === 'analytics' ? 'analytics' : 'data';
-  const body = page === 'analytics' ? analyticsBody() : dataBody();
-  const script = page === 'analytics' ? analyticsScript() : dataScript();
+  const page = ['analytics', 'up-profiles'].includes(activePage) ? activePage : 'data';
+  const body = page === 'analytics' ? analyticsBody() : (page === 'up-profiles' ? upProfilesBody() : dataBody());
+  const script = page === 'analytics' ? analyticsScript() : (page === 'up-profiles' ? upProfilesScript() : dataScript());
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -66,6 +66,7 @@ function adminPage(activePage = 'data') {
       <nav>
         <a class="${page === 'data' ? 'active' : ''}" href="/data">数据</a>
         <a class="${page === 'analytics' ? 'active' : ''}" href="/analytics">分析</a>
+        <a class="${page === 'up-profiles' ? 'active' : ''}" href="/up-profiles">UP画像</a>
       </nav>
       <button class="secondary" type="button" id="logoutBtn">退出</button>
     </div>
@@ -384,6 +385,51 @@ function analyticsBody() {
     </section>`;
 }
 
+function upProfilesBody() {
+  return `
+    <section>
+      <div class="toolbar">
+        <h2>UP画像采集</h2>
+        <input class="grow" id="upImportInput" placeholder="输入 UID，支持逗号或换行分隔">
+        <button type="button" id="upImportBtn">导入 UID</button>
+        <button class="secondary" type="button" id="collectorRunBtn">运行一批采集</button>
+      </div>
+      <p class="muted" id="upActionStatus">未执行</p>
+    </section>
+    <section>
+      <div class="toolbar">
+        <h2>目标列表</h2>
+        <input class="grow" id="upQueryInput" placeholder="搜索 UID / 昵称 / 摘要">
+        <select id="upSort">
+          <option value="updated">最近更新</option>
+          <option value="followers">粉丝数</option>
+          <option value="videos">视频数</option>
+          <option value="collected">最近采集</option>
+          <option value="name">昵称</option>
+        </select>
+        <select id="upPageSize"><option value="20">20 条/页</option><option value="50">50 条/页</option></select>
+        <button class="secondary" type="button" id="upLoadBtn">加载列表</button>
+      </div>
+      <p class="muted" id="upListStatus">未加载</p>
+      <table>
+        <thead><tr><th>UP</th><th>状态</th><th>粉丝/视频</th><th>画像摘要</th><th>操作</th></tr></thead>
+        <tbody id="upRows"><tr><td class="muted" colspan="5">未加载</td></tr></tbody>
+      </table>
+      <div class="pager">
+        <button class="secondary" type="button" id="upPrevBtn">上一页</button>
+        <span class="muted" id="upPageInfo">第 1 页</span>
+        <button class="secondary" type="button" id="upNextBtn">下一页</button>
+      </div>
+    </section>
+    <section>
+      <div class="toolbar">
+        <h2>画像详情</h2>
+        <span class="muted" id="upDetailTitle">未选择</span>
+      </div>
+      <pre id="upDetailView">{}</pre>
+    </section>`;
+}
+
 function dataScript() {
   return `
     const batchState = { page: 1, pageSize: 20, hasMore: false, loaded: false };
@@ -552,6 +598,163 @@ function dataScript() {
     });
     updateBatchPager();
     updateSamplePager();`;
+}
+
+function upProfilesScript() {
+  return `
+    const upState = { page: 1, pageSize: 20, hasMore: false, loaded: false };
+    function setUpStatus(id, text, error = false) {
+      const node = $(id);
+      if (!node) return;
+      node.textContent = text;
+      node.className = error ? 'error' : 'muted';
+    }
+    function emptyUpRow(text) {
+      return '<tr><td class="muted" colspan="5">' + esc(text) + '</td></tr>';
+    }
+    async function postApi(path, body = {}) {
+      const response = await fetch(path, {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer ' + state.secret,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(body)
+      });
+      const text = await response.text();
+      const payload = text ? JSON.parse(text) : {};
+      if (!response.ok) {
+        const error = new Error([payload.message || payload.error || text || response.statusText, payload.hint].filter(Boolean).join('。'));
+        error.payload = payload;
+        throw error;
+      }
+      return payload;
+    }
+    async function refresh() {
+      return loadUps(true);
+    }
+    function upParams() {
+      const params = new URLSearchParams();
+      params.set('includeTotal', '0');
+      params.set('limit', String(upState.pageSize));
+      params.set('offset', String((upState.page - 1) * upState.pageSize));
+      const q = $('upQueryInput').value.trim();
+      if (q) params.set('q', q);
+      const sort = $('upSort').value;
+      if (sort) params.set('sort', sort);
+      return params.toString();
+    }
+    function updateUpPager() {
+      $('upPageInfo').textContent = upState.loaded
+        ? '第 ' + upState.page + ' 页' + (upState.hasMore ? '' : ' / 最后一页')
+        : '第 1 页';
+      $('upPrevBtn').disabled = !upState.loaded || upState.page <= 1;
+      $('upNextBtn').disabled = !upState.loaded || !upState.hasMore;
+    }
+    function renderUpRows(items) {
+      $('upRows').innerHTML = items.length ? items.map((item) => {
+        const target = item.target || {};
+        return '<tr>'
+          + '<td><strong>' + esc(item.name || target.name || item.mid) + '</strong><div class="muted">' + esc(item.mid) + '</div></td>'
+          + '<td>' + esc(target.status || '') + '<div class="muted">' + esc(target.lastErrorType || '') + '</div></td>'
+          + '<td>' + esc(item.followerCount || 0) + '<div class="muted">视频 ' + esc(item.videoCount || 0) + '</div></td>'
+          + '<td>' + esc(item.summary || '') + '</td>'
+          + '<td><button class="secondary" type="button" data-action="collect" data-mid="' + esc(item.mid) + '">采集</button> '
+          + '<button class="secondary" type="button" data-action="portrait" data-mid="' + esc(item.mid) + '">LLM</button> '
+          + '<button class="secondary" type="button" data-action="detail" data-mid="' + esc(item.mid) + '">详情</button></td>'
+          + '</tr>';
+      }).join('') : emptyUpRow('无数据');
+    }
+    async function loadUps(resetPage = false) {
+      if (!state.secret) {
+        setMessage('请输入服务密钥。');
+        return;
+      }
+      upState.pageSize = Number($('upPageSize').value);
+      if (resetPage) upState.page = 1;
+      setUpStatus('upListStatus', '加载中');
+      const result = await api('/api/up-profiles?' + upParams());
+      upState.loaded = true;
+      upState.hasMore = result.hasMore === true;
+      renderUpRows(result.items || []);
+      updateUpPager();
+      setUpStatus('upListStatus', '已加载');
+      setMessage('UP画像列表已加载。');
+    }
+    async function importUps() {
+      const mids = $('upImportInput').value.trim();
+      if (!mids) {
+        setUpStatus('upActionStatus', '请输入 UID。', true);
+        return;
+      }
+      setUpStatus('upActionStatus', '导入中');
+      const result = await postApi('/api/up-targets/import', { mids });
+      setUpStatus('upActionStatus', '已导入 ' + result.imported + ' 个，已存在 ' + result.existing + ' 个。');
+      await loadUps(true);
+    }
+    async function runCollector() {
+      setUpStatus('upActionStatus', '采集中');
+      const result = await postApi('/api/collector/run', { maxTargets: 1, includeArchives: false, maxPages: 0, maxVideos: 5, requestIntervalMs: 3000 });
+      setUpStatus('upActionStatus', '采集完成：' + (result.results || []).length + ' 个目标。');
+      await loadUps(false);
+    }
+    async function collectOne(mid) {
+      setUpStatus('upActionStatus', '采集中：' + mid);
+      try {
+        await postApi('/api/up-targets/' + encodeURIComponent(mid) + '/collect', { includeArchives: false, maxPages: 0, maxVideos: 5, requestIntervalMs: 3000 });
+        setUpStatus('upActionStatus', '采集完成：' + mid);
+      } catch (error) {
+        setUpStatus('upActionStatus', '采集失败：' + error.message, true);
+      } finally {
+        await loadUps(false);
+      }
+    }
+    async function generatePortrait(mid) {
+      setUpStatus('upActionStatus', 'LLM 分析中：' + mid);
+      try {
+        await postApi('/api/up-profiles/' + encodeURIComponent(mid) + '/portrait/generate', {});
+        setUpStatus('upActionStatus', 'LLM 分析完成：' + mid);
+      } catch (error) {
+        setUpStatus('upActionStatus', 'LLM 分析失败：' + error.message, true);
+      }
+      await loadDetail(mid);
+      await loadUps(false);
+    }
+    async function loadDetail(mid) {
+      $('upDetailTitle').textContent = mid;
+      const detail = await api('/api/up-profiles/' + encodeURIComponent(mid));
+      $('upDetailView').textContent = JSON.stringify(detail, null, 2);
+    }
+    $('upImportBtn').addEventListener('click', () => importUps().catch((error) => setMessage(error.message, true)));
+    $('collectorRunBtn').addEventListener('click', () => runCollector().catch((error) => setMessage(error.message, true)));
+    $('upLoadBtn').addEventListener('click', () => loadUps(true).catch((error) => setMessage(error.message, true)));
+    $('upQueryInput').addEventListener('input', () => {
+      upState.page = 1;
+      if (upState.loaded) setUpStatus('upListStatus', '筛选已更改，点击“加载列表”更新。');
+      updateUpPager();
+    });
+    $('upSort').addEventListener('change', () => loadUps(true).catch((error) => setMessage(error.message, true)));
+    $('upPageSize').addEventListener('change', () => loadUps(true).catch((error) => setMessage(error.message, true)));
+    $('upPrevBtn').addEventListener('click', () => {
+      if (!upState.loaded || upState.page <= 1) return;
+      upState.page -= 1;
+      loadUps(false).catch((error) => setMessage(error.message, true));
+    });
+    $('upNextBtn').addEventListener('click', () => {
+      if (!upState.loaded || !upState.hasMore) return;
+      upState.page += 1;
+      loadUps(false).catch((error) => setMessage(error.message, true));
+    });
+    $('upRows').addEventListener('click', (event) => {
+      const button = event.target.closest('button[data-action]');
+      if (!button) return;
+      const mid = button.getAttribute('data-mid');
+      const action = button.getAttribute('data-action');
+      if (action === 'collect') collectOne(mid).catch((error) => setMessage(error.message, true));
+      if (action === 'portrait') generatePortrait(mid).catch((error) => setMessage(error.message, true));
+      if (action === 'detail') loadDetail(mid).catch((error) => setMessage(error.message, true));
+    });
+    updateUpPager();`;
 }
 
 function analyticsScript() {

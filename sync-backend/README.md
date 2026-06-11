@@ -22,6 +22,14 @@ Authorization: Bearer <SYNC_SECRET>
 - `GET /api/reports/batches`
 - `GET /api/reports/analytics`
 - `POST /api/reports/cleanup`
+- `POST /api/up-targets/import`
+- `GET /api/up-targets`
+- `POST /api/up-targets/<mid>/collect`
+- `POST /api/collector/run`
+- `GET /api/up-profiles`
+- `GET /api/up-profiles/<mid>`
+- `POST /api/up-profiles/<mid>/portrait/generate`
+- `GET /api/up-videos?mid=<mid>`
 
 ### 批量上报接口
 
@@ -95,9 +103,91 @@ Content-Type: application/json
 
 `daily_metrics` 每日汇总表不会被 cleanup 删除，用于在清理明细事件后保留长期趋势基础数据。
 
+### UP 主画像采集
+
+后端提供独立的 UP 主画像采集链路。采集由后端主动执行，不依赖浏览器扩展参与；扩展端最多可以作为 UID/BVID 种子来源。当前实现优先面向 Node/Docker + SQLite 部署，Cloudflare Worker + D1 保持 schema 和 API 兼容，但不建议让 Worker 承担主动采集任务。
+
+采集只读取 B站公开可见字段，不使用 Cookie，不绕过登录或风控。客户端封装了 User-Agent、Referer、超时、业务错误解析，并将 `-799`、`-352`、HTTP `412/429` 等错误分类为限频或风控失败。采集器会记录失败类型、失败消息、失败次数和 `nextCollectAfter`，遇到限频/风控会指数退避；单次任务也有最大 UP 数、最大页数和最大视频数限制，避免高频扫描。
+
+默认采集策略是“资料优先、已知视频增强”：先抓 `card`、`relation/stat`、`space/navnum` 三个公开资料接口，再用目标的 `seedBvid` 以及历史推荐样本/已入库视频中的 BVID 补全视频详情和标签。默认不会访问 `/x/space/arc/search` 投稿列表，因为该接口即使单个 UP、无 Cookie、低频访问也可能返回 HTTP `412` 或 `-799`；投稿列表只作为显式开启的增强项使用。
+
+推荐的最小流程：
+
+```http
+POST /api/up-targets/import
+Authorization: Bearer <SYNC_SECRET>
+Content-Type: application/json
+
+{ "mids": ["12345", "67890"], "source": "manual", "seedBvid": "BV1xx411c7mD" }
+```
+
+随后低频触发一批到期任务：
+
+```http
+POST /api/collector/run
+Authorization: Bearer <SYNC_SECRET>
+Content-Type: application/json
+
+{ "maxTargets": 1, "includeArchives": false, "maxPages": 0, "maxVideos": 10 }
+```
+
+也可以手动采集单个 UP：
+
+```http
+POST /api/up-targets/12345/collect
+Authorization: Bearer <SYNC_SECRET>
+Content-Type: application/json
+
+{ "includeArchives": false, "maxPages": 0, "maxVideos": 10 }
+```
+
+如果确实需要从投稿列表发现新视频，可以在低频、很小页数下显式开启：
+
+```http
+POST /api/up-targets/12345/collect
+Authorization: Bearer <SYNC_SECRET>
+Content-Type: application/json
+
+{ "includeArchives": true, "maxPages": 1, "pageSize": 5, "maxVideos": 5, "requestIntervalMs": 3000 }
+```
+
+这个模式命中风控时不会回滚已保存的 UP 基础资料；任务会标记为 `partial`，记录错误和退避时间，后续可重试或改用 BVID 种子。
+
+查询画像与视频：
+
+- `GET /api/up-targets`：目标 UID、采集状态、失败和退避信息。
+- `GET /api/up-profiles`：UP 列表、粉丝/视频概览、画像摘要，支持 `q`、分页和排序。
+- `GET /api/up-profiles/<mid>`：目标、最新基础资料、视频统计、规则画像和 LLM 画像。
+- `GET /api/up-videos?mid=<mid>`：某 UP 的视频事实列表。
+
+规则画像会基于已入库视频计算主分区、高频标签/关键词、发稿频率、近 7/30/90 天活跃度、中位/平均播放、爆款率、点赞/投币/收藏/评论/弹幕/分享率、系列化倾向和商业合作关键词线索。
+
+### LLM Provider
+
+LLM 分析使用 OpenAI-compatible Chat Completions 抽象，不把 DeepSeek 写死在业务逻辑里。模型输入只包含已采集的结构化事实、近期视频摘要和规则画像，不直接发送原始大 JSON。
+
+环境变量：
+
+```bash
+LLM_PROVIDER=deepseek
+LLM_BASE_URL=https://api.deepseek.com
+LLM_API_KEY=<your-api-key>
+LLM_MODEL=deepseek-chat
+LLM_TIMEOUT_MS=30000
+```
+
+触发分析：
+
+```http
+POST /api/up-profiles/12345/portrait/generate
+Authorization: Bearer <SYNC_SECRET>
+```
+
+结果保存到 `up_portraits`，字段包括 `summary`、`contentPositioning`、`audienceHypothesis`、`contentStyle`、`commercialFit`、`risks`、`evidence`、`provider`、`model`、`promptVersion` 和 `generatedAt`。其中 `audienceHypothesis` 明确要求模型按推断表述。LLM 调用失败会保存 `llm_error_type` 和 `llm_error_message`，不会删除已生成的规则画像，后续可以重试。
+
 ### Schema 迁移
 
-D1 推荐在部署前执行 `migrations/0001_schema.sql`。运行时仍保留兼容性的自动创建和补齐逻辑，但只在写入、配置保存和清理这些会修改数据的路径上触发；读接口在空库或未建表时会直接返回空结果，不承担建表成本。Worker 同一 isolate 内只会初始化一次；如果 `schema_migrations` 已记录最新版本，会快速跳过完整 DDL/索引检查。SQLite 仍在启动时自动创建表、补齐缺失列和索引。当前记录：
+D1 推荐在部署前执行 `migrations/` 目录下的迁移。运行时仍保留兼容性的自动创建和补齐逻辑，但只在写入、配置保存和清理这些会修改数据的路径上触发；读接口在空库或未建表时会直接返回空结果，不承担建表成本。Worker 同一 isolate 内只会初始化一次；如果 `schema_migrations` 已记录最新版本，会快速跳过完整 DDL/索引检查。SQLite 仍在启动时自动创建表、补齐缺失列和索引。当前记录：
 
 - `1 base_tables`
 - `2 structured_event_columns`
@@ -105,6 +195,8 @@ D1 推荐在部署前执行 `migrations/0001_schema.sql`。运行时仍保留兼
 - `4 daily_metrics`
 - `5 analytics_indexes`
 - `6 drop_events_up_name_index`
+- `7 report_totals`
+- `8 up_portrait_collector`
 
 重复运行初始化是幂等的。新 D1 部署建议优先执行 migration，避免首次写入请求承担完整 schema 初始化成本。
 

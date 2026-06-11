@@ -14,6 +14,7 @@ function getApp(env) {
   cachedSecret = env.SYNC_SECRET;
   cachedApp = createApp({
     secret: env.SYNC_SECRET,
+    env,
     storage: new D1Storage(env.TABULABILI_SYNC_DB)
   });
   return cachedApp;
