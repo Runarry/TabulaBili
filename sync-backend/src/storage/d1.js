@@ -12,6 +12,11 @@ import {
 } from './helpers.js';
 import { buildAnalyticsQuerySpecs, executeAnalyticsQueries } from './sql-analytics.js';
 import {
+  REPORT_TOTAL_REFRESH_DATASETS,
+  exportSqlSyncDataset,
+  importSqlSyncDataset
+} from './sync-data.js';
+import {
   UP_COLUMNS,
   UP_INDEX_STATEMENTS,
   UP_SCHEMA_MIGRATION,
@@ -1524,6 +1529,25 @@ class D1Storage {
       )
     `).bind(before));
     return { events: events.count, batches: batches.count, orphanSamples: orphanSamples.count };
+  }
+
+  createSyncAdapter(db = this.db) {
+    return {
+      all: async (sql, args = []) => allRows(db.prepare(sql).bind(...args)),
+      first: async (sql, args = []) => firstRow(db.prepare(sql).bind(...args)),
+      run: async (sql, args = []) => changesOf(await this.db.prepare(sql).bind(...args).run())
+    };
+  }
+
+  async exportSyncDataset(options = {}) {
+    return exportSqlSyncDataset(this.createSyncAdapter(this.getReadDb()), options);
+  }
+
+  async importSyncDataset(dataset, items = []) {
+    await this.ensureReady();
+    const result = await importSqlSyncDataset(this.createSyncAdapter(this.db), dataset, items);
+    if (REPORT_TOTAL_REFRESH_DATASETS.has(dataset)) await this.refreshReportTotals();
+    return result;
   }
 }
 

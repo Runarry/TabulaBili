@@ -3,6 +3,11 @@ import { BilibiliClient } from './bilibili-client.js';
 import { materializeConfig, mergeConfig, normalizeEnvelope, sameConfigEnvelope } from './config-merge.js';
 import { createLlmProvider } from './llm-provider.js';
 import { normalizeReportPayload } from './report-aggregate.js';
+import {
+  SYNC_DATASET_NAMES,
+  SYNC_DATA_VERSION,
+  normalizeSyncLimit
+} from './storage/sync-data.js';
 import { UpCollector, compactError, generateUpPortrait } from './up-collector.js';
 import { buildRulePortrait } from './up-portrait-rules.js';
 
@@ -10,6 +15,8 @@ const MAX_BULK_REPORT_BATCHES = 50;
 const MAX_BULK_REPORT_EVENTS = 2000;
 const READ_CACHE_TTL_MS = 30 * 1000;
 const READ_CACHE_MAX_ENTRIES = 100;
+const SYNC_PULL_DEFAULT_MAX_PAGES = 50;
+const SYNC_PULL_MAX_PAGES = 500;
 
 function json(value, status = 200) {
   return new Response(JSON.stringify(value), {
@@ -128,6 +135,212 @@ function getCollectorOptions(body) {
   };
 }
 
+function normalizeSyncDatasets(value) {
+  if (value == null || value === '') return { datasets: SYNC_DATASET_NAMES, invalid: [] };
+  const raw = Array.isArray(value)
+    ? value
+    : String(value).split(/[\s,，;；]+/);
+  const requested = raw.map((item) => String(item || '').trim()).filter(Boolean);
+  if (!requested.length || requested.includes('all')) return { datasets: SYNC_DATASET_NAMES, invalid: [] };
+  const known = new Set(SYNC_DATASET_NAMES);
+  const invalid = requested.filter((item) => !known.has(item));
+  return {
+    datasets: [...new Set(requested.filter((item) => known.has(item)))],
+    invalid
+  };
+}
+
+function normalizeSyncMaxPages(value) {
+  const number = Number(value || SYNC_PULL_DEFAULT_MAX_PAGES);
+  const fallback = SYNC_PULL_DEFAULT_MAX_PAGES;
+  return Math.min(SYNC_PULL_MAX_PAGES, Math.max(1, Number.isFinite(number) ? Math.floor(number) : fallback));
+}
+
+function createSyncPullStats() {
+  return {
+    total: {
+      read: 0,
+      written: 0,
+      inserted: 0,
+      updated: 0,
+      skipped: 0,
+      errorCount: 0
+    },
+    datasets: {}
+  };
+}
+
+function ensureDatasetStats(stats, dataset) {
+  if (!stats.datasets[dataset]) {
+    stats.datasets[dataset] = {
+      read: 0,
+      written: 0,
+      inserted: 0,
+      updated: 0,
+      skipped: 0,
+      errorCount: 0,
+      pages: 0,
+      errors: []
+    };
+  }
+  return stats.datasets[dataset];
+}
+
+function mergeSyncImportStats(stats, dataset, imported) {
+  const target = ensureDatasetStats(stats, dataset);
+  target.pages += 1;
+  for (const key of ['read', 'written', 'inserted', 'updated', 'skipped', 'errorCount']) {
+    const value = Number(imported && imported[key] || 0);
+    target[key] += value;
+    stats.total[key] += value;
+  }
+  for (const error of imported && imported.errors || []) {
+    if (target.errors.length < 10) target.errors.push(error);
+  }
+}
+
+function redactSecretText(value) {
+  return String(value || '').replace(/Bearer\s+[^,\s)]+/gi, 'Bearer <redacted>');
+}
+
+function buildSourceExportUrl(sourceUrl, dataset, cursor, limit) {
+  const url = new URL(sourceUrl);
+  url.hash = '';
+  url.search = '';
+  url.pathname = `${url.pathname.replace(/\/+$/, '')}/api/sync/export`;
+  url.searchParams.set('dataset', dataset);
+  url.searchParams.set('limit', String(limit));
+  if (cursor) url.searchParams.set('cursor', String(cursor));
+  return url;
+}
+
+async function fetchSourceSyncPage(fetcher, { sourceUrl, sourceSecret, dataset, cursor, limit }) {
+  const url = buildSourceExportUrl(sourceUrl, dataset, cursor, limit);
+  const response = await fetcher(new Request(url.toString(), {
+    method: 'GET',
+    headers: { authorization: `Bearer ${sourceSecret}` }
+  }));
+  let body = null;
+  try {
+    body = await response.json();
+  } catch {
+    body = null;
+  }
+  if (!response.ok) {
+    const error = new Error(body && (body.error || body.message) || `source_http_${response.status}`);
+    error.sourceStatus = response.status;
+    throw error;
+  }
+  if (!body || body.version !== SYNC_DATA_VERSION || body.dataset !== dataset || !Array.isArray(body.items)) {
+    throw new Error('invalid_source_sync_export');
+  }
+  return body;
+}
+
+function normalizeSyncPullRequest(body, targetSecret) {
+  const source = body && typeof body === 'object' ? body : {};
+  const sourceUrl = String(source.sourceUrl || '').trim();
+  const sourceSecret = String(source.sourceSecret || source.secret || targetSecret || '').trim();
+  if (!sourceUrl) return { error: 'invalid_source_url' };
+  let parsedUrl = null;
+  try {
+    parsedUrl = new URL(sourceUrl);
+  } catch {
+    return { error: 'invalid_source_url' };
+  }
+  if (!['http:', 'https:'].includes(parsedUrl.protocol)) return { error: 'invalid_source_url' };
+  if (!sourceSecret) return { error: 'invalid_source_secret' };
+
+  const { datasets, invalid } = normalizeSyncDatasets(source.datasets);
+  if (invalid.length) return { error: 'invalid_sync_dataset', invalid };
+  const cursors = source.cursors && typeof source.cursors === 'object' && !Array.isArray(source.cursors)
+    ? source.cursors
+    : {};
+  return {
+    sourceUrl,
+    sourceSecret,
+    datasets,
+    cursors,
+    limit: normalizeSyncLimit(source.limit),
+    maxPages: normalizeSyncMaxPages(source.maxPages)
+  };
+}
+
+async function pullSyncData({ storage, fetcher, request }) {
+  const stats = createSyncPullStats();
+  const nextCursors = {};
+  let pages = 0;
+
+  for (let index = 0; index < request.datasets.length; index += 1) {
+    const dataset = request.datasets[index];
+    let cursor = String(request.cursors[dataset] || '');
+
+    if (pages >= request.maxPages) {
+      for (const pending of request.datasets.slice(index)) {
+        nextCursors[pending] = String(request.cursors[pending] || '');
+      }
+      break;
+    }
+
+    while (pages < request.maxPages) {
+      let page = null;
+      try {
+        page = await fetchSourceSyncPage(fetcher, {
+          sourceUrl: request.sourceUrl,
+          sourceSecret: request.sourceSecret,
+          dataset,
+          cursor,
+          limit: request.limit
+        });
+      } catch (error) {
+        error.dataset = dataset;
+        error.cursor = cursor;
+        error.stats = stats;
+        throw error;
+      }
+
+      pages += 1;
+      const imported = await storage.importSyncDataset(dataset, page.items);
+      mergeSyncImportStats(stats, dataset, imported);
+
+      if (!page.hasMore) {
+        cursor = '';
+        break;
+      }
+      cursor = String(page.nextCursor || '');
+      if (!cursor) {
+        const error = new Error('missing_source_next_cursor');
+        error.dataset = dataset;
+        error.stats = stats;
+        throw error;
+      }
+    }
+
+    if (cursor) {
+      nextCursors[dataset] = cursor;
+      for (const pending of request.datasets.slice(index + 1)) {
+        nextCursors[pending] = String(request.cursors[pending] || '');
+      }
+      break;
+    }
+  }
+
+  const pendingDatasets = Object.keys(nextCursors);
+  return {
+    ok: true,
+    version: SYNC_DATA_VERSION,
+    complete: pendingDatasets.length === 0,
+    pages,
+    limit: request.limit,
+    maxPages: request.maxPages,
+    datasets: request.datasets,
+    stats,
+    next: pendingDatasets.length
+      ? { datasets: pendingDatasets, cursors: nextCursors, limit: request.limit }
+      : null
+  };
+}
+
 function getUpListOptions(url) {
   return {
     limit: Number(url.searchParams.get('limit') || 50),
@@ -242,7 +455,7 @@ function createApp(options) {
   const storage = options.storage;
   const secret = options.secret;
   const env = options.env || {};
-  const fetcher = options.fetcher || options.fetch;
+  const fetcher = options.fetcher || options.fetch || (typeof fetch === 'function' ? fetch.bind(globalThis) : null);
   const collectorFactory = options.collectorFactory;
   const llmProviderFactory = options.llmProviderFactory;
   const readCache = new Map();
@@ -345,6 +558,9 @@ function createApp(options) {
       if (url.pathname === '/up-profiles') {
         return text(adminPage('up-profiles'), 200, 'text/html; charset=utf-8');
       }
+      if (url.pathname === '/sync') {
+        return text(adminPage('sync'), 200, 'text/html; charset=utf-8');
+      }
       if (!url.pathname.startsWith('/api/')) return json({ error: 'not_found' }, 404);
       if (url.pathname === '/api/health' && request.method === 'GET') {
         return json({ ok: true });
@@ -353,6 +569,54 @@ function createApp(options) {
 
       if (url.pathname === '/api/auth/check' && request.method === 'POST') {
         return json({ ok: true });
+      }
+
+      if (url.pathname === '/api/sync/export' && request.method === 'GET') {
+        if (typeof storage.exportSyncDataset !== 'function') return json({ error: 'sync_export_not_supported' }, 501);
+        const dataset = url.searchParams.get('dataset') || '';
+        if (!dataset) {
+          return json({
+            version: SYNC_DATA_VERSION,
+            datasets: SYNC_DATASET_NAMES,
+            defaultLimit: 200,
+            maxLimit: 1000
+          });
+        }
+        const { invalid } = normalizeSyncDatasets([dataset]);
+        if (invalid.length) return json({ error: 'invalid_sync_dataset', invalid }, 400);
+        return json(await storage.exportSyncDataset({
+          dataset,
+          cursor: url.searchParams.get('cursor') || '',
+          limit: url.searchParams.get('limit') || ''
+        }));
+      }
+
+      if (url.pathname === '/api/sync/pull' && request.method === 'POST') {
+        if (typeof storage.importSyncDataset !== 'function') return json({ error: 'sync_import_not_supported' }, 501);
+        if (typeof fetcher !== 'function') return json({ error: 'fetch_not_supported' }, 501);
+        const normalized = normalizeSyncPullRequest(await readJson(request), secret);
+        if (normalized.error) return json(normalized, 400);
+        try {
+          const result = await pullSyncData({ storage, fetcher, request: normalized });
+          if (result.stats.total.written > 0) {
+            configEnvelopeCache = null;
+            invalidateReadCache();
+          }
+          return json(result);
+        } catch (error) {
+          if (error.stats && error.stats.total.written > 0) {
+            configEnvelopeCache = null;
+            invalidateReadCache();
+          }
+          return json({
+            error: 'sync_pull_failed',
+            message: redactSecretText(error && error.message || error),
+            dataset: error && error.dataset || '',
+            cursor: error && error.cursor || '',
+            sourceStatus: error && error.sourceStatus,
+            stats: error && error.stats
+          }, 502);
+        }
       }
 
       if (url.pathname === '/api/config/sync' && request.method === 'POST') {

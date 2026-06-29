@@ -323,6 +323,67 @@ test('D1 bulk storage handles documented maximum payload idempotently', { skip: 
   assert.equal(duplicate.duplicateEventCount, 2000);
 });
 
+test('D1 sync export paginates and import skips duplicates', { skip: DatabaseSync ? false : 'node:sqlite unavailable' }, async () => {
+  const source = new D1Storage(new FakeD1());
+  await source.saveBulkReportBatches([{
+    batchId: 'sync-d1-b1',
+    clientId: 'c1',
+    capturedAt: '2026-06-01T00:00:00.000Z',
+    events: [
+      { eventId: 'sync-d1-e1', id: 'BV_D1_SYNC', bvid: 'BV_D1_SYNC', title: 'sync', capturedAt: '2026-06-01T00:00:00.000Z' },
+      { eventId: 'sync-d1-e2', id: 'BV_D1_SYNC', bvid: 'BV_D1_SYNC', eventKind: 'click', capturedAt: '2026-06-01T00:01:00.000Z' }
+    ]
+  }]);
+  await source.importUpTargets(['42'], { source: 'test' });
+  await source.saveUpProfileSnapshot({
+    mid: '42',
+    name: 'D1 Sync UP',
+    followerCount: 42,
+    capturedAt: '2026-06-01T01:00:00.000Z'
+  });
+  await source.saveVideoMetricSnapshot({
+    bvid: 'BV_D1_SYNC',
+    mid: '42',
+    capturedAt: '2026-06-01T01:05:00.000Z',
+    viewCount: 10
+  });
+
+  const firstPage = await source.exportSyncDataset({ dataset: 'report_events', limit: 1 });
+  assert.equal(firstPage.count, 1);
+  assert.equal(firstPage.hasMore, true);
+  assert.equal(firstPage.nextCursor, '1');
+  assert.equal(firstPage.items[0].eventId, 'sync-d1-e1');
+
+  const secondPage = await source.exportSyncDataset({ dataset: 'report_events', limit: 1, cursor: firstPage.nextCursor });
+  assert.equal(secondPage.count, 1);
+  assert.equal(secondPage.hasMore, false);
+  assert.equal(secondPage.items[0].eventId, 'sync-d1-e2');
+
+  const target = new D1Storage(new FakeD1());
+  const importedEvents = await target.importSyncDataset('report_events', [...firstPage.items, ...secondPage.items]);
+  assert.equal(importedEvents.inserted, 2);
+  assert.equal(importedEvents.skipped, 0);
+
+  const repeatedEvents = await target.importSyncDataset('report_events', [...firstPage.items, ...secondPage.items]);
+  assert.equal(repeatedEvents.inserted, 0);
+  assert.equal(repeatedEvents.updated, 0);
+  assert.equal(repeatedEvents.skipped, 2);
+
+  const snapshots = await source.exportSyncDataset({ dataset: 'up_profile_snapshots' });
+  assert.equal(snapshots.count, 1);
+  const importedSnapshots = await target.importSyncDataset('up_profile_snapshots', snapshots.items);
+  assert.equal(importedSnapshots.inserted, 1);
+  const repeatedSnapshots = await target.importSyncDataset('up_profile_snapshots', snapshots.items);
+  assert.equal(repeatedSnapshots.skipped, 1);
+
+  const metrics = await source.exportSyncDataset({ dataset: 'video_metric_snapshots' });
+  assert.equal(metrics.count, 1);
+  const importedMetrics = await target.importSyncDataset('video_metric_snapshots', metrics.items);
+  assert.equal(importedMetrics.inserted, 1);
+  const repeatedMetrics = await target.importSyncDataset('video_metric_snapshots', metrics.items);
+  assert.equal(repeatedMetrics.skipped, 1);
+});
+
 test('D1 report totals migrate and stay accurate across writes and cleanup', { skip: DatabaseSync ? false : 'node:sqlite unavailable' }, async () => {
   const fake = new FakeD1();
   const storage = new D1Storage(fake);

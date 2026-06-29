@@ -210,6 +210,22 @@ test('admin routes render data and analytics pages', async () => {
   assert.match(upHtml, /id="loginScreen"/);
   assert.match(upHtml, /id="appShell" hidden/);
   assert.doesNotMatch(upHtml, /auth=/);
+
+  const sync = await app.fetch(new Request('http://local/sync'));
+  assert.equal(sync.status, 200);
+  const syncHtml = await sync.text();
+  assert.match(syncHtml, /数据同步/);
+  assert.match(syncHtml, /读取源端/);
+  assert.match(syncHtml, /开始拉取/);
+  assert.match(syncHtml, /继续拉取/);
+  assert.match(syncHtml, /syncSourceUrl/);
+  assert.match(syncHtml, /syncSourceSecret/);
+  assert.match(syncHtml, /syncDatasetList/);
+  assert.match(syncHtml, /api\/sync\/pull/);
+  assert.match(syncHtml, /api\/sync\/export/);
+  assert.match(syncHtml, /id="loginScreen"/);
+  assert.match(syncHtml, /id="appShell" hidden/);
+  assert.doesNotMatch(syncHtml, /auth=/);
 });
 
 test('bulk report endpoint saves multiple batches idempotently and preserves batch ids', async () => {
@@ -449,6 +465,302 @@ test('report cleanup supports dry run and actual deletion', async () => {
   const body = await summary.json();
   assert.equal(body.eventCount, 0);
   assert.equal(body.sampleCount, 0);
+});
+
+test('sync export endpoint requires auth and paginates datasets', async () => {
+  const storage = new MemoryStorage();
+  const app = createApp({ secret: 'secret', storage });
+  const headers = { authorization: 'Bearer secret', 'content-type': 'application/json' };
+
+  const unauthorized = await app.fetch(new Request('http://local/api/sync/export?dataset=report_events'));
+  assert.equal(unauthorized.status, 401);
+
+  const manifest = await app.fetch(new Request('http://local/api/sync/export', { headers }));
+  assert.equal(manifest.status, 200);
+  const manifestBody = await manifest.json();
+  assert.equal(manifestBody.version, 1);
+  assert.equal(manifestBody.datasets.includes('report_events'), true);
+  assert.equal(manifestBody.datasets.includes('up_portraits'), true);
+
+  await storage.saveReportBatch(makeBatch('sync-page-b1', 'sync-page-e1', {
+    sampleId: 'BV_SYNC_PAGE',
+    events: [
+      { eventId: 'sync-page-e1', id: 'BV_SYNC_PAGE', bvid: 'BV_SYNC_PAGE', title: 'page', capturedAt: '2026-06-01T00:00:00.000Z' },
+      { eventId: 'sync-page-e2', id: 'BV_SYNC_PAGE', bvid: 'BV_SYNC_PAGE', eventKind: 'click', capturedAt: '2026-06-01T00:01:00.000Z' }
+    ]
+  }));
+
+  const first = await app.fetch(new Request('http://local/api/sync/export?dataset=report_events&limit=1', { headers }));
+  assert.equal(first.status, 200);
+  const firstPage = await first.json();
+  assert.equal(firstPage.version, 1);
+  assert.equal(firstPage.dataset, 'report_events');
+  assert.equal(firstPage.count, 1);
+  assert.equal(firstPage.hasMore, true);
+  assert.equal(firstPage.nextCursor, '1');
+  assert.equal(firstPage.items[0].eventId, 'sync-page-e1');
+
+  const second = await app.fetch(new Request(`http://local/api/sync/export?dataset=report_events&limit=1&cursor=${firstPage.nextCursor}`, { headers }));
+  const secondPage = await second.json();
+  assert.equal(secondPage.count, 1);
+  assert.equal(secondPage.hasMore, false);
+  assert.equal(secondPage.items[0].eventId, 'sync-page-e2');
+
+  const invalid = await app.fetch(new Request('http://local/api/sync/export?dataset=read_cache', { headers }));
+  assert.equal(invalid.status, 400);
+});
+
+async function seedSyncSource(storage) {
+  await storage.saveConfig({
+    fields: {
+      bili_mode: { value: 'fusion', updatedAt: '2026-06-01T00:00:00.000Z', clientId: 'sync-source' }
+    },
+    rules: { items: [] }
+  });
+  await storage.saveReportBatch({
+    batchId: 'sync-b1',
+    clientId: 'sync-client',
+    capturedAt: '2026-06-01T00:00:00.000Z',
+    events: [
+      {
+        eventId: 'sync-e1',
+        id: 'BV_SYNC_1',
+        bvid: 'BV_SYNC_1',
+        title: 'sync video',
+        upName: 'Sync UP',
+        upMid: '12345',
+        category: 'tech',
+        capturedAt: '2026-06-01T00:00:00.000Z',
+        mode: 'fusion',
+        source: 'feed',
+        position: 1
+      },
+      {
+        eventId: 'sync-e2',
+        id: 'BV_SYNC_1',
+        bvid: 'BV_SYNC_1',
+        eventKind: 'click',
+        upMid: '12345',
+        category: 'tech',
+        capturedAt: '2026-06-01T00:01:00.000Z',
+        mode: 'fusion',
+        source: 'feed'
+      },
+      {
+        eventId: 'sync-e3',
+        id: 'BV_SYNC_1',
+        bvid: 'BV_SYNC_1',
+        eventKind: 'feedback',
+        feedback: 'like',
+        upMid: '12345',
+        category: 'tech',
+        capturedAt: '2026-06-01T00:02:00.000Z',
+        mode: 'fusion',
+        source: 'feed'
+      }
+    ]
+  });
+  await storage.importUpTargets(['12345'], {
+    source: 'manual',
+    seedBvid: 'BV_SYNC_1',
+    note: 'sync seed',
+    priority: 5
+  });
+  await storage.updateUpTargetStatus('12345', {
+    name: 'Sync UP',
+    status: 'success',
+    lastCollectedAt: '2026-06-01T01:00:00.000Z',
+    nextCollectAfter: '2026-06-02T01:00:00.000Z',
+    lastErrorType: '',
+    lastErrorMessage: '',
+    failureCount: 0,
+    updatedAt: '2026-06-01T01:00:00.000Z'
+  });
+  await storage.saveUpProfileSnapshot({
+    mid: '12345',
+    name: 'Sync UP',
+    face: 'https://example.invalid/face.jpg',
+    sign: 'sync sign',
+    level: 6,
+    officialType: 0,
+    officialTitle: '',
+    vipType: 2,
+    vipStatus: 1,
+    followerCount: 1000,
+    followingCount: 10,
+    archiveCount: 20,
+    articleCount: 3,
+    albumCount: 4,
+    favoriteCount: 5,
+    likeCount: 600,
+    cardJson: { mid: '12345' },
+    relationJson: { following: 10 },
+    navJson: { video: 20 },
+    capturedAt: '2026-06-01T01:00:00.000Z'
+  });
+  await storage.upsertUpVideo({
+    bvid: 'BV_SYNC_1',
+    aid: '1001',
+    mid: '12345',
+    title: 'sync video',
+    description: 'desc',
+    coverUrl: 'https://example.invalid/cover.jpg',
+    tname: 'tech',
+    tid: 1,
+    duration: 120,
+    pubdate: 1780275600,
+    publishedAt: '2026-06-01T00:00:00.000Z',
+    ownerName: 'Sync UP',
+    copyright: 1,
+    videos: 1,
+    viewCount: 100,
+    danmakuCount: 2,
+    replyCount: 3,
+    favoriteCount: 4,
+    coinCount: 5,
+    shareCount: 6,
+    likeCount: 7,
+    tags: ['sync'],
+    pages: [{ page: 1 }],
+    rawJson: { bvid: 'BV_SYNC_1' }
+  });
+  await storage.saveVideoMetricSnapshot({
+    bvid: 'BV_SYNC_1',
+    mid: '12345',
+    capturedAt: '2026-06-01T01:05:00.000Z',
+    viewCount: 100,
+    danmakuCount: 2,
+    replyCount: 3,
+    favoriteCount: 4,
+    coinCount: 5,
+    shareCount: 6,
+    likeCount: 7
+  });
+  await storage.createCollectorRun({
+    runId: 'sync-run-1',
+    kind: 'manual',
+    mid: '12345',
+    status: 'success',
+    startedAt: '2026-06-01T01:00:00.000Z',
+    finishedAt: '2026-06-01T01:06:00.000Z',
+    targetCount: 1,
+    collectedCount: 1,
+    videoCount: 1,
+    options: { maxTargets: 1 }
+  });
+  await storage.saveUpPortrait({
+    mid: '12345',
+    rulePortrait: { primaryCategory: 'tech' },
+    llmPortrait: {
+      summary: 'sync summary',
+      contentPositioning: 'positioning',
+      audienceHypothesis: 'audience',
+      contentStyle: 'style',
+      commercialFit: 'fit',
+      risks: ['risk'],
+      evidence: ['evidence'],
+      provider: 'test',
+      model: 'model',
+      promptVersion: 'v1',
+      generatedAt: '2026-06-01T01:10:00.000Z'
+    }
+  });
+}
+
+test('sync pull copies business datasets and is idempotent', async () => {
+  const sourceStorage = new MemoryStorage();
+  const targetStorage = new MemoryStorage();
+  await seedSyncSource(sourceStorage);
+
+  const sourceApp = createApp({ secret: 'source-secret', storage: sourceStorage });
+  const targetApp = createApp({
+    secret: 'target-secret',
+    storage: targetStorage,
+    fetcher: (request) => sourceApp.fetch(request)
+  });
+  const headers = { authorization: 'Bearer target-secret', 'content-type': 'application/json' };
+  const requestBody = {
+    sourceUrl: 'http://source.local',
+    sourceSecret: 'source-secret',
+    limit: 1,
+    maxPages: 50
+  };
+
+  const unauthorized = await targetApp.fetch(new Request('http://target.local/api/sync/pull', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(requestBody)
+  }));
+  assert.equal(unauthorized.status, 401);
+
+  const pulled = await targetApp.fetch(new Request('http://target.local/api/sync/pull', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(requestBody)
+  }));
+  assert.equal(pulled.status, 200);
+  const first = await pulled.json();
+  assert.equal(first.ok, true);
+  assert.equal(first.complete, true);
+  assert.equal(first.stats.datasets.config.read, 1);
+  assert.equal(first.stats.datasets.report_events.read, 3);
+  assert.equal(first.stats.datasets.up_portraits.read, 1);
+  assert.equal(first.stats.total.errorCount, 0);
+
+  const config = await targetStorage.getConfig();
+  assert.equal(config.fields.bili_mode.value, 'fusion');
+
+  const summary = await targetStorage.getReportSummary();
+  assert.deepEqual(summary, {
+    batchCount: 1,
+    eventCount: 3,
+    duplicateEventCount: 0,
+    sampleCount: 1
+  });
+
+  const dailyMetrics = await targetStorage.exportSyncDataset({ dataset: 'daily_metrics' });
+  assert.equal(dailyMetrics.items.length, 1);
+  assert.deepEqual({
+    impressions: dailyMetrics.items[0].impressions,
+    clicks: dailyMetrics.items[0].clicks,
+    feedbacks: dailyMetrics.items[0].feedbacks
+  }, { impressions: 1, clicks: 1, feedbacks: 1 });
+
+  const profile = await targetStorage.getUpProfile('12345');
+  assert.equal(profile.target.name, 'Sync UP');
+  assert.equal(profile.profile.followerCount, 1000);
+  assert.equal(profile.videoStats.videoCount, 1);
+  assert.equal(profile.portrait.summary, 'sync summary');
+
+  const videos = await targetStorage.listUpVideos({ mid: '12345' });
+  assert.equal(videos.total, 1);
+  assert.equal(videos.items[0].viewCount, 100);
+
+  const metrics = await targetStorage.exportSyncDataset({ dataset: 'video_metric_snapshots' });
+  assert.equal(metrics.items.length, 1);
+  assert.equal(metrics.items[0].bvid, 'BV_SYNC_1');
+
+  const run = await targetStorage.getCollectorRun('sync-run-1');
+  assert.equal(run.status, 'success');
+  assert.equal(run.videoCount, 1);
+
+  const repeated = await targetApp.fetch(new Request('http://target.local/api/sync/pull', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(requestBody)
+  }));
+  assert.equal(repeated.status, 200);
+  const second = await repeated.json();
+  assert.equal(second.complete, true);
+  assert.equal(second.stats.total.inserted, 0);
+  assert.equal(second.stats.total.updated, 0);
+  assert.equal(second.stats.total.errorCount, 0);
+  assert.ok(second.stats.total.skipped >= first.stats.total.read);
+
+  const repeatedSummary = await targetStorage.getReportSummary();
+  assert.deepEqual(repeatedSummary, summary);
+  const repeatedMetrics = await targetStorage.exportSyncDataset({ dataset: 'video_metric_snapshots' });
+  assert.equal(repeatedMetrics.items.length, 1);
 });
 
 test('report APIs expose paginated samples and analytics', async () => {

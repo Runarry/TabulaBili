@@ -1,7 +1,7 @@
 function adminPage(activePage = 'data') {
-  const page = ['analytics', 'up-profiles'].includes(activePage) ? activePage : 'data';
-  const body = page === 'analytics' ? analyticsBody() : (page === 'up-profiles' ? upProfilesBody() : dataBody());
-  const script = page === 'analytics' ? analyticsScript() : (page === 'up-profiles' ? upProfilesScript() : dataScript());
+  const page = ['analytics', 'up-profiles', 'sync'].includes(activePage) ? activePage : 'data';
+  const body = page === 'analytics' ? analyticsBody() : (page === 'up-profiles' ? upProfilesBody() : (page === 'sync' ? syncBody() : dataBody()));
+  const script = page === 'analytics' ? analyticsScript() : (page === 'up-profiles' ? upProfilesScript() : (page === 'sync' ? syncScript() : dataScript()));
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -16,8 +16,9 @@ function adminPage(activePage = 'data') {
     h1 { margin: 0; font-size: 24px; }
     h2 { margin: 0 0 12px; font-size: 18px; }
     a { color: inherit; }
-    button, input, select { font: inherit; }
-    input, select { padding: 9px 10px; border: 1px solid #c9d1dc; border-radius: 6px; background: white; }
+    button, input, select, textarea { font: inherit; }
+    input, select, textarea { padding: 9px 10px; border: 1px solid #c9d1dc; border-radius: 6px; background: white; box-sizing: border-box; }
+    textarea { min-height: 90px; resize: vertical; }
     button { padding: 9px 12px; border: 0; border-radius: 6px; background: #2563eb; color: white; cursor: pointer; }
     button:disabled { opacity: .55; cursor: not-allowed; }
     button.secondary { background: #485465; }
@@ -67,6 +68,7 @@ function adminPage(activePage = 'data') {
         <a class="${page === 'data' ? 'active' : ''}" href="/data">数据</a>
         <a class="${page === 'analytics' ? 'active' : ''}" href="/analytics">分析</a>
         <a class="${page === 'up-profiles' ? 'active' : ''}" href="/up-profiles">UP画像</a>
+        <a class="${page === 'sync' ? 'active' : ''}" href="/sync">同步</a>
       </nav>
       <button class="secondary" type="button" id="logoutBtn">退出</button>
     </div>
@@ -430,6 +432,60 @@ function upProfilesBody() {
     </section>`;
 }
 
+function syncBody() {
+  return `
+    <section>
+      <div class="toolbar">
+        <h2>数据同步</h2>
+        <button class="secondary" type="button" id="syncManifestBtn">读取源端</button>
+        <button type="button" id="syncPullBtn">开始拉取</button>
+        <button class="secondary" type="button" id="syncContinueBtn" disabled>继续拉取</button>
+        <button class="secondary" type="button" id="syncClearBtn">清空结果</button>
+      </div>
+      <div class="table-grid">
+        <div class="table-panel">
+          <h3>源端</h3>
+          <div class="toolbar">
+            <input class="grow" id="syncSourceUrl" placeholder="源后端 URL">
+            <input class="grow" id="syncSourceSecret" type="password" placeholder="源端密钥；留空则使用当前密钥" autocomplete="off">
+          </div>
+          <div class="toolbar">
+            <select id="syncLimit">
+              <option value="100">100 条/页</option>
+              <option value="200" selected>200 条/页</option>
+              <option value="500">500 条/页</option>
+              <option value="1000">1000 条/页</option>
+            </select>
+            <input id="syncMaxPages" type="number" min="1" max="500" value="50" placeholder="最大页数">
+          </div>
+          <p class="muted" id="syncSourceStatus">未读取</p>
+        </div>
+        <div class="table-panel">
+          <h3>数据集</h3>
+          <div class="toolbar" id="syncDatasetList"></div>
+          <textarea id="syncCursorsInput" placeholder='续跑游标 JSON，例如 {"report_events":"400"}'></textarea>
+        </div>
+      </div>
+    </section>
+    <section>
+      <div class="toolbar">
+        <h2>同步结果</h2>
+        <span class="muted" id="syncResultStatus">未执行</span>
+      </div>
+      <div class="grid">
+        <div class="metric"><span>读取</span><strong id="syncReadCount">0</strong></div>
+        <div class="metric"><span>写入</span><strong id="syncWrittenCount">0</strong></div>
+        <div class="metric"><span>跳过</span><strong id="syncSkippedCount">0</strong></div>
+        <div class="metric"><span>错误</span><strong id="syncErrorCount">0</strong></div>
+      </div>
+      <table>
+        <thead><tr><th>数据集</th><th>页数</th><th>读取</th><th>写入</th><th>新增</th><th>更新</th><th>跳过</th><th>错误</th></tr></thead>
+        <tbody id="syncStatsRows"><tr><td class="muted" colspan="8">未执行</td></tr></tbody>
+      </table>
+      <pre id="syncResultView">{}</pre>
+    </section>`;
+}
+
 function dataScript() {
   return `
     const batchState = { page: 1, pageSize: 20, hasMore: false, loaded: false };
@@ -755,6 +811,197 @@ function upProfilesScript() {
       if (action === 'detail') loadDetail(mid).catch((error) => setMessage(error.message, true));
     });
     updateUpPager();`;
+}
+
+function syncScript() {
+  return `
+    const syncDatasets = [
+      'config',
+      'report_batches',
+      'report_events',
+      'report_samples',
+      'daily_metrics',
+      'up_targets',
+      'up_profile_snapshots',
+      'up_videos',
+      'video_metric_snapshots',
+      'collector_runs',
+      'up_portraits'
+    ];
+    const syncDatasetLabels = {
+      config: '配置',
+      report_batches: '批次',
+      report_events: '事件',
+      report_samples: '样本',
+      daily_metrics: '日报',
+      up_targets: 'UP目标',
+      up_profile_snapshots: 'UP资料',
+      up_videos: 'UP视频',
+      video_metric_snapshots: '视频指标',
+      collector_runs: '采集记录',
+      up_portraits: '画像'
+    };
+    const syncState = { lastResult: null, lastNext: null };
+    function setSyncStatus(id, text, error = false) {
+      const node = $(id);
+      if (!node) return;
+      node.textContent = text;
+      node.className = error ? 'error' : 'muted';
+    }
+    function sourceBaseUrl() {
+      return $('syncSourceUrl').value.trim();
+    }
+    function sourceSecret() {
+      return $('syncSourceSecret').value.trim() || state.secret;
+    }
+    function sourceApiUrl(path) {
+      const base = sourceBaseUrl();
+      if (!base) throw new Error('请输入源后端 URL。');
+      const url = new URL(base);
+      url.hash = '';
+      url.search = '';
+      url.pathname = url.pathname.replace(/\\/+$/, '') + path;
+      return url.toString();
+    }
+    async function postJson(path, body = {}) {
+      const response = await fetch(path, {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer ' + state.secret,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(body)
+      });
+      const text = await response.text();
+      const payload = text ? JSON.parse(text) : {};
+      if (!response.ok) {
+        const error = new Error(payload.message || payload.error || text || response.statusText);
+        error.payload = payload;
+        throw error;
+      }
+      return payload;
+    }
+    function renderDatasetList(available = syncDatasets) {
+      const availableSet = new Set(available);
+      $('syncDatasetList').innerHTML = syncDatasets.map((dataset) => {
+        const disabled = availableSet.has(dataset) ? '' : ' disabled';
+        const checked = availableSet.has(dataset) ? ' checked' : '';
+        return '<label><input type="checkbox" class="sync-dataset" value="' + esc(dataset) + '"' + checked + disabled + '> ' + esc(syncDatasetLabels[dataset] || dataset) + '</label>';
+      }).join('');
+    }
+    function selectedDatasets() {
+      return [...document.querySelectorAll('.sync-dataset')]
+        .filter((node) => node.checked && !node.disabled)
+        .map((node) => node.value);
+    }
+    function parseCursors() {
+      const text = $('syncCursorsInput').value.trim();
+      if (!text) return {};
+      const value = JSON.parse(text);
+      return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+    }
+    function buildPullBody(useNext = false) {
+      const datasets = useNext && syncState.lastNext ? syncState.lastNext.datasets : selectedDatasets();
+      if (!datasets.length) throw new Error('请选择数据集。');
+      return {
+        sourceUrl: sourceBaseUrl(),
+        sourceSecret: sourceSecret(),
+        limit: Number($('syncLimit').value || 200),
+        maxPages: Number($('syncMaxPages').value || 50),
+        datasets,
+        cursors: useNext && syncState.lastNext ? syncState.lastNext.cursors : parseCursors()
+      };
+    }
+    function emptyStatsRow(text) {
+      return '<tr><td class="muted" colspan="8">' + esc(text) + '</td></tr>';
+    }
+    function renderSyncResult(result) {
+      syncState.lastResult = result;
+      syncState.lastNext = result && result.next || null;
+      const total = result && result.stats && result.stats.total || {};
+      metric('syncReadCount', total.read || 0);
+      metric('syncWrittenCount', total.written || 0);
+      metric('syncSkippedCount', total.skipped || 0);
+      metric('syncErrorCount', total.errorCount || 0);
+      const datasets = result && result.stats && result.stats.datasets || {};
+      const names = syncDatasets.filter((name) => Object.hasOwn(datasets, name));
+      $('syncStatsRows').innerHTML = names.length ? names.map((name) => {
+        const row = datasets[name] || {};
+        return '<tr><td>' + esc(syncDatasetLabels[name] || name) + '<div class="muted">' + esc(name) + '</div></td>'
+          + '<td>' + esc(row.pages || 0) + '</td>'
+          + '<td>' + esc(row.read || 0) + '</td>'
+          + '<td>' + esc(row.written || 0) + '</td>'
+          + '<td>' + esc(row.inserted || 0) + '</td>'
+          + '<td>' + esc(row.updated || 0) + '</td>'
+          + '<td>' + esc(row.skipped || 0) + '</td>'
+          + '<td>' + esc(row.errorCount || 0) + '</td></tr>';
+      }).join('') : emptyStatsRow('无数据');
+      $('syncResultView').textContent = JSON.stringify(result || {}, null, 2);
+      $('syncContinueBtn').disabled = !syncState.lastNext;
+      if (syncState.lastNext) {
+        $('syncCursorsInput').value = JSON.stringify(syncState.lastNext.cursors || {}, null, 2);
+        setSyncStatus('syncResultStatus', '未完成，可继续拉取。');
+      } else if (result) {
+        setSyncStatus('syncResultStatus', '已完成。');
+      }
+    }
+    async function loadSourceManifest() {
+      const url = sourceApiUrl('/api/sync/export');
+      setSyncStatus('syncSourceStatus', '读取中');
+      const response = await fetch(url, { headers: { Authorization: 'Bearer ' + sourceSecret() } });
+      const text = await response.text();
+      const payload = text ? JSON.parse(text) : {};
+      if (!response.ok) throw new Error(payload.message || payload.error || text || response.statusText);
+      renderDatasetList(payload.datasets || syncDatasets);
+      setSyncStatus('syncSourceStatus', '已读取：v' + (payload.version || 1) + '，' + (payload.datasets || []).length + ' 个数据集。');
+      setMessage('源端数据集已读取。');
+    }
+    async function pullSync(useNext = false) {
+      setSyncStatus('syncResultStatus', useNext ? '继续拉取中' : '拉取中');
+      const result = await postJson('/api/sync/pull', buildPullBody(useNext));
+      renderSyncResult(result);
+      setMessage(result.complete ? '同步完成。' : '同步未完成，可继续拉取。');
+    }
+    function clearSyncResult() {
+      syncState.lastResult = null;
+      syncState.lastNext = null;
+      metric('syncReadCount', 0);
+      metric('syncWrittenCount', 0);
+      metric('syncSkippedCount', 0);
+      metric('syncErrorCount', 0);
+      $('syncStatsRows').innerHTML = emptyStatsRow('未执行');
+      $('syncResultView').textContent = '{}';
+      $('syncCursorsInput').value = '';
+      $('syncContinueBtn').disabled = true;
+      setSyncStatus('syncResultStatus', '未执行');
+    }
+    async function refresh() {
+      renderDatasetList(syncDatasets);
+      clearSyncResult();
+      setMessage('同步页已就绪。');
+    }
+    $('syncManifestBtn').addEventListener('click', () => {
+      loadSourceManifest().catch((error) => {
+        setSyncStatus('syncSourceStatus', '读取失败：' + error.message, true);
+        setMessage(error.message, true);
+      });
+    });
+    $('syncPullBtn').addEventListener('click', () => {
+      pullSync(false).catch((error) => {
+        setSyncStatus('syncResultStatus', '同步失败：' + error.message, true);
+        $('syncResultView').textContent = JSON.stringify(error.payload || { error: error.message }, null, 2);
+        setMessage(error.message, true);
+      });
+    });
+    $('syncContinueBtn').addEventListener('click', () => {
+      pullSync(true).catch((error) => {
+        setSyncStatus('syncResultStatus', '续跑失败：' + error.message, true);
+        $('syncResultView').textContent = JSON.stringify(error.payload || { error: error.message }, null, 2);
+        setMessage(error.message, true);
+      });
+    });
+    $('syncClearBtn').addEventListener('click', clearSyncResult);
+    renderDatasetList(syncDatasets);`;
 }
 
 function analyticsScript() {

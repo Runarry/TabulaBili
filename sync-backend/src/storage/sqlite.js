@@ -13,6 +13,11 @@ import {
 } from './helpers.js';
 import { buildAnalyticsQuerySpecs, executeAnalyticsQueries } from './sql-analytics.js';
 import {
+  REPORT_TOTAL_REFRESH_DATASETS,
+  exportSqlSyncDataset,
+  importSqlSyncDataset
+} from './sync-data.js';
+import {
   UP_COLUMNS,
   UP_INDEX_STATEMENTS,
   UP_SCHEMA_MIGRATION,
@@ -1214,6 +1219,24 @@ class SqliteStorage {
       )
     `).get(before).count;
     return { events, batches, orphanSamples };
+  }
+
+  createSyncAdapter() {
+    return {
+      all: async (sql, args = []) => this.db.prepare(sql).all(...args),
+      first: async (sql, args = []) => this.db.prepare(sql).get(...args) || null,
+      run: async (sql, args = []) => this.db.prepare(sql).run(...args).changes
+    };
+  }
+
+  async exportSyncDataset(options = {}) {
+    return exportSqlSyncDataset(this.createSyncAdapter(), options);
+  }
+
+  async importSyncDataset(dataset, items = []) {
+    const result = await importSqlSyncDataset(this.createSyncAdapter(), dataset, items);
+    if (REPORT_TOTAL_REFRESH_DATASETS.has(dataset)) this.refreshReportTotals();
+    return result;
   }
 }
 

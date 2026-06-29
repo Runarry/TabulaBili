@@ -15,6 +15,14 @@ import {
   normalizeStoredEvent,
   sortSamples
 } from './helpers.js';
+import {
+  buildSyncExportPage,
+  canonicalizeSyncItem,
+  createSyncImportStats,
+  finalizeSyncImportStats,
+  getSyncItemKey,
+  syncItemsEqual
+} from './sync-data.js';
 
 function createRunId(kind = 'run') {
   return `${kind}:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 10)}`;
@@ -27,6 +35,16 @@ function normalizeMid(value) {
 
 function clone(value) {
   return value == null ? value : JSON.parse(JSON.stringify(value));
+}
+
+function addMemoryImportError(stats, index, error) {
+  stats.errorCount += 1;
+  if (stats.errors.length < 10) {
+    stats.errors.push({
+      index,
+      message: String(error && error.message || error || 'error')
+    });
+  }
 }
 
 function getVideoOrderValue(video, sort) {
@@ -516,6 +534,206 @@ class MemoryStorage {
     const rows = items.slice(offset, offset + limit + (includeTotal ? 0 : 1));
     if (!includeTotal) return { items: rows.slice(0, limit), hasMore: rows.length > limit };
     return { items: rows.slice(0, limit), total: items.length };
+  }
+
+  getSyncBatchItem(batch) {
+    if (!batch) return null;
+    return {
+      batchId: batch.batchId,
+      clientId: batch.clientId,
+      capturedAt: batch.capturedAt,
+      receivedAt: batch.receivedAt,
+      eventCount: batch.eventCount,
+      duplicateEventCount: batch.duplicateEventCount,
+      rawJson: clone(batch.raw || batch.rawJson || {})
+    };
+  }
+
+  getSyncSampleItem(sampleId, sample) {
+    const aggregate = clone(sample || {});
+    return {
+      sampleId,
+      bvid: aggregate.bvid || '',
+      title: aggregate.title || '',
+      upName: aggregate.upName || '',
+      upMid: aggregate.upMid || '',
+      category: aggregate.category || '',
+      firstSeenAt: aggregate.firstSeenAt || aggregate.lastSeenAt || aggregate.updatedAt || '',
+      lastSeenAt: aggregate.lastSeenAt || aggregate.updatedAt || '',
+      seenCount: Number(aggregate.seenCount || 0),
+      clickCount: Number(aggregate.clickCount || 0),
+      feedback: aggregate.feedback || 'unset',
+      lastClickedAt: aggregate.lastClickedAt || '',
+      feedbackUpdatedAt: aggregate.feedbackUpdatedAt || '',
+      json: aggregate
+    };
+  }
+
+  async getSyncDatasetItems(dataset) {
+    switch (dataset) {
+      case 'config':
+        return this.config == null ? [] : [canonicalizeSyncItem(dataset, { id: 1, config: clone(this.config) })];
+      case 'report_batches':
+        return [...this.batches.values()]
+          .map((batch) => canonicalizeSyncItem(dataset, this.getSyncBatchItem(batch)))
+          .sort((a, b) => String(a.batchId).localeCompare(String(b.batchId)));
+      case 'report_events':
+        return [...this.events.values()]
+          .map((event) => canonicalizeSyncItem(dataset, clone(event)))
+          .sort((a, b) => String(a.eventId).localeCompare(String(b.eventId)));
+      case 'report_samples':
+        return [...this.samples.entries()]
+          .map(([sampleId, sample]) => canonicalizeSyncItem(dataset, this.getSyncSampleItem(sampleId, sample)))
+          .sort((a, b) => String(a.sampleId).localeCompare(String(b.sampleId)));
+      case 'daily_metrics':
+        return [...this.dailyMetrics.values()]
+          .map((item) => canonicalizeSyncItem(dataset, clone(item)))
+          .sort((a, b) => getSyncItemKey(dataset, a).localeCompare(getSyncItemKey(dataset, b)));
+      case 'up_targets':
+        return [...this.upTargets.values()]
+          .map((item) => canonicalizeSyncItem(dataset, clone(item)))
+          .sort((a, b) => String(a.mid).localeCompare(String(b.mid)));
+      case 'up_profile_snapshots':
+        return this.upProfileSnapshots
+          .map((item, index) => canonicalizeSyncItem(dataset, { id: index + 1, ...clone(item) }));
+      case 'up_videos':
+        return [...this.upVideos.values()]
+          .map((item) => canonicalizeSyncItem(dataset, clone(item)))
+          .sort((a, b) => String(a.bvid).localeCompare(String(b.bvid)));
+      case 'video_metric_snapshots':
+        return this.videoMetricSnapshots
+          .map((item, index) => canonicalizeSyncItem(dataset, { id: index + 1, ...clone(item) }));
+      case 'collector_runs':
+        return [...this.collectorRuns.values()]
+          .map((item) => canonicalizeSyncItem(dataset, clone(item)))
+          .sort((a, b) => String(a.runId).localeCompare(String(b.runId)));
+      case 'up_portraits':
+        return [...this.upPortraits.values()]
+          .map((item) => canonicalizeSyncItem(dataset, clone(item)))
+          .sort((a, b) => String(a.mid).localeCompare(String(b.mid)));
+      default:
+        throw new Error('invalid_sync_dataset');
+    }
+  }
+
+  async exportSyncDataset(options = {}) {
+    const dataset = String(options.dataset || '');
+    return buildSyncExportPage(dataset, await this.getSyncDatasetItems(dataset), options);
+  }
+
+  importSyncMapItem(stats, dataset, map, key, item, toStored = (value) => value, currentToItem = (value) => value) {
+    const current = map.get(key);
+    if (current && syncItemsEqual(dataset, currentToItem(current, key), item)) {
+      stats.skipped += 1;
+      return;
+    }
+    map.set(key, toStored(item, current));
+    if (current) stats.updated += 1;
+    else stats.inserted += 1;
+  }
+
+  importSyncAppendItem(stats, dataset, collection, item, toStored = (value) => value) {
+    if (collection.some((current) => syncItemsEqual(dataset, current, item))) {
+      stats.skipped += 1;
+      return;
+    }
+    collection.push(toStored(item));
+    stats.inserted += 1;
+  }
+
+  async importSyncDataset(dataset, items = []) {
+    const rows = Array.isArray(items) ? items : [];
+    const stats = createSyncImportStats(dataset, rows.length);
+
+    for (let index = 0; index < rows.length; index += 1) {
+      try {
+        const item = canonicalizeSyncItem(dataset, rows[index]);
+        switch (dataset) {
+          case 'config': {
+            if (this.config != null && syncItemsEqual(dataset, { config: this.config }, item)) {
+              stats.skipped += 1;
+            } else {
+              const existed = this.config != null;
+              this.config = clone(item.config);
+              if (existed) stats.updated += 1;
+              else stats.inserted += 1;
+            }
+            break;
+          }
+          case 'report_batches':
+            this.importSyncMapItem(stats, dataset, this.batches, item.batchId, item, (value) => ({
+              batchId: value.batchId,
+              clientId: value.clientId,
+              capturedAt: value.capturedAt,
+              receivedAt: value.receivedAt,
+              eventCount: value.eventCount,
+              duplicateEventCount: value.duplicateEventCount,
+              raw: clone(value.rawJson || {})
+            }), (value) => this.getSyncBatchItem(value));
+            break;
+          case 'report_events':
+            this.importSyncMapItem(stats, dataset, this.events, item.eventId, item, (value) => ({
+              ...clone(value),
+              rawJson: JSON.stringify(value.rawJson || {})
+            }));
+            break;
+          case 'report_samples':
+            this.importSyncMapItem(stats, dataset, this.samples, item.sampleId, item, (value) => {
+              const aggregate = clone(value.json || {});
+              return {
+                ...aggregate,
+                id: aggregate.id || value.sampleId,
+                bvid: aggregate.bvid || value.bvid,
+                title: aggregate.title || value.title,
+                upName: aggregate.upName || value.upName,
+                upMid: aggregate.upMid || value.upMid,
+                category: aggregate.category || value.category,
+                firstSeenAt: aggregate.firstSeenAt || value.firstSeenAt,
+                lastSeenAt: aggregate.lastSeenAt || value.lastSeenAt,
+                seenCount: Number(aggregate.seenCount || value.seenCount || 0),
+                clickCount: Number(aggregate.clickCount || value.clickCount || 0),
+                feedback: aggregate.feedback || value.feedback,
+                lastClickedAt: aggregate.lastClickedAt || value.lastClickedAt,
+                feedbackUpdatedAt: aggregate.feedbackUpdatedAt || value.feedbackUpdatedAt
+              };
+            }, (value, key) => this.getSyncSampleItem(key, value));
+            break;
+          case 'daily_metrics':
+            this.importSyncMapItem(stats, dataset, this.dailyMetrics, getSyncItemKey(dataset, item), item, clone);
+            break;
+          case 'up_targets':
+            this.importSyncMapItem(stats, dataset, this.upTargets, item.mid, item, clone);
+            break;
+          case 'up_profile_snapshots':
+            this.importSyncAppendItem(stats, dataset, this.upProfileSnapshots, item, (value) => ({
+              ...clone(value),
+              id: this.upProfileSnapshots.length + 1
+            }));
+            break;
+          case 'up_videos':
+            this.importSyncMapItem(stats, dataset, this.upVideos, item.bvid, item, clone);
+            break;
+          case 'video_metric_snapshots':
+            this.importSyncAppendItem(stats, dataset, this.videoMetricSnapshots, item, (value) => ({
+              ...clone(value),
+              id: this.videoMetricSnapshots.length + 1
+            }));
+            break;
+          case 'collector_runs':
+            this.importSyncMapItem(stats, dataset, this.collectorRuns, item.runId, item, clone);
+            break;
+          case 'up_portraits':
+            this.importSyncMapItem(stats, dataset, this.upPortraits, item.mid, item, clone);
+            break;
+          default:
+            throw new Error('invalid_sync_dataset');
+        }
+      } catch (error) {
+        addMemoryImportError(stats, index, error);
+      }
+    }
+
+    return finalizeSyncImportStats(stats);
   }
 }
 

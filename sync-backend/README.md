@@ -22,6 +22,8 @@ Authorization: Bearer <SYNC_SECRET>
 - `GET /api/reports/batches`
 - `GET /api/reports/analytics`
 - `POST /api/reports/cleanup`
+- `GET /api/sync/export`
+- `POST /api/sync/pull`
 - `POST /api/up-targets/import`
 - `GET /api/up-targets`
 - `POST /api/up-targets/<mid>/collect`
@@ -102,6 +104,145 @@ Content-Type: application/json
 如果请求体不提供 `before`，可以提供 `retentionDays`，默认按 365 天计算清理边界。
 
 `daily_metrics` 每日汇总表不会被 cleanup 删除，用于在清理明细事件后保留长期趋势基础数据。
+
+### 数据同步与迁移
+
+后端提供通用的版本化数据同步 API，用于 Worker/D1 迁移到 Docker/SQLite，也可用于两个 Docker/SQLite 后端之间同步。所有同步 API 继续使用 `Authorization: Bearer <SYNC_SECRET>` 鉴权；`sourceSecret` 只在本次请求中用于拉取源端数据，不会写入数据库或日志。
+
+后台管理页也提供同步入口：登录目标端后打开 `/sync`，填写源后端 URL、源端密钥、分页大小和数据集，点击“开始拉取”。如果返回未完成，可以直接点击“继续拉取”使用返回游标续跑。
+
+同步范围覆盖除运行时缓存外的业务数据：
+
+- `config`：配置。
+- `report_batches`、`report_events`、`report_samples`、`daily_metrics`：上报批次、事件、样本聚合、每日统计。
+- `up_targets`、`up_profile_snapshots`、`up_videos`、`video_metric_snapshots`、`collector_runs`、`up_portraits`：UP 目标、资料快照、视频事实、视频指标快照、采集运行记录、画像。
+
+不导出内存 read cache、临时进程状态和 `report_totals`。`report_totals` 是派生汇总，目标端导入报表核心表后会自动刷新。
+
+查看源端支持的数据集：
+
+```bash
+curl -H "Authorization: Bearer $SOURCE_SECRET" \
+  "$SOURCE_URL/api/sync/export"
+```
+
+分页导出单个数据集：
+
+```bash
+curl -H "Authorization: Bearer $SOURCE_SECRET" \
+  "$SOURCE_URL/api/sync/export?dataset=report_events&limit=200"
+```
+
+返回格式包含 `version`、`dataset`、`cursor`、`nextCursor`、`hasMore` 和 `items`。继续导出下一页时把 `nextCursor` 作为 `cursor` 传回：
+
+```bash
+curl -H "Authorization: Bearer $SOURCE_SECRET" \
+  "$SOURCE_URL/api/sync/export?dataset=report_events&limit=200&cursor=200"
+```
+
+目标端主动拉取并导入：
+
+```bash
+curl -X POST "$TARGET_URL/api/sync/pull" \
+  -H "Authorization: Bearer $TARGET_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sourceUrl": "https://tabulabili-sync.example.workers.dev",
+    "sourceSecret": "SOURCE_SYNC_SECRET",
+    "limit": 200,
+    "maxPages": 50
+  }'
+```
+
+如果源端和目标端使用同一个密钥，可以省略 `sourceSecret`，目标端会使用本次请求的目标密钥访问源端。返回值会按数据集统计 `read`、`written`、`inserted`、`updated`、`skipped` 和 `errorCount`：
+
+```json
+{
+  "ok": true,
+  "version": 1,
+  "complete": true,
+  "pages": 11,
+  "stats": {
+    "total": {
+      "read": 123,
+      "written": 123,
+      "inserted": 123,
+      "updated": 0,
+      "skipped": 0,
+      "errorCount": 0
+    }
+  }
+}
+```
+
+导入是幂等的：带主键或唯一业务键的数据会 upsert 或跳过；资料快照和视频指标快照会按完整业务字段去重。重复执行同一个 pull 不会产生重复数据，响应中的 `skipped` 会增加。
+
+为避免 Worker 或目标端请求过长，`POST /api/sync/pull` 会按 `limit` 分页拉取，并受 `maxPages` 限制。如果返回 `complete: false`，响应中的 `next` 可用于继续：
+
+```bash
+curl -X POST "$TARGET_URL/api/sync/pull" \
+  -H "Authorization: Bearer $TARGET_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sourceUrl": "https://tabulabili-sync.example.workers.dev",
+    "sourceSecret": "SOURCE_SYNC_SECRET",
+    "limit": 200,
+    "datasets": ["report_events", "report_samples"],
+    "cursors": {
+      "report_events": "400",
+      "report_samples": ""
+    }
+  }'
+```
+
+#### 从 Worker/D1 迁移到 Docker/SQLite
+
+1. 先启动新的 Docker 后端，并设置好目标端 `SYNC_SECRET`。
+2. 确认源 Worker 地址和源端 `SYNC_SECRET` 可用。
+3. 对 Docker 目标端调用 `POST /api/sync/pull`，`sourceUrl` 填 Worker 地址，`sourceSecret` 填 Worker 的密钥。
+4. 如果返回 `complete: false`，带上返回的 `next.datasets` 和 `next.cursors` 继续调用，直到 `complete: true`。
+5. 打开 Docker 后台 `/data`、`/analytics`、`/up-profiles` 验证配置、报表和 UP 数据。
+
+示例：
+
+```bash
+TARGET_URL=http://localhost:8787
+TARGET_SECRET=your-docker-secret
+SOURCE_URL=https://tabulabili-sync.example.workers.dev
+SOURCE_SECRET=your-worker-secret
+
+curl -X POST "$TARGET_URL/api/sync/pull" \
+  -H "Authorization: Bearer $TARGET_SECRET" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"sourceUrl\": \"$SOURCE_URL\",
+    \"sourceSecret\": \"$SOURCE_SECRET\",
+    \"limit\": 200,
+    \"maxPages\": 50
+  }"
+```
+
+#### 两个 Docker 后端之间同步
+
+把旧 Docker 后端作为源端，新 Docker 后端作为目标端，调用同一个 pull API：
+
+```bash
+curl -X POST "http://new-host:8787/api/sync/pull" \
+  -H "Authorization: Bearer $NEW_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sourceUrl": "http://old-host:8787",
+    "sourceSecret": "OLD_SECRET",
+    "limit": 500,
+    "maxPages": 100
+  }'
+```
+
+需要只同步部分数据时可以传 `datasets`：
+
+```json
+{ "datasets": ["config", "up_targets", "up_portraits"] }
+```
 
 ### UP 主画像采集
 
